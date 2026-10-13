@@ -2,7 +2,9 @@ name: Build USVFS
 
 on:
   push:
-    branches: master
+    branches:
+      - master
+      - "async-read-prefetch*"
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -14,7 +16,7 @@ jobs:
     name: Build USVFS
     strategy:
       matrix:
-        arch: [x86, x64]
+        arch: [x64]
         config: [Debug, Release]
         tests: ["", "Test"]
     runs-on: windows-2022
@@ -100,7 +102,7 @@ jobs:
     runs-on: windows-2022
     strategy:
       matrix:
-        arch: [x86, x64]
+        arch: [x64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@master
