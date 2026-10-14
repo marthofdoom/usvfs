@@ -36,7 +36,9 @@ constexpr uint32_t kModeSynchronousNonAlert     = 0x00000020;
 constexpr uint32_t kAccessReadData              = 0x00000001;
 constexpr uint32_t kAccessWriteData             = 0x00000002;
 constexpr uint32_t kAccessAppendData            = 0x00000004;
-constexpr uint32_t kDeviceTypeDisk              = 0x00000007;
+constexpr uint32_t kDeviceTypeDisk              = 0x00000007;  // FILE_DEVICE_DISK
+// Wine reports regular files as FILE_DEVICE_DISK_FILE_SYSTEM
+constexpr uint32_t kDeviceTypeDiskFileSystem    = 0x00000008;
 
 // reads of this size or more are not worth caching
 constexpr uint64_t kSmallReadLimit = 64 * 1024;
@@ -108,7 +110,7 @@ inline Eligibility evaluateEligibility(const HandleAttrs& a, const Limits& l)
     return Eligibility::EventOrApc;
   if (!a.queriesOk)
     return Eligibility::QueryFailed;
-  if (a.deviceType != kDeviceTypeDisk)
+  if (a.deviceType != kDeviceTypeDisk && a.deviceType != kDeviceTypeDiskFileSystem)
     return Eligibility::NotDisk;
   if (a.directory)
     return Eligibility::Directory;

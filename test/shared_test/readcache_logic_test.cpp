@@ -30,6 +30,19 @@ TEST(ReadCacheEligibility, GoodHandleIsEligible)
   EXPECT_EQ(Eligibility::Eligible, evaluateEligibility(goodAttrs(), Limits{}));
 }
 
+TEST(ReadCacheEligibility, DiskFileSystemDeviceTypeIsAccepted)
+{
+  auto a = goodAttrs();
+  a.deviceType = kDeviceTypeDiskFileSystem;
+  EXPECT_EQ(Eligibility::Eligible, evaluateEligibility(a, Limits{}));
+  for (uint32_t t : {0x3u /* cdrom */, 0x13u /* cdrom fs */, 0x14u /* network fs */,
+                     0x11u /* named pipe */, 0x0u})
+  {
+    a.deviceType = t;
+    EXPECT_EQ(Eligibility::NotDisk, evaluateEligibility(a, Limits{})) << t;
+  }
+}
+
 TEST(ReadCacheEligibility, SynchronousAlertAlsoCounts)
 {
   auto a = goodAttrs();

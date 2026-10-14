@@ -47,6 +47,15 @@ void init();
 // off. Must NOT be called from DllMain (it waits for the workers).
 void shutdown();
 
+enum class Peek { Unknown, Ineligible, Eligible };
+
+// cheap look at the classification of a handle (no reference counting, no
+// hook context); used to let ineligible handles bypass everything
+Peek peek(HANDLE handle);
+
+// counts a read that was passed to the real function without further ado
+void notePassthrough();
+
 // drops the state of a handle; must be called before the handle is closed
 void onClose(HANDLE handle);
 

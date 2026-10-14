@@ -960,8 +960,7 @@ NTSTATUS realRead(HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc, PVOID ctx,
                   PIO_STATUS_BLOCK iosb, PVOID buf, ULONG len,
                   PLARGE_INTEGER off, PULONG key)
 {
-  g->stats.passthroughs.fetch_add(1, std::memory_order_relaxed);
-  countEvent(g->stats.passthroughs);
+  notePassthrough();
   return ::NtReadFile(h, ev, apc, ctx, iosb, buf, len, off, key);
 }
 
@@ -989,6 +988,32 @@ NTSTATUS syncedRead(HandleState& hs, HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc,
 
 // ---------------------------------------------------------------------------
 // public interface
+
+Peek peek(HANDLE h)
+{
+  if (!g)
+    return Peek::Unknown;
+  std::shared_lock<std::shared_mutex> lock(g->handlesLock);
+  auto it = g->handles.find(h);
+  if (it == g->handles.end())
+    return Peek::Unknown;
+  const HandleState& hs = *it->second;
+  if (!hs.classified.load(std::memory_order_acquire))
+    return Peek::Unknown;
+  return hs.eligible.load(std::memory_order_acquire) ? Peek::Eligible
+                                                     : Peek::Ineligible;
+}
+
+void notePassthrough()
+{
+  // per-thread count, flushed in batches so the hot path has no atomic RMW
+  thread_local uint32_t pending = 0;
+  if (++pending < 1024)
+    return;
+  g->stats.passthroughs.fetch_add(pending, std::memory_order_relaxed);
+  pending = 0;
+  maybeLog();
+}
 
 bool inProtectedCopy()
 {

@@ -1442,6 +1442,14 @@ NTSTATUS WINAPI usvfs::hook_NtReadFile(
                         Buffer, Length, ByteOffset, Key);
   }
 
+  // hot path: handles we decided not to touch go straight to the real function
+  // (we are inside the hook, so the trampoline barrier routes this call to it)
+  if (usvfs::readcache::peek(FileHandle) == usvfs::readcache::Peek::Ineligible) {
+    usvfs::readcache::notePassthrough();
+    return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                        Buffer, Length, ByteOffset, Key);
+  }
+
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
   // readcache::read() ends up in the real function by itself whenever it
