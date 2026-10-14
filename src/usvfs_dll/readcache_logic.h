@@ -3,17 +3,24 @@ Userspace Virtual Filesystem
 
 This file is part of usvfs.
 
-usvfs is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
+usvfs is free software:
+ * you can redistribute it and/or modify
+it under the terms of the GNU General Public
+ * License as published by
+the Free Software Foundation, either version 3 of the
+ * License, or
 (at your option) any later version.
 
-usvfs is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
+usvfs is distributed in the hope
+ * that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty
+ * of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
+GNU General Public
+ * License for more details.
 
-You should have received a copy of the GNU General Public License
+You should have received a copy of the GNU General Public
+ * License
 along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
@@ -38,7 +45,7 @@ constexpr uint32_t kAccessWriteData             = 0x00000002;
 constexpr uint32_t kAccessAppendData            = 0x00000004;
 constexpr uint32_t kDeviceTypeDisk              = 0x00000007;  // FILE_DEVICE_DISK
 // Wine reports regular files as FILE_DEVICE_DISK_FILE_SYSTEM
-constexpr uint32_t kDeviceTypeDiskFileSystem    = 0x00000008;
+constexpr uint32_t kDeviceTypeDiskFileSystem = 0x00000008;
 
 // reads of this size or more are not worth caching
 constexpr uint64_t kSmallReadLimit = 64 * 1024;
@@ -54,9 +61,9 @@ constexpr int64_t kUseFilePointerPosition = -2;
 enum class Eligibility : int
 {
   Eligible = 0,
-  EventOrApc,      // first read had an event or apc routine
-  QueryFailed,     // an attribute query failed
-  NotDisk,         // device type is not FILE_DEVICE_DISK
+  EventOrApc,   // first read had an event or apc routine
+  QueryFailed,  // an attribute query failed
+  NotDisk,      // device type is not FILE_DEVICE_DISK
   Directory,
   NotSynchronous,  // handle is not opened for synchronous i/o
   NoBuffering,     // FILE_NO_INTERMEDIATE_BUFFERING
@@ -71,32 +78,45 @@ enum class Eligibility : int
 inline const char* eligibilityName(Eligibility e)
 {
   switch (e) {
-  case Eligibility::Eligible:       return "eligible";
-  case Eligibility::EventOrApc:     return "event/apc";
-  case Eligibility::QueryFailed:    return "query-failed";
-  case Eligibility::NotDisk:        return "not-disk";
-  case Eligibility::Directory:      return "directory";
-  case Eligibility::NotSynchronous: return "not-sync";
-  case Eligibility::NoBuffering:    return "no-buffering";
-  case Eligibility::NotReadable:    return "not-readable";
-  case Eligibility::Writable:       return "writable";
-  case Eligibility::TooLarge:       return "too-large";
-  case Eligibility::BigRead:        return "big-read";
-  case Eligibility::FillFailed:     return "fill-failed";
-  default:                          return "?";
+  case Eligibility::Eligible:
+    return "eligible";
+  case Eligibility::EventOrApc:
+    return "event/apc";
+  case Eligibility::QueryFailed:
+    return "query-failed";
+  case Eligibility::NotDisk:
+    return "not-disk";
+  case Eligibility::Directory:
+    return "directory";
+  case Eligibility::NotSynchronous:
+    return "not-sync";
+  case Eligibility::NoBuffering:
+    return "no-buffering";
+  case Eligibility::NotReadable:
+    return "not-readable";
+  case Eligibility::Writable:
+    return "writable";
+  case Eligibility::TooLarge:
+    return "too-large";
+  case Eligibility::BigRead:
+    return "big-read";
+  case Eligibility::FillFailed:
+    return "fill-failed";
+  default:
+    return "?";
   }
 }
 
 // attributes of a handle gathered at its first NtReadFile
 struct HandleAttrs
 {
-  bool hasEventOrApc = false;
-  bool queriesOk     = true;
-  uint32_t deviceType = 0;
-  bool directory      = false;
-  uint32_t mode       = 0;  // FILE_MODE_INFORMATION::Mode
-  uint32_t access     = 0;  // FILE_ACCESS_INFORMATION::AccessFlags
-  uint64_t endOfFile  = 0;
+  bool hasEventOrApc       = false;
+  bool queriesOk           = true;
+  uint32_t deviceType      = 0;
+  bool directory           = false;
+  uint32_t mode            = 0;  // FILE_MODE_INFORMATION::Mode
+  uint32_t access          = 0;  // FILE_ACCESS_INFORMATION::AccessFlags
+  uint64_t endOfFile       = 0;
   uint64_t firstReadLength = 0;
 };
 
@@ -151,9 +171,8 @@ struct ReadPlan
 
 // hasByteOffset: the ByteOffset parameter was non-NULL
 // byteOffset:    its QuadPart (ignored if !hasByteOffset)
-inline ReadPlan planRead(uint64_t fileSize, uint64_t shadowPos,
-                         bool hasByteOffset, int64_t byteOffset,
-                         uint64_t length, bool hasKey)
+inline ReadPlan planRead(uint64_t fileSize, uint64_t shadowPos, bool hasByteOffset,
+                         int64_t byteOffset, uint64_t length, bool hasKey)
 {
   ReadPlan plan;
   plan.newPos = shadowPos;
@@ -214,10 +233,14 @@ inline size_t sizeBucket(uint64_t fileSize)
 inline const char* sizeBucketName(size_t bucket)
 {
   switch (bucket) {
-  case 0:  return "<64K";
-  case 1:  return "64K-1M";
-  case 2:  return "1-8M";
-  default: return "8M+";
+  case 0:
+    return "<64K";
+  case 1:
+    return "64K-1M";
+  case 2:
+    return "1-8M";
+  default:
+    return "8M+";
   }
 }
 
@@ -227,8 +250,9 @@ inline const char* sizeBucketName(size_t bucket)
 // a handle whose big reads may be split / read ahead (it need not be cacheable)
 inline bool splitCapable(const HandleAttrs& a)
 {
-  return a.deviceType != 0 && (a.deviceType == kDeviceTypeDisk ||
-                               a.deviceType == kDeviceTypeDiskFileSystem) &&
+  return a.deviceType != 0 &&
+         (a.deviceType == kDeviceTypeDisk ||
+          a.deviceType == kDeviceTypeDiskFileSystem) &&
          !a.directory &&
          (a.mode & (kModeSynchronousAlert | kModeSynchronousNonAlert)) != 0 &&
          (a.mode & kModeNoIntermediateBuffering) == 0 &&
@@ -253,10 +277,14 @@ inline size_t bigBucket(uint64_t length)
 inline const char* bigBucketName(size_t bucket)
 {
   switch (bucket) {
-  case 0:  return "64-256K";
-  case 1:  return "256K-1M";
-  case 2:  return "1-4M";
-  default: return "4M+";
+  case 0:
+    return "64-256K";
+  case 1:
+    return "256K-1M";
+  case 2:
+    return "1-4M";
+  default:
+    return "4M+";
   }
 }
 
@@ -297,7 +325,8 @@ inline SplitPlan planSplit(uint64_t offset, uint64_t length, uint64_t fileSize,
 
   plan.action = SplitAction::Split;
   for (uint64_t done = 0; done < plan.total; done += chunk) {
-    plan.chunks.push_back({offset + done, std::min<uint64_t>(chunk, plan.total - done)});
+    plan.chunks.push_back(
+        {offset + done, std::min<uint64_t>(chunk, plan.total - done)});
   }
   return plan;
 }
@@ -315,9 +344,9 @@ struct SeqState
 inline bool updateSequential(SeqState& s, uint64_t offset, uint64_t total)
 {
   const bool sequential = s.valid && offset == s.lastEnd;
-  s.run     = sequential ? s.run + 1 : 0;
-  s.lastEnd = offset + total;
-  s.valid   = true;
+  s.run                 = sequential ? s.run + 1 : 0;
+  s.lastEnd             = offset + total;
+  s.valid               = true;
   return sequential;
 }
 
@@ -330,14 +359,14 @@ struct WindowPlan
   uint64_t length = 0;  // 0: no window
 };
 
-constexpr uint64_t kMaxWindow = 4ull << 20;
-inline uint64_t g_maxWindow = kMaxWindow;
+constexpr uint64_t kMaxWindow   = 4ull << 20;
+inline uint64_t g_maxWindow     = kMaxWindow;
 inline uint32_t g_sequentialRun = kSequentialRunForReadahead;
 
-// next readahead window: 2x the last read (at most 1 MiB for reads below 1 MiB), capped at kMaxWindow, the end of the
-// file and what is left of the readahead memory budget
-inline WindowPlan planWindow(uint64_t lastEnd, uint64_t lastReadSize,
-                             uint64_t fileSize, uint64_t budgetLeft)
+// next readahead window: 2x the last read (at most 1 MiB for reads below 1 MiB), capped
+// at kMaxWindow, the end of the file and what is left of the readahead memory budget
+inline WindowPlan planWindow(uint64_t lastEnd, uint64_t lastReadSize, uint64_t fileSize,
+                             uint64_t budgetLeft)
 {
   WindowPlan w;
   if (lastEnd >= fileSize)
@@ -345,8 +374,8 @@ inline WindowPlan planWindow(uint64_t lastEnd, uint64_t lastReadSize,
   uint64_t len = std::min<uint64_t>(lastReadSize * 2, g_maxWindow);
   if (lastReadSize < (1ull << 20))
     len = std::min<uint64_t>(len, 1ull << 20);  // small reads: no more than 1 MiB ahead
-  len          = std::min<uint64_t>(len, fileSize - lastEnd);
-  len          = std::min<uint64_t>(len, budgetLeft);
+  len = std::min<uint64_t>(len, fileSize - lastEnd);
+  len = std::min<uint64_t>(len, budgetLeft);
   if (len == 0)
     return w;
   w.start  = lastEnd;
@@ -397,11 +426,11 @@ inline uint64_t evictionTarget(uint64_t budget)
 
 // `lruOldestFirst` lists all cached entries from least to most recently used.
 // Returns the indices (ascending order of age) to evict so that the remaining
-// total is within `budget`, never selecting pinned entries (those being filled). `used` is the
-// current total of all entries.
+// total is within `budget`, never selecting pinned entries (those being filled). `used`
+// is the current total of all entries.
 inline std::vector<size_t>
-selectEvictions(const std::vector<EvictCandidate>& lruOldestFirst,
-                uint64_t used, uint64_t budget)
+selectEvictions(const std::vector<EvictCandidate>& lruOldestFirst, uint64_t used,
+                uint64_t budget)
 {
   std::vector<size_t> result;
   for (size_t i = 0; i < lruOldestFirst.size() && used > budget; ++i) {

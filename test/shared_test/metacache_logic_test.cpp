@@ -8,7 +8,8 @@ using namespace usvfs::metacache::logic;
 
 TEST(MetaCachePath, NormalizeFoldsCaseAndSlashes)
 {
-  EXPECT_EQ(LR"(\??\C:\GAMES\DATA\A.ESP)", normalizePath(LR"(\??\c:\Games/Data\a.esp)"));
+  EXPECT_EQ(LR"(\??\C:\GAMES\DATA\A.ESP)",
+            normalizePath(LR"(\??\c:\Games/Data\a.esp)"));
   EXPECT_EQ(LR"(\??\C:\DIR)", normalizePath(LR"(\??\C:\dir\)"));
   EXPECT_EQ(LR"(\??\C:\)", normalizePath(LR"(\??\C:\)"));  // root keeps its slash
 }
@@ -75,15 +76,15 @@ TEST(MetaCachePack, CountFitting)
 {
   const std::vector<size_t> r{10, 20, 30};  // aligned: 16, 24, 32
   // offsets: 0, 16, 40; ends: 10, 36, 70
-  EXPECT_EQ(0u, countFitting(r, 0, 9, false));    // not even one fits
+  EXPECT_EQ(0u, countFitting(r, 0, 9, false));  // not even one fits
   EXPECT_EQ(1u, countFitting(r, 0, 10, false));
   EXPECT_EQ(1u, countFitting(r, 0, 35, false));
   EXPECT_EQ(2u, countFitting(r, 0, 36, false));
   EXPECT_EQ(2u, countFitting(r, 0, 69, false));
   EXPECT_EQ(3u, countFitting(r, 0, 70, false));
-  EXPECT_EQ(1u, countFitting(r, 0, 1000, true));  // single entry
-  EXPECT_EQ(1u, countFitting(r, 2, 30, false));   // starting in the middle
-  EXPECT_EQ(0u, countFitting(r, 3, 1000, false)); // nothing left
+  EXPECT_EQ(1u, countFitting(r, 0, 1000, true));   // single entry
+  EXPECT_EQ(1u, countFitting(r, 2, 30, false));    // starting in the middle
+  EXPECT_EQ(0u, countFitting(r, 3, 1000, false));  // nothing left
 }
 
 TEST(MetaCachePack, PackedSize)
@@ -225,7 +226,8 @@ TEST(MetaCacheStore, NoCachePrefix)
 TEST(MetaCacheStore, LruEvictsLeastRecentlyUsedWithinCap)
 {
   const std::wstring p1 = L"\\P\\1", p2 = L"\\P\\2", p3 = L"\\P\\3";
-  // each entry costs Store::attrCost(leaf) plus the interned directory once; room for two
+  // each entry costs Store::attrCost(leaf) plus the interned directory once; room for
+  // two
   const size_t cap = 2 * Store::attrCost(1) + 2 * 2 + 96 + 10;
   Store s(cap);
   s.putAttr(p1, existing());
@@ -258,7 +260,7 @@ TEST(MetaCacheStore, ListingsKeyedByClassAndMask)
 TEST(MetaCacheStore, ChildWriteInvalidatesParentDirectoryAttributes)
 {
   Store s(1 << 20);
-  s.putAttr(L"\\D", existing());     // the directory itself
+  s.putAttr(L"\\D", existing());  // the directory itself
   s.putAttr(L"\\D\\F", existing());
   s.invalidatePath(L"\\D\\F");
 
@@ -297,7 +299,9 @@ TEST(MetaCacheStore, TooManyWrittenPathsSwitchCachingOff)
 TEST(MetaCachePath, NonAsciiFoldingUsesTheHookWhenSet)
 {
   EXPECT_NE(normalizePath(L"\xE9"), normalizePath(L"\xC9"));  // without a hook: exact
-  g_upcaseHook = [](wchar_t c) -> wchar_t { return c >= 0xE0 && c <= 0xFE ? c - 0x20 : c; };
+  g_upcaseHook = [](wchar_t c) -> wchar_t {
+    return c >= 0xE0 && c <= 0xFE ? c - 0x20 : c;
+  };
   EXPECT_EQ(normalizePath(L"\xE9"), normalizePath(L"\xC9"));
   g_upcaseHook = nullptr;
 }
@@ -359,21 +363,22 @@ TEST(MetaCacheFront, AbsoluteAndRelative)
   EXPECT_EQ(LR"(C:\GAME\A.ESP)", frontKey(LR"(a.esp)", LR"(c:\game)"));
   EXPECT_EQ(LR"(D:\X\Y)", frontKey(LR"(\x\y)", LR"(D:\Game)"));
   // same file, different spelling: same key
-  EXPECT_EQ(frontKey(LR"(C:\Game\Data\a.esp)", L""), frontKey(LR"(data/A.ESP)", LR"(C:\game)"));
+  EXPECT_EQ(frontKey(LR"(C:\Game\Data\a.esp)", L""),
+            frontKey(LR"(data/A.ESP)", LR"(C:\game)"));
 }
 
 TEST(MetaCacheFront, Rejected)
 {
   EXPECT_EQ(L"", frontKey(L"", LR"(C:\G)"));
-  EXPECT_EQ(L"", frontKey(L"a.esp", L""));                 // no cwd
-  EXPECT_EQ(L"", frontKey(L"a.esp", L"rel"));              // cwd not absolute
-  EXPECT_EQ(L"", frontKey(L"C:a.esp", LR"(C:\G)"));        // drive-relative
+  EXPECT_EQ(L"", frontKey(L"a.esp", L""));           // no cwd
+  EXPECT_EQ(L"", frontKey(L"a.esp", L"rel"));        // cwd not absolute
+  EXPECT_EQ(L"", frontKey(L"C:a.esp", LR"(C:\G)"));  // drive-relative
   EXPECT_EQ(L"", frontKey(LR"(\\?\C:\a)", L""));
   EXPECT_EQ(L"", frontKey(LR"(\\.\pipe\x)", LR"(C:\G)"));
   EXPECT_EQ(L"", frontKey(LR"(\\srv\share\a)", LR"(C:\G)"));
   EXPECT_EQ(L"", frontKey(LR"(C:\a\..\b)", L""));
   EXPECT_EQ(L"", frontKey(LR"(C:\a\.\b)", L""));
-  EXPECT_EQ(L"", frontKey(LR"(C:\a\)", L""));              // trailing separator
+  EXPECT_EQ(L"", frontKey(LR"(C:\a\)", L""));  // trailing separator
   EXPECT_EQ(L"", frontKey(LR"(C:\a.)", L""));
   EXPECT_EQ(L"", frontKey(LR"(C:\a )", L""));
   EXPECT_EQ(L"", frontKey(LR"(C:\a\\b)", L""));
@@ -394,7 +399,8 @@ TEST(MetaCacheFront, EnumKey)
   EXPECT_EQ(k, frontEnumKey(L"*.esp", LR"(C:\Game\Data\)", 0, 0));
   // search parameters are part of the key
   EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 1, 0));
-  EXPECT_EQ(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 0, 2));  // large fetch: same result
+  EXPECT_EQ(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 0,
+                            2));  // large fetch: same result
   EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 0, 4));  // on-disk only
   EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esm)", L"", 0, 0));
   // drive root
@@ -416,14 +422,14 @@ TEST(MetaCacheFront, EnumKeyDoubledSeparators)
 TEST(MetaCacheFront, EnumKeyRejected)
 {
   EXPECT_EQ(L"", frontEnumKey(L"", LR"(C:\G)", 0, 0));
-  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\)", L"", 0, 0));            // empty mask
-  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\*)", L"", 2, 0));          // info level
-  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\*)", L"", 0, 1));          // case-sensitive flag
-  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\a:b)", L"", 0, 0));        // stream in mask
-  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\..\*)", L"", 0, 0));       // dot-dot in directory
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\)", L"", 0, 0));      // empty mask
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\*)", L"", 2, 0));     // info level
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\*)", L"", 0, 1));     // case-sensitive flag
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\a:b)", L"", 0, 0));   // stream in mask
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\..\*)", L"", 0, 0));  // dot-dot in directory
   EXPECT_EQ(L"", frontEnumKey(LR"(\\?\C:\G\*)", L"", 0, 0));
-  EXPECT_EQ(L"", frontEnumKey(L"*", L"", 0, 0));                  // no cwd
-  EXPECT_EQ(L"", frontEnumKey(LR"(\*)", LR"(C:\G)", 0, 0));       // rooted without drive
+  EXPECT_EQ(L"", frontEnumKey(L"*", L"", 0, 0));             // no cwd
+  EXPECT_EQ(L"", frontEnumKey(LR"(\*)", LR"(C:\G)", 0, 0));  // rooted without drive
 }
 
 TEST(MetaCacheFront, PrewarmRank)
@@ -432,7 +438,8 @@ TEST(MetaCacheFront, PrewarmRank)
   EXPECT_EQ(0, frontPrewarmRank("Z:/game/data/Meshes"));
   EXPECT_EQ(0, frontPrewarmRank("Z:\\game\\DATA"));
   EXPECT_LT(frontPrewarmRank("Z:/game/data/meshes"), frontPrewarmRank("Z:/game/saves"));
-  EXPECT_GT(frontPrewarmRank("Z:/game/data/meshes/actors"), frontPrewarmRank("Z:/game/saves"));
+  EXPECT_GT(frontPrewarmRank("Z:/game/data/meshes/actors"),
+            frontPrewarmRank("Z:/game/saves"));
   EXPECT_LT(frontPrewarmRank("Z:/a"), frontPrewarmRank("Z:/a/b"));
   EXPECT_EQ(1, frontPrewarmRank(""));
   EXPECT_EQ(0, frontPrewarmRank("Z:/data/game/Data/meshes"));
@@ -463,7 +470,7 @@ TEST(MetaCacheNegative, Split)
   EXPECT_EQ(L"x.esp", c[3]);
   ASSERT_TRUE(negSplit(L"Z:/a/b", c));
   EXPECT_EQ(3u, c.size());
-  EXPECT_FALSE(negSplit(LR"(\??\C:\a\)", c));       // trailing separator
+  EXPECT_FALSE(negSplit(LR"(\??\C:\a\)", c));  // trailing separator
   EXPECT_FALSE(negSplit(LR"(\??\C:\a\..\b)", c));
   EXPECT_FALSE(negSplit(LR"(\??\C:\a\.\b)", c));
   EXPECT_FALSE(negSplit(LR"(\??\C:\a\b*)", c));
@@ -488,11 +495,14 @@ TEST(MetaCacheNegative, Decision)
         p += (i ? L"\\" : L"") + c[i];
       for (wchar_t& ch : p)
         ch = foldChar(ch);
-      if (p == L"C:" || p == L"C:\\G" || p == L"C:\\G\\DATA" || p == L"C:\\G\\DATA\\MESHES")
+      if (p == L"C:" || p == L"C:\\G" || p == L"C:\\G\\DATA" ||
+          p == L"C:\\G\\DATA\\MESHES")
         return NegNode::Dir;
       return p == L"C:\\G\\DATA\\A.ESP" ? NegNode::File : NegNode::None;
     };
-    return deriveNegative(c.size(), node, [&](size_t) { return answer; });
+    return deriveNegative(c.size(), node, [&](size_t) {
+      return answer;
+    });
   };
   // parent is a directory node, name not in its contents
   EXPECT_EQ(NegVerdict::FileNotFound, run(LR"(C:\g\data\b.esp)", NegChild::Absent));
@@ -503,12 +513,15 @@ TEST(MetaCacheNegative, Decision)
   EXPECT_EQ(NegVerdict::Unknown, run(LR"(C:\g\data\a.esp)", NegChild::Absent));
   EXPECT_EQ(NegVerdict::Unknown, run(LR"(C:\g\data\meshes)", NegChild::Absent));
   // intermediate directory absent: PATH_NOT_FOUND
-  EXPECT_EQ(NegVerdict::PathNotFound, run(LR"(C:\g\data\textures\x.dds)", NegChild::Absent));
-  EXPECT_EQ(NegVerdict::PathNotFound, run(LR"(C:\g\data\textures\a\x.dds)", NegChild::Absent));
+  EXPECT_EQ(NegVerdict::PathNotFound,
+            run(LR"(C:\g\data\textures\x.dds)", NegChild::Absent));
+  EXPECT_EQ(NegVerdict::PathNotFound,
+            run(LR"(C:\g\data\textures\a\x.dds)", NegChild::Absent));
   // a file used as a directory, and no tree ancestor below the drive
   EXPECT_EQ(NegVerdict::Unknown, run(LR"(C:\g\data\a.esp\x)", NegChild::Absent));
   EXPECT_EQ(NegVerdict::Unknown, run(LR"(D:\x\y)", NegChild::Absent));
-  EXPECT_EQ(NegVerdict::FileNotFound, run(L"C:\\x", NegChild::Absent));  // parent = drive node
+  EXPECT_EQ(NegVerdict::FileNotFound,
+            run(L"C:\\x", NegChild::Absent));  // parent = drive node
 }
 
 TEST(MetaCacheNegative, ListingAnyStar)

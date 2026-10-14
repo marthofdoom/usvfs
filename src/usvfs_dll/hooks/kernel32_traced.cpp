@@ -1,6 +1,6 @@
+#include "../trace.h"
 #include "kernel32.h"
 #include "kernel32_impl.h"
-#include "../trace.h"
 
 // kernel32 hooks wrapped for the harness trace (USVFS_TRACE): the application's
 // arguments are recorded at entry, when no hook group is active on the thread.
@@ -12,20 +12,22 @@ namespace usvfs
 
 namespace
 {
-#define TRACE_END(call)                                                             \
-  if (ts.on()) {                                                                    \
-    const DWORD err_ = ::GetLastError();                                            \
-    trace::call;                                                                    \
-    ::SetLastError(err_);                                                           \
+#define TRACE_END(call)                                                                \
+  if (ts.on()) {                                                                       \
+    const DWORD err_ = ::GetLastError();                                               \
+    trace::call;                                                                       \
+    ::SetLastError(err_);                                                              \
   }
 }  // namespace
 
-BOOL WINAPI hook_GetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId,
+BOOL WINAPI hook_GetFileAttributesExW(LPCWSTR lpFileName,
+                                      GET_FILEEX_INFO_LEVELS fInfoLevelId,
                                       LPVOID lpFileInformation)
 {
   trace::Scope ts;
   ts.keepLastError();
-  const BOOL res = impl_GetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+  const BOOL res =
+      impl_GetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
   TRACE_END(recGetAttrEx(ts, lpFileName, fInfoLevelId, res, err_));
   return res;
 }
@@ -45,14 +47,17 @@ HANDLE WINAPI hook_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfo
 {
   trace::Scope ts;
   ts.keepLastError();
-  const HANDLE res = impl_FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp,
-                                           lpSearchFilter, dwAdditionalFlags);
-  TRACE_END(recFindFirst(ts, lpFileName, fInfoLevelId, fSearchOp, dwAdditionalFlags, res, err_));
+  const HANDLE res =
+      impl_FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp,
+                            lpSearchFilter, dwAdditionalFlags);
+  TRACE_END(recFindFirst(ts, lpFileName, fInfoLevelId, fSearchOp, dwAdditionalFlags,
+                         res, err_));
   return res;
 }
 
-DWORD WINAPI hook_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, LPCSTR lpDefault,
-                                           LPSTR lpReturnedString, DWORD nSize, LPCSTR lpFileName)
+DWORD WINAPI hook_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName,
+                                           LPCSTR lpDefault, LPSTR lpReturnedString,
+                                           DWORD nSize, LPCSTR lpFileName)
 {
   trace::Scope ts;
   ts.keepLastError();
@@ -62,8 +67,9 @@ DWORD WINAPI hook_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, L
   return res;
 }
 
-DWORD WINAPI hook_GetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpDefault,
-                                           LPWSTR lpReturnedString, DWORD nSize, LPCWSTR lpFileName)
+DWORD WINAPI hook_GetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName,
+                                           LPCWSTR lpDefault, LPWSTR lpReturnedString,
+                                           DWORD nSize, LPCWSTR lpFileName)
 {
   trace::Scope ts;
   ts.keepLastError();
@@ -73,22 +79,24 @@ DWORD WINAPI hook_GetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName,
   return res;
 }
 
-DWORD WINAPI hook_GetPrivateProfileSectionA(LPCSTR lpAppName, LPSTR lpReturnedString, DWORD nSize,
-                                            LPCSTR lpFileName)
+DWORD WINAPI hook_GetPrivateProfileSectionA(LPCSTR lpAppName, LPSTR lpReturnedString,
+                                            DWORD nSize, LPCSTR lpFileName)
 {
   trace::Scope ts;
   ts.keepLastError();
-  const DWORD res = impl_GetPrivateProfileSectionA(lpAppName, lpReturnedString, nSize, lpFileName);
+  const DWORD res =
+      impl_GetPrivateProfileSectionA(lpAppName, lpReturnedString, nSize, lpFileName);
   TRACE_END(recProfile(ts, true, true, lpAppName, nullptr, lpFileName, nSize, res));
   return res;
 }
 
-DWORD WINAPI hook_GetPrivateProfileSectionW(LPCWSTR lpAppName, LPWSTR lpReturnedString, DWORD nSize,
-                                            LPCWSTR lpFileName)
+DWORD WINAPI hook_GetPrivateProfileSectionW(LPCWSTR lpAppName, LPWSTR lpReturnedString,
+                                            DWORD nSize, LPCWSTR lpFileName)
 {
   trace::Scope ts;
   ts.keepLastError();
-  const DWORD res = impl_GetPrivateProfileSectionW(lpAppName, lpReturnedString, nSize, lpFileName);
+  const DWORD res =
+      impl_GetPrivateProfileSectionW(lpAppName, lpReturnedString, nSize, lpFileName);
   TRACE_END(recProfile(ts, true, false, lpAppName, nullptr, lpFileName, nSize, res));
   return res;
 }
@@ -143,7 +151,8 @@ BOOL WINAPI hook_MoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName)
   return res;
 }
 
-BOOL WINAPI hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags)
+BOOL WINAPI hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName,
+                             DWORD dwFlags)
 {
   trace::Scope ts;
   ts.keepLastError();
@@ -152,22 +161,24 @@ BOOL WINAPI hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, 
   return res;
 }
 
-BOOL WINAPI hook_WritePrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, LPCSTR lpString,
-                                            LPCSTR lpFileName)
+BOOL WINAPI hook_WritePrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName,
+                                            LPCSTR lpString, LPCSTR lpFileName)
 {
   trace::Scope ts;
   ts.keepLastError();
-  const BOOL res = impl_WritePrivateProfileStringA(lpAppName, lpKeyName, lpString, lpFileName);
+  const BOOL res =
+      impl_WritePrivateProfileStringA(lpAppName, lpKeyName, lpString, lpFileName);
   TRACE_END(recWriteMarker(ts, 3, true, lpFileName));
   return res;
 }
 
-BOOL WINAPI hook_WritePrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpString,
-                                            LPCWSTR lpFileName)
+BOOL WINAPI hook_WritePrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName,
+                                            LPCWSTR lpString, LPCWSTR lpFileName)
 {
   trace::Scope ts;
   ts.keepLastError();
-  const BOOL res = impl_WritePrivateProfileStringW(lpAppName, lpKeyName, lpString, lpFileName);
+  const BOOL res =
+      impl_WritePrivateProfileStringW(lpAppName, lpKeyName, lpString, lpFileName);
   TRACE_END(recWriteMarker(ts, 3, false, lpFileName));
   return res;
 }

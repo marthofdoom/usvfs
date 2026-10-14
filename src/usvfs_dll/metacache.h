@@ -3,25 +3,32 @@ Userspace Virtual Filesystem
 
 This file is part of usvfs.
 
-usvfs is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
+usvfs is free software:
+ * you can redistribute it and/or modify
+it under the terms of the GNU General Public
+ * License as published by
+the Free Software Foundation, either version 3 of the
+ * License, or
 (at your option) any later version.
 
-usvfs is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
+usvfs is distributed in the hope
+ * that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty
+ * of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
+GNU General Public
+ * License for more details.
 
-You should have received a copy of the GNU General Public License
+You should have received a copy of the GNU General Public
+ * License
 along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
 
 #include <atomic>
+#include <ntdll_declarations.h>
 #include <string>
 #include <string_view>
-#include <ntdll_declarations.h>
 
 // In-process file metadata cache: results of NtQueryAttributesFile /
 // NtQueryFullAttributesFile (including "not found") and the raw record lists of
@@ -32,8 +39,9 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 //
 // Configuration (environment, read once in init()):
 //   USVFS_METACACHE=1|0                force on/off (default: on only in SkyrimSE.exe)
-//   USVFS_METACACHE_MB=auto            memory cap (auto: RAM/64 clamped 256..1024) (auto: RAM/64 clamped 256..1024)
-//   USVFS_METACACHE_FRONT_ENUM=1|0     enumeration front cache (default: on with the
+//   USVFS_METACACHE_MB=auto            memory cap (auto: RAM/64 clamped 256..1024)
+//   (auto: RAM/64 clamped 256..1024) USVFS_METACACHE_FRONT_ENUM=1|0     enumeration
+//   front cache (default: on with the
 //                                      metacache; memory: half of USVFS_METACACHE_MB)
 //   USVFS_METACACHE_FRONT=1|0          front cache for GetFileAttributesW/ExW keyed
 //                                      by the virtual path (default: on with the
@@ -74,7 +82,10 @@ enum class Hook : int
 // counts a call of a hook that otherwise does no metacache work (profile only)
 void noteHook(Hook h);
 
-inline bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
+inline bool enabled()
+{
+  return g_enabled.load(std::memory_order_relaxed);
+}
 
 void init();
 
@@ -93,7 +104,8 @@ std::wstring makeKey(std::wstring_view ntPath);
 // system; results from before an invalidation are then dropped)
 uint64_t generation();
 
-bool lookupBasic(const std::wstring& key, PFILE_BASIC_INFORMATION out, NTSTATUS& status);
+bool lookupBasic(const std::wstring& key, PFILE_BASIC_INFORMATION out,
+                 NTSTATUS& status);
 bool lookupFull(const std::wstring& key, PFILE_NETWORK_OPEN_INFORMATION out,
                 NTSTATUS& status);
 void storeBasic(const std::wstring& key, NTSTATUS status,
@@ -150,9 +162,9 @@ struct FrontTicket
 
 struct FrontResult
 {
-  bool ok = false;
-  DWORD err = 0;   // GetLastError of the call
-  DWORD attr = 0;  // GetFileAttributesW result (ok)
+  bool ok                        = false;
+  DWORD err                      = 0;   // GetLastError of the call
+  DWORD attr                     = 0;   // GetFileAttributesW result (ok)
   WIN32_FILE_ATTRIBUTE_DATA data = {};  // GetFileAttributesExW (ok)
 };
 
@@ -187,11 +199,12 @@ bool enumFrontEnabled();
 // registry exists (also true after shutdown(), so open searches are still routed)
 bool enumFrontActive();
 // true if answered from a listing (res/err are the results; `data` is filled)
-bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, DWORD flags,
-               void* data, HANDLE& res, DWORD& err, EnumTicket& ticket);
+bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter,
+               DWORD flags, void* data, HANDLE& res, DWORD& err, EnumTicket& ticket);
 // after the real FindFirstFileExW; `first`: its data (if it succeeded)
-void enumRecordFirst(const EnumTicket& ticket, const wchar_t* canonicalName, int infoLevel,
-                     DWORD flags, HANDLE res, DWORD err, const WIN32_FIND_DATAW* first);
+void enumRecordFirst(const EnumTicket& ticket, const wchar_t* canonicalName,
+                     int infoLevel, DWORD flags, HANDLE res, DWORD err,
+                     const WIN32_FIND_DATAW* first);
 bool enumNext(HANDLE h, WIN32_FIND_DATAW* data, BOOL& result, DWORD& err);
 void enumAfterNext(HANDLE h, BOOL result, DWORD err, const WIN32_FIND_DATAW* data);
 // true if `h` was a replayed search (now freed; the caller returns TRUE)

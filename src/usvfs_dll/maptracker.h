@@ -1,8 +1,8 @@
 #pragma once
 
-#include "metacache.h"
 #include "hookcallcontext.h"
 #include "hookcontext.h"
+#include "metacache.h"
 #include "stringcast.h"
 
 namespace usvfs
@@ -578,7 +578,7 @@ public:
     // check virtualized paths
     DWORD virtAttr = GetFileAttributesW(lpFileName);
     bool isFile    = virtAttr != INVALID_FILE_ATTRIBUTES &&
-                  (virtAttr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+                     (virtAttr & FILE_ATTRIBUTE_DIRECTORY) == 0;
     m_isDir =
         virtAttr != INVALID_FILE_ATTRIBUTES && (virtAttr & FILE_ATTRIBUTE_DIRECTORY);
 

@@ -20,13 +20,13 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
 
-#include <mutex>
 #include "dllimport.h"
 #include "redirectiontree.h"
 #include "semaphore.h"
 #include "tree_container.h"
 #include <directory_tree.h>
 #include <exceptionex.h>
+#include <mutex>
 #include <usvfsparameters.h>
 #include <usvfsparametersprivate.h>
 #include <winapi.h>

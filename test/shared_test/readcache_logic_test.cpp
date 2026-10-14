@@ -32,12 +32,11 @@ TEST(ReadCacheEligibility, GoodHandleIsEligible)
 
 TEST(ReadCacheEligibility, DiskFileSystemDeviceTypeIsAccepted)
 {
-  auto a = goodAttrs();
+  auto a       = goodAttrs();
   a.deviceType = kDeviceTypeDiskFileSystem;
   EXPECT_EQ(Eligibility::Eligible, evaluateEligibility(a, Limits{}));
   for (uint32_t t : {0x3u /* cdrom */, 0x13u /* cdrom fs */, 0x14u /* network fs */,
-                     0x11u /* named pipe */, 0x0u})
-  {
+                     0x11u /* named pipe */, 0x0u}) {
     a.deviceType = t;
     EXPECT_EQ(Eligibility::NotDisk, evaluateEligibility(a, Limits{})) << t;
   }
@@ -54,22 +53,22 @@ TEST(ReadCacheEligibility, Rejections)
 {
   Limits l;
   {
-    auto a = goodAttrs();
+    auto a          = goodAttrs();
     a.hasEventOrApc = true;
     EXPECT_EQ(Eligibility::EventOrApc, evaluateEligibility(a, l));
   }
   {
-    auto a = goodAttrs();
+    auto a      = goodAttrs();
     a.queriesOk = false;
     EXPECT_EQ(Eligibility::QueryFailed, evaluateEligibility(a, l));
   }
   {
-    auto a = goodAttrs();
+    auto a       = goodAttrs();
     a.deviceType = 0x12;  // network file system
     EXPECT_EQ(Eligibility::NotDisk, evaluateEligibility(a, l));
   }
   {
-    auto a = goodAttrs();
+    auto a      = goodAttrs();
     a.directory = true;
     EXPECT_EQ(Eligibility::Directory, evaluateEligibility(a, l));
   }
@@ -84,7 +83,7 @@ TEST(ReadCacheEligibility, Rejections)
     EXPECT_EQ(Eligibility::NoBuffering, evaluateEligibility(a, l));
   }
   {
-    auto a = goodAttrs();
+    auto a   = goodAttrs();
     a.access = 0x100000;
     EXPECT_EQ(Eligibility::NotReadable, evaluateEligibility(a, l));
   }
@@ -99,12 +98,12 @@ TEST(ReadCacheEligibility, Rejections)
     EXPECT_EQ(Eligibility::Writable, evaluateEligibility(a, l));
   }
   {
-    auto a = goodAttrs();
+    auto a      = goodAttrs();
     a.endOfFile = l.maxFileBytes + 1;
     EXPECT_EQ(Eligibility::TooLarge, evaluateEligibility(a, l));
   }
   {
-    auto a = goodAttrs();
+    auto a            = goodAttrs();
     a.firstReadLength = kSmallReadLimit;
     EXPECT_EQ(Eligibility::BigRead, evaluateEligibility(a, l));
   }
@@ -116,14 +115,14 @@ TEST(ReadCacheEligibility, FileLimitBoundaryAndBudget)
   l.maxFileBytes = 1000;
   l.budgetBytes  = 500;
 
-  auto a = goodAttrs();
+  auto a      = goodAttrs();
   a.endOfFile = 500;
   EXPECT_EQ(Eligibility::Eligible, evaluateEligibility(a, l));
   a.endOfFile = 501;  // above the budget, even though below the file cap
   EXPECT_EQ(Eligibility::TooLarge, evaluateEligibility(a, l));
 
   l.budgetBytes = 5000;
-  a.endOfFile = 1000;
+  a.endOfFile   = 1000;
   EXPECT_EQ(Eligibility::Eligible, evaluateEligibility(a, l));
   a.endOfFile = 1001;
   EXPECT_EQ(Eligibility::TooLarge, evaluateEligibility(a, l));
@@ -131,7 +130,7 @@ TEST(ReadCacheEligibility, FileLimitBoundaryAndBudget)
 
 TEST(ReadCacheEligibility, SmallReadBoundary)
 {
-  auto a = goodAttrs();
+  auto a            = goodAttrs();
   a.firstReadLength = kSmallReadLimit - 1;
   EXPECT_EQ(Eligibility::Eligible, evaluateEligibility(a, Limits{}));
 }
@@ -307,22 +306,27 @@ TEST(ReadCacheSplit, Capability)
   EXPECT_TRUE(splitCapable(a));
   a.deviceType = 0x14;
   EXPECT_FALSE(splitCapable(a));
-  a = goodAttrs(); a.directory = true;
+  a           = goodAttrs();
+  a.directory = true;
   EXPECT_FALSE(splitCapable(a));
-  a = goodAttrs(); a.mode = 0;
+  a      = goodAttrs();
+  a.mode = 0;
   EXPECT_FALSE(splitCapable(a));
-  a = goodAttrs(); a.mode |= kModeNoIntermediateBuffering;
+  a = goodAttrs();
+  a.mode |= kModeNoIntermediateBuffering;
   EXPECT_FALSE(splitCapable(a));
-  a = goodAttrs(); a.access |= kAccessWriteData;
+  a = goodAttrs();
+  a.access |= kAccessWriteData;
   EXPECT_FALSE(splitCapable(a));
-  a = goodAttrs(); a.access = 0;
+  a        = goodAttrs();
+  a.access = 0;
   EXPECT_FALSE(splitCapable(a));
 }
 
 TEST(ReadCacheSplit, PlansEqualChunks)
 {
   const uint64_t K = 1024;
-  SplitPlan p = planSplit(0, 1024 * K, 10000 * K, 256 * K, 256 * K);
+  SplitPlan p      = planSplit(0, 1024 * K, 10000 * K, 256 * K, 256 * K);
   ASSERT_EQ(SplitAction::Split, p.action);
   EXPECT_EQ(1024 * K, p.total);
   ASSERT_EQ(4u, p.chunks.size());
@@ -337,7 +341,7 @@ TEST(ReadCacheSplit, PlansEqualChunks)
 TEST(ReadCacheSplit, ShortTailChunk)
 {
   const uint64_t K = 1024;
-  SplitPlan p = planSplit(100, 600 * K, 10000 * K, 256 * K, 256 * K);
+  SplitPlan p      = planSplit(100, 600 * K, 10000 * K, 256 * K, 256 * K);
   ASSERT_EQ(SplitAction::Split, p.action);
   ASSERT_EQ(3u, p.chunks.size());
   EXPECT_EQ(100u, p.chunks[0].offset);
@@ -360,25 +364,30 @@ TEST(ReadCacheSplit, ClampsToEndOfFile)
 TEST(ReadCacheSplit, EndOfFileAndNotWorthIt)
 {
   const uint64_t K = 1024;
-  EXPECT_EQ(SplitAction::EndOfFile, planSplit(1000 * K, 1024 * K, 1000 * K, 256 * K, 256 * K).action);
-  EXPECT_EQ(SplitAction::EndOfFile, planSplit(2000 * K, 1024 * K, 1000 * K, 256 * K, 256 * K).action);
+  EXPECT_EQ(SplitAction::EndOfFile,
+            planSplit(1000 * K, 1024 * K, 1000 * K, 256 * K, 256 * K).action);
+  EXPECT_EQ(SplitAction::EndOfFile,
+            planSplit(2000 * K, 1024 * K, 1000 * K, 256 * K, 256 * K).action);
   // below the minimum length
-  EXPECT_EQ(SplitAction::Passthrough, planSplit(0, 128 * K, 10000 * K, 256 * K, 256 * K).action);
+  EXPECT_EQ(SplitAction::Passthrough,
+            planSplit(0, 128 * K, 10000 * K, 256 * K, 256 * K).action);
   // only one chunk worth of data left
-  EXPECT_EQ(SplitAction::Passthrough, planSplit(900 * K, 1024 * K, 1000 * K, 256 * K, 256 * K).action);
-  EXPECT_EQ(SplitAction::Passthrough, planSplit(0, 0, 1000 * K, 256 * K, 256 * K).action);
+  EXPECT_EQ(SplitAction::Passthrough,
+            planSplit(900 * K, 1024 * K, 1000 * K, 256 * K, 256 * K).action);
+  EXPECT_EQ(SplitAction::Passthrough,
+            planSplit(0, 0, 1000 * K, 256 * K, 256 * K).action);
 }
 
 TEST(ReadCacheSequential, Detection)
 {
   SeqState s;
-  EXPECT_FALSE(updateSequential(s, 0, 100));     // first read
-  EXPECT_TRUE(updateSequential(s, 100, 100));    // continues
+  EXPECT_FALSE(updateSequential(s, 0, 100));   // first read
+  EXPECT_TRUE(updateSequential(s, 100, 100));  // continues
   EXPECT_EQ(1u, s.run);
   EXPECT_TRUE(updateSequential(s, 200, 50));
   EXPECT_EQ(2u, s.run);
   EXPECT_GE(s.run, kSequentialRunForReadahead);
-  EXPECT_FALSE(updateSequential(s, 1000, 50));   // jump
+  EXPECT_FALSE(updateSequential(s, 1000, 50));  // jump
   EXPECT_EQ(0u, s.run);
   EXPECT_TRUE(updateSequential(s, 1050, 10));
   EXPECT_EQ(1u, s.run);
@@ -387,7 +396,7 @@ TEST(ReadCacheSequential, Detection)
 TEST(ReadCacheReadahead, WindowPlanning)
 {
   const uint64_t M = 1u << 20;
-  WindowPlan w = planWindow(10 * M, 1 * M, 100 * M, 64 * M);
+  WindowPlan w     = planWindow(10 * M, 1 * M, 100 * M, 64 * M);
   EXPECT_EQ(10 * M, w.start);
   EXPECT_EQ(2 * M, w.length);
 
@@ -418,10 +427,10 @@ TEST(ReadCacheReadahead, CoverageAndRenewal)
   EXPECT_FALSE(windowCovers(100, 100, 100, 0));
 
   EXPECT_TRUE(needNewWindow(false, 0, 0, 0, 10));
-  EXPECT_FALSE(needNewWindow(true, 100, 100, 100, 50));   // room for another read
+  EXPECT_FALSE(needNewWindow(true, 100, 100, 100, 50));  // room for another read
   EXPECT_FALSE(needNewWindow(true, 100, 100, 150, 50));
-  EXPECT_TRUE(needNewWindow(true, 100, 100, 151, 50));    // can't satisfy the next one
-  EXPECT_TRUE(needNewWindow(true, 100, 100, 50, 10));     // behind the window
+  EXPECT_TRUE(needNewWindow(true, 100, 100, 151, 50));  // can't satisfy the next one
+  EXPECT_TRUE(needNewWindow(true, 100, 100, 50, 10));   // behind the window
 }
 
 TEST(ReadCacheReadahead, NextWindowWhenHalfConsumed)

@@ -3,17 +3,24 @@ Userspace Virtual Filesystem
 
 This file is part of usvfs.
 
-usvfs is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
+usvfs is free software:
+ * you can redistribute it and/or modify
+it under the terms of the GNU General Public
+ * License as published by
+the Free Software Foundation, either version 3 of the
+ * License, or
 (at your option) any later version.
 
-usvfs is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
+usvfs is distributed in the hope
+ * that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty
+ * of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
+GNU General Public
+ * License for more details.
 
-You should have received a copy of the GNU General Public License
+You should have received a copy of the GNU General Public
+ * License
 along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
@@ -64,18 +71,23 @@ inline std::wstring normalizePath(std::wstring_view path)
   out.reserve(path.size());
   for (wchar_t c : path)
     out.push_back(foldChar(c));
-  while (out.size() > 1 && out.back() == L'\\' && !(out.size() >= 2 && out[out.size() - 2] == L':'))
+  while (out.size() > 1 && out.back() == L'\\' &&
+         !(out.size() >= 2 && out[out.size() - 2] == L':'))
     out.pop_back();
   return out;
 }
 
 // ---- front cache keys ----
 
-inline bool frontIsSep(wchar_t c) { return c == L'\\' || c == L'/'; }
+inline bool frontIsSep(wchar_t c)
+{
+  return c == L'\\' || c == L'/';
+}
 
 inline bool frontIsDriveAbs(std::wstring_view p)
 {
-  return p.size() >= 3 && ((p[0] >= L'a' && p[0] <= L'z') || (p[0] >= L'A' && p[0] <= L'Z')) &&
+  return p.size() >= 3 &&
+         ((p[0] >= L'a' && p[0] <= L'z') || (p[0] >= L'A' && p[0] <= L'Z')) &&
          p[1] == L':' && frontIsSep(p[2]);
 }
 
@@ -84,7 +96,8 @@ inline bool frontIsDriveAbs(std::wstring_view p)
 // relative names. Empty if the name is not safe to cache: anything that the
 // system would interpret (".", "..", trailing dot/space/separator, streams,
 // wildcards, device/UNC/\\?\ forms, drive-relative names, empty segments).
-inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd, int* why = nullptr)
+inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd,
+                             int* why = nullptr)
 {
   auto fail = [&](int code) {
     if (why)
@@ -122,7 +135,8 @@ inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd, int*
     while (end < abs.size() && !frontIsSep(abs[end]))
       ++end;
     const std::wstring_view seg(abs.data() + pos, end - pos);
-    if (seg.empty() || seg == L"." || seg == L".." || seg.back() == L'.' || seg.back() == L' ')
+    if (seg.empty() || seg == L"." || seg == L".." || seg.back() == L'.' ||
+        seg.back() == L' ')
       return fail(6);
     for (wchar_t c : seg) {
       if (c < 32 || c == L':' || c == L'*' || c == L'?' || c == L'<' || c == L'>' ||
@@ -140,8 +154,9 @@ inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd, int*
 // directory (frontKey rules) plus the folded mask and the search parameters.
 // Empty if the search is not cacheable. `cwd` is used for a bare mask and for
 // relative directories.
-inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, int infoLevel,
-                                 unsigned long flags, std::wstring* dirKeyOut = nullptr, int* why = nullptr)
+inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd,
+                                 int infoLevel, unsigned long flags,
+                                 std::wstring* dirKeyOut = nullptr, int* why = nullptr)
 {
   auto fail = [&](int code) {
     if (why)
@@ -180,7 +195,7 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
     if (c < 32 || c == L':')
       return fail(16);
   }
-  int dirWhy = 0;
+  int dirWhy                = 0;
   const std::wstring dirKey = frontKey(dir, cwd, &dirWhy);
   if (dirKey.empty())
     return fail(20 + dirWhy);
@@ -189,7 +204,8 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
   std::wstring key = dirKey;
   key.push_back(L'\x03');
   key.push_back(static_cast<wchar_t>(L'0' + infoLevel));
-  key.push_back(static_cast<wchar_t>(L'0' + (flags & 4)));  // large fetch does not change the result
+  key.push_back(static_cast<wchar_t>(
+      L'0' + (flags & 4)));  // large fetch does not change the result
   key.push_back(L'\x03');
   for (wchar_t c : mask)
     key.push_back(foldChar(c));
@@ -197,9 +213,9 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
 }
 
 // Visiting order of the enumeration front pre-warm (lower first): the "Data"
-// directory (the last segment named data) and its direct children (what the game lists first) rank 0, every
-// other directory ranks by its depth (breadth-first), below Data by 1 + depth.
-// `vpath` uses '/' or '\\' separators.
+// directory (the last segment named data) and its direct children (what the game lists
+// first) rank 0, every other directory ranks by its depth (breadth-first), below Data
+// by 1 + depth. `vpath` uses '/' or '\\' separators.
 inline int frontPrewarmRankByName(std::string_view vpath);
 
 inline std::string normalizeDataRoot(std::string_view path)
@@ -219,11 +235,12 @@ inline std::string normalizeDataRoot(std::string_view path)
 // With an explicit `dataRoot` (normalizeDataRoot form) the ranking is: the root,
 // its direct children and every ancestor of the root rank 0 (ancestors must be
 // walked to get there), all else 1 + depth. Without one, the name heuristic below.
-inline int frontPrewarmRank(std::string_view vpath, const std::string& dataRoot = std::string())
+inline int frontPrewarmRank(std::string_view vpath,
+                            const std::string& dataRoot = std::string())
 {
   if (!dataRoot.empty()) {
     const std::string v = normalizeDataRoot(vpath);
-    auto depthOf = [](const std::string& p) {
+    auto depthOf        = [](const std::string& p) {
       int d = 0;
       for (size_t i = 0; i < p.size();) {
         size_t e = p.find('/', i);
@@ -392,7 +409,8 @@ inline size_t countFitting(const std::vector<size_t>& rawLengths, size_t first,
 
 // size of the data written for `count` records starting at `first`
 // (information value of the call)
-inline size_t packedSize(const std::vector<size_t>& rawLengths, size_t first, size_t count)
+inline size_t packedSize(const std::vector<size_t>& rawLengths, size_t first,
+                         size_t count)
 {
   if (count == 0)
     return 0;
@@ -407,14 +425,14 @@ inline size_t packedSize(const std::vector<size_t>& rawLengths, size_t first, si
 
 struct Attr
 {
-  int32_t status   = 0;
-  bool full        = false;  // allocation size / end of file are valid
-  int64_t creation = 0;
-  int64_t access   = 0;
-  int64_t write    = 0;
-  int64_t change   = 0;
-  int64_t allocation = 0;
-  int64_t endOfFile  = 0;
+  int32_t status      = 0;
+  bool full           = false;  // allocation size / end of file are valid
+  int64_t creation    = 0;
+  int64_t access      = 0;
+  int64_t write       = 0;
+  int64_t change      = 0;
+  int64_t allocation  = 0;
+  int64_t endOfFile   = 0;
   uint32_t attributes = 0;
 };
 
@@ -522,8 +540,8 @@ public:
   {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = findAttr(path);
-    if (it == m_attrs.end() || (needFull && !it->second.attr.full &&
-                                it->second.attr.status >= 0)) {
+    if (it == m_attrs.end() ||
+        (needFull && !it->second.attr.full && it->second.attr.status >= 0)) {
       ++m_stats.attrMisses;
       return false;
     }
@@ -627,7 +645,7 @@ public:
     if (isBlocked(dir) || m_volatileDirs.count(dir) ||
         (generation != kAnyGeneration && generation != m_generation))
       return;
-    auto dirIt = m_dirs.try_emplace(dir).first;
+    auto dirIt                   = m_dirs.try_emplace(dir).first;
     std::vector<ListSlot>& slots = dirIt->second;
     for (ListSlot& slot : slots) {
       if (slot.cls == cls && slot.mask == mask)
@@ -690,9 +708,9 @@ public:
       // compare the interned directory first: no string is built for entries that
       // are clearly outside (or inside) the tree
       const std::wstring& entryDir = *m_dirNames[it->first.dir];
-      const bool under = entryDir.size() >= path.size()
-                             ? isUnderPrefix(entryDir, path)
-                             : isUnderPrefix(attrPath(it->first), path);
+      const bool under             = entryDir.size() >= path.size()
+                                         ? isUnderPrefix(entryDir, path)
+                                         : isUnderPrefix(attrPath(it->first), path);
       if (under) {
         m_bytes -= std::min(m_bytes, it->second.lru->bytes);
         m_lru.erase(it->second.lru);
@@ -775,7 +793,8 @@ public:
     return m_attrs.size();
   }
 
-  // accounted bytes of attribute entries and of listings, and the entries in the listings
+  // accounted bytes of attribute entries and of listings, and the entries in the
+  // listings
   void breakdown(uint64_t& attrBytes, uint64_t& listBytes, uint64_t& listEntries) const
   {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -828,10 +847,10 @@ private:
 
   struct Node
   {
-    bool isAttr = true;
+    bool isAttr              = true;
     const AttrKey* akey      = nullptr;  // attr: key inside m_attrs (node-stable)
     const std::wstring* dkey = nullptr;  // listing: key inside m_dirs
-    int cls = 0;
+    int cls                  = 0;
     std::unique_ptr<std::wstring> mask;  // listing only
     size_t bytes = 0;
   };
@@ -872,7 +891,8 @@ private:
 
   // ---- interned directories of attribute keys ----
 
-  static void splitPath(const std::wstring& path, std::wstring_view& dir, std::wstring_view& leaf)
+  static void splitPath(const std::wstring& path, std::wstring_view& dir,
+                        std::wstring_view& leaf)
   {
     const size_t pos = path.rfind(L'\\');
     if (pos == std::wstring::npos) {
@@ -895,7 +915,8 @@ private:
     return out;
   }
 
-  std::unordered_map<AttrKey, AttrSlot, AttrKeyHash>::iterator findAttr(const std::wstring& path)
+  std::unordered_map<AttrKey, AttrSlot, AttrKeyHash>::iterator
+  findAttr(const std::wstring& path)
   {
     std::wstring_view dir, leaf;
     splitPath(path, dir, leaf);
@@ -929,9 +950,9 @@ private:
     slot.attr = attr;
     auto it   = m_attrs.emplace(std::move(k), std::move(slot)).first;
     Node n;
-    n.isAttr = true;
-    n.akey   = &it->first;
-    n.bytes  = attrCost(leaf.size());
+    n.isAttr       = true;
+    n.akey         = &it->first;
+    n.bytes        = attrCost(leaf.size());
     it->second.lru = addLru(std::move(n));
     m_bytes += it->second.lru->bytes;
   }
@@ -1000,7 +1021,8 @@ private:
           auto& slots = d->second;
           slots.erase(std::remove_if(slots.begin(), slots.end(),
                                      [&](const ListSlot& s) {
-                                       return s.cls == victim.cls && s.mask == *victim.mask;
+                                       return s.cls == victim.cls &&
+                                              s.mask == *victim.mask;
                                      }),
                       slots.end());
           if (slots.empty())
@@ -1028,12 +1050,12 @@ private:
   Lru m_lru;  // front = most recently used
   std::unordered_map<AttrKey, AttrSlot, AttrKeyHash> m_attrs;
   std::unordered_map<std::wstring, uint32_t> m_dirIds;  // interned attr directories
-  std::vector<const std::wstring*> m_dirNames;           // id -> name (node-stable)
+  std::vector<const std::wstring*> m_dirNames;          // id -> name (node-stable)
   std::unordered_map<std::wstring, std::vector<ListSlot>> m_dirs;
   std::unordered_set<std::wstring> m_volatilePaths;
   std::unordered_set<std::wstring> m_volatileDirs;
   std::vector<std::wstring> m_noCache;
-  bool m_overflowed = false;
+  bool m_overflowed     = false;
   uint64_t m_generation = 0;
   StoreStats m_stats;
 };
@@ -1042,9 +1064,24 @@ private:
 // negative derivation: "X does not exist" from a virtual directory whose complete
 // contents are known (tree children + complete real listings)
 
-enum class NegVerdict { Unknown, FileNotFound, PathNotFound };
-enum class NegNode { None, Dir, File };            // node of the usvfs tree
-enum class NegChild { Present, Absent, Unknown };  // name in the known contents
+enum class NegVerdict
+{
+  Unknown,
+  FileNotFound,
+  PathNotFound
+};
+enum class NegNode
+{
+  None,
+  Dir,
+  File
+};  // node of the usvfs tree
+enum class NegChild
+{
+  Present,
+  Absent,
+  Unknown
+};  // name in the known contents
 
 // Splits an absolute drive path ("\\??\\C:\\A\\B", "C:/A/B", ...) into its components
 // ("C:", "A", "B"). False for anything the system would interpret: empty
@@ -1065,7 +1102,8 @@ inline bool negSplit(std::wstring_view path, std::vector<std::wstring>& comps)
     if (seg.empty() || seg == L"." || seg == L"..")
       return false;
     if (comps.empty()) {
-      const bool letter = (seg[0] >= L'a' && seg[0] <= L'z') || (seg[0] >= L'A' && seg[0] <= L'Z');
+      const bool letter =
+          (seg[0] >= L'a' && seg[0] <= L'z') || (seg[0] >= L'A' && seg[0] <= L'Z');
       if (seg.size() != 2 || !letter || seg[1] != L':')
         return false;
     } else {

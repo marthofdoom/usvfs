@@ -3,17 +3,24 @@ Userspace Virtual Filesystem
 
 This file is part of usvfs.
 
-usvfs is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
+usvfs is free software:
+ * you can redistribute it and/or modify
+it under the terms of the GNU General Public
+ * License as published by
+the Free Software Foundation, either version 3 of the
+ * License, or
 (at your option) any later version.
 
-usvfs is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
+usvfs is distributed in the hope
+ * that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty
+ * of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
+GNU General Public
+ * License for more details.
 
-You should have received a copy of the GNU General Public License
+You should have received a copy of the GNU General Public
+ * License
 along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
@@ -34,7 +41,8 @@ inline std::string trim(std::string_view s)
   size_t b = 0, e = s.size();
   while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n'))
     ++b;
-  while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n'))
+  while (e > b &&
+         (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n'))
     --e;
   return std::string(s.substr(b, e - b));
 }
@@ -67,7 +75,7 @@ inline std::string keyFromEnvName(std::string_view env)
 struct ParsedIni
 {
   std::map<std::string, std::string> values;  // "section.key" (lower case) -> value
-  std::vector<std::string> errors;            // "line N: ..." for lines that were ignored
+  std::vector<std::string> errors;  // "line N: ..." for lines that were ignored
 };
 
 // INI text: [section] headers, key=value lines, blank lines and lines starting
@@ -78,7 +86,8 @@ inline ParsedIni parseIni(std::string_view text)
 {
   ParsedIni out;
   if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
-      static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF)
+      static_cast<unsigned char>(text[1]) == 0xBB &&
+      static_cast<unsigned char>(text[2]) == 0xBF)
     text.remove_prefix(3);
 
   std::string section;
@@ -95,7 +104,8 @@ inline ParsedIni parseIni(std::string_view text)
     if (line[0] == '[') {
       const size_t close = line.find(']');
       if (close == std::string::npos) {
-        out.errors.push_back("line " + std::to_string(lineNo) + ": unterminated section header");
+        out.errors.push_back("line " + std::to_string(lineNo) +
+                             ": unterminated section header");
         section.clear();
         continue;
       }
@@ -108,7 +118,8 @@ inline ParsedIni parseIni(std::string_view text)
       continue;
     }
     if (section.empty()) {
-      out.errors.push_back("line " + std::to_string(lineNo) + ": key outside a section");
+      out.errors.push_back("line " + std::to_string(lineNo) +
+                           ": key outside a section");
       continue;
     }
     std::string key = lower(trim(std::string_view(line).substr(0, eq)));

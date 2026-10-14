@@ -1,8 +1,8 @@
 #pragma once
 
 #include <atomic>
-#include <string>
 #include <ntdll_declarations.h>
+#include <string>
 
 // Application file-API trace for the replay harness (replay.exe). Records what
 // the APPLICATION asked of ntdll, at hook entry, regardless of what our caches
@@ -20,7 +20,10 @@ namespace usvfs::trace
 
 extern std::atomic<bool> g_enabled;
 
-inline bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
+inline bool enabled()
+{
+  return g_enabled.load(std::memory_order_relaxed);
+}
 
 // reads configuration and opens the output; must be called before the hooks
 // are installed (the output file is opened with the real, unhooked functions)
@@ -51,7 +54,7 @@ public:
     if (m_on)
       end();
   }
-  Scope(const Scope&) = delete;
+  Scope(const Scope&)            = delete;
   Scope& operator=(const Scope&) = delete;
 
   bool on() const { return m_on; }
@@ -63,9 +66,9 @@ private:
   void begin();
   void end();
 
-  bool m_on = false;
-  bool m_restore = true;
-  uint64_t m_start = 0;
+  bool m_on           = false;
+  bool m_restore      = true;
+  uint64_t m_start    = 0;
   unsigned long m_err = 0;
 };
 
@@ -88,13 +91,16 @@ void recClose(const Scope& s, HANDLE handle, NTSTATUS status);
 // kernel32-level calls (usvfs kernel32 hooks), recorded with the application's
 // arguments; string pointers are application memory (`ansi`: char*, else wchar_t*).
 // `result` is the call's return value, `err` GetLastError after it.
-void recGetAttr(const Scope& s, const void* path, unsigned long result, unsigned long err);
+void recGetAttr(const Scope& s, const void* path, unsigned long result,
+                unsigned long err);
 void recGetAttrEx(const Scope& s, const void* path, unsigned long level, int ok,
                   unsigned long err);
-void recFindFirst(const Scope& s, const void* path, unsigned long level, unsigned long op,
-                  unsigned long flags, HANDLE result, unsigned long err);
-void recProfile(const Scope& s, bool section, bool ansi, const void* app, const void* key,
-                const void* file, unsigned long nSize, unsigned long result);
+void recFindFirst(const Scope& s, const void* path, unsigned long level,
+                  unsigned long op, unsigned long flags, HANDLE result,
+                  unsigned long err);
+void recProfile(const Scope& s, bool section, bool ansi, const void* app,
+                const void* key, const void* file, unsigned long nSize,
+                unsigned long result);
 void recFindNext(const Scope& s, HANDLE find, int ok);
 void recFindClose(const Scope& s, HANDLE find, int ok);
 void recSetCwd(const Scope& s, const void* path, int ok);

@@ -17,8 +17,8 @@
 #include "../hookcallcontext.h"
 #include "../hookcontext.h"
 #include "../maptracker.h"
-#include "../readcache.h"
 #include "../metacache.h"
+#include "../readcache.h"
 #include "../stringcast_boost.h"
 
 #include "file_information_utils.h"
@@ -141,8 +141,7 @@ void closeInternalHandle(HANDLE h)
   ::CloseHandle(h);
 }
 
-
-UnicodeString CreateUnicodeString(const OBJECT_ATTRIBUTES *objectAttributes)
+UnicodeString CreateUnicodeString(const OBJECT_ATTRIBUTES* objectAttributes)
 {
   UnicodeString result = ntdllHandleTracker.lookup(objectAttributes->RootDirectory);
   if (objectAttributes->ObjectName != nullptr) {
@@ -315,15 +314,14 @@ bool isDeviceFile(std::wstring_view name)
   }
 }
 
-
 // the directory whose content an enumeration of `virtualDir` really returns
 std::wstring resolveDirectoryContent(const std::wstring& virtualDir)
 {
   try {
     usvfs::HookCallContext cc;
-    RedirectionInfo redir = applyReroute(
-        usvfs::HookContext::readAccess("resolveDirectoryContent"), cc,
-        UnicodeString(virtualDir.c_str()));
+    RedirectionInfo redir =
+        applyReroute(usvfs::HookContext::readAccess("resolveDirectoryContent"), cc,
+                     UnicodeString(virtualDir.c_str()));
     return std::wstring(static_cast<LPCWSTR>(redir.path));
   } catch (const std::exception&) {
     return std::wstring();
@@ -349,9 +347,9 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
           &status, buffer, bufferSize, FileInformationClass, returnSingleEntry,
           FileName, resolveDirectoryContent);
     } else {
-      res = NtQueryDirectoryFile(hdl, event, apcRoutine, apcContext, &status,
-                                 buffer, bufferSize, FileInformationClass,
-                                 returnSingleEntry, FileName, FALSE);
+      res = NtQueryDirectoryFile(hdl, event, apcRoutine, apcContext, &status, buffer,
+                                 bufferSize, FileInformationClass, returnSingleEntry,
+                                 FileName, FALSE);
     }
 
     if ((res != STATUS_SUCCESS) || (status.Information <= 0)) {
@@ -442,11 +440,9 @@ struct Searches
       std::wstring virtualName;
     };
 
-    Info() : currentSearchHandle(INVALID_HANDLE_VALUE)
-    {
-    }
-    Info(const Info &) = delete;
-    Info &operator=(const Info &) = delete;
+    Info() : currentSearchHandle(INVALID_HANDLE_VALUE) {}
+    Info(const Info&)            = delete;
+    Info& operator=(const Info&) = delete;
     ~Info()
     {
       if (currentSearchHandle != INVALID_HANDLE_VALUE) {
@@ -467,7 +463,7 @@ struct Searches
   // must provide a special copy constructor because boost::mutex is
   // non-copyable
   // (only ever copied while empty; per-handle state is not copied)
-  Searches(const Searches &) {}
+  Searches(const Searches&) {}
 
   Searches& operator=(const Searches&) = delete;
 
@@ -578,10 +574,10 @@ bool addVirtualSearchResult(PVOID& FileInformation,
 }
 
 NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
-    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
-    PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
-    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass,
-    BOOLEAN ReturnSingleEntry, PUNICODE_STRING FileName, BOOLEAN RestartScan)
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    FILE_INFORMATION_CLASS FileInformationClass, BOOLEAN ReturnSingleEntry,
+    PUNICODE_STRING FileName, BOOLEAN RestartScan)
 {
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
@@ -608,7 +604,7 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
 
   {  // scope to limit context lifetime
     HookContext::ConstPtr context = READ_CONTEXT();
-    Searches &activeSearches = context->customData<Searches>(SearchInfo);
+    Searches& activeSearches      = context->customData<Searches>(SearchInfo);
     // old entry is destroyed after mapMutex is released (~Info closes a handle,
     // which re-enters impl_NtClose)
     std::shared_ptr<Searches::Info> doomed;
@@ -624,7 +620,7 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
 
     // see if we already have a running search
     auto infoIter = activeSearches.info.find(FileHandle);
-    firstSearch = (infoIter == activeSearches.info.end());
+    firstSearch   = (infoIter == activeSearches.info.end());
     if (!firstSearch) {
       infoPtr = infoIter->second;
     }
@@ -649,11 +645,11 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
       std::shared_ptr<Searches::Info> replaced;
       {
         std::lock_guard<std::mutex> mapLock(activeSearches.mapMutex);
-        auto &slot = activeSearches.info[FileHandle];
-        replaced = std::move(slot);
-        slot = infoPtr;
+        auto& slot = activeSearches.info[FileHandle];
+        replaced   = std::move(slot);
+        slot       = infoPtr;
       }
-    } // replaced destructs outside mapMutex
+    }  // replaced destructs outside mapMutex
     infoPtr->searchPattern.appendPath(FileName);
 
     SearchHandleMap& searchMap = context->customData<SearchHandleMap>(SearchHandles);
@@ -661,16 +657,14 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
 
     UnicodeString searchPath;
     if (iter != searchMap.end()) {
-      searchPath = UnicodeString(iter->second.c_str());
-      infoPtr->currentSearchHandle =
-          CreateFileW(iter->second.c_str(), GENERIC_READ,
-                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+      searchPath                   = UnicodeString(iter->second.c_str());
+      infoPtr->currentSearchHandle = CreateFileW(
+          iter->second.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+          nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     } else {
       searchPath = ntdllHandleTracker.lookup(FileHandle);
     }
-    gatherVirtualEntries(searchPath, context->redirectionTable(), FileName,
-                         *infoPtr);
+    gatherVirtualEntries(searchPath, context->redirectionTable(), FileName, *infoPtr);
   }
 
   ULONG dataRead               = Length;
@@ -688,9 +682,8 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
       handle = FileHandle;
     }
     NTSTATUS subRes = addNtSearchData(
-        handle, FileName, L"", FileInformationClass, FileInformationCurrent,
-        dataRead, infoPtr->foundFiles, Event, ApcRoutine, ApcContext,
-        ReturnSingleEntry);
+        handle, FileName, L"", FileInformationClass, FileInformationCurrent, dataRead,
+        infoPtr->foundFiles, Event, ApcRoutine, ApcContext, ReturnSingleEntry);
     moreRegular = subRes == STATUS_SUCCESS;
     if (moreRegular) {
       dataReturned = dataRead != 0;
@@ -710,9 +703,8 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
       if (match.realPath.size() != 0) {
         dataRead = Length;
         if (addVirtualSearchResult(FileInformationCurrent, FileInformationClass,
-                                   *infoPtr, match.realPath,
-                                   match.virtualName, ReturnSingleEntry,
-                                   dataRead)) {
+                                   *infoPtr, match.realPath, match.virtualName,
+                                   ReturnSingleEntry, dataRead)) {
           // a positive result here means the call returned data and there may
           // be further objects to be retrieved by repeating the call
           dataReturned = true;
@@ -757,15 +749,9 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
 }
 
 NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
-    HANDLE FileHandle,
-    HANDLE Event,
-    PIO_APC_ROUTINE ApcRoutine,
-    PVOID ApcContext,
-    PIO_STATUS_BLOCK IoStatusBlock,
-    PVOID FileInformation,
-    ULONG Length,
-    FILE_INFORMATION_CLASS FileInformationClass,
-    ULONG QueryFlags,
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    FILE_INFORMATION_CLASS FileInformationClass, ULONG QueryFlags,
     PUNICODE_STRING FileName)
 {
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
@@ -793,7 +779,7 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
 
   {  // scope to limit context lifetime
     HookContext::ConstPtr context = READ_CONTEXT();
-    Searches &activeSearches = context->customData<Searches>(SearchInfo);
+    Searches& activeSearches      = context->customData<Searches>(SearchInfo);
     // old entry is destroyed after mapMutex is released (~Info closes a handle,
     // which re-enters impl_NtClose)
     std::shared_ptr<Searches::Info> doomed;
@@ -809,7 +795,7 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
 
     // see if we already have a running search
     auto infoIter = activeSearches.info.find(FileHandle);
-    firstSearch = (infoIter == activeSearches.info.end());
+    firstSearch   = (infoIter == activeSearches.info.end());
     if (!firstSearch) {
       infoPtr = infoIter->second;
     }
@@ -834,11 +820,11 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
       std::shared_ptr<Searches::Info> replaced;
       {
         std::lock_guard<std::mutex> mapLock(activeSearches.mapMutex);
-        auto &slot = activeSearches.info[FileHandle];
-        replaced = std::move(slot);
-        slot = infoPtr;
+        auto& slot = activeSearches.info[FileHandle];
+        replaced   = std::move(slot);
+        slot       = infoPtr;
       }
-    } // replaced destructs outside mapMutex
+    }  // replaced destructs outside mapMutex
     infoPtr->searchPattern.appendPath(FileName);
 
     SearchHandleMap& searchMap = context->customData<SearchHandleMap>(SearchHandles);
@@ -846,17 +832,14 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
 
     UnicodeString searchPath;
     if (iter != searchMap.end()) {
-      searchPath = UnicodeString(iter->second.c_str());
-      infoPtr->currentSearchHandle =
-        CreateFileW(iter->second.c_str(), GENERIC_READ,
-          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-          OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    }
-    else {
+      searchPath                   = UnicodeString(iter->second.c_str());
+      infoPtr->currentSearchHandle = CreateFileW(
+          iter->second.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+          nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    } else {
       searchPath = ntdllHandleTracker.lookup(FileHandle);
     }
-    gatherVirtualEntries(searchPath, context->redirectionTable(), FileName,
-      *infoPtr);
+    gatherVirtualEntries(searchPath, context->redirectionTable(), FileName, *infoPtr);
   }
 
   ULONG dataRead               = Length;
@@ -864,7 +847,7 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
 
   // add regular search results, skipping those files we have in a virtual
   // location
-  bool moreRegular = !infoPtr->regularComplete;
+  bool moreRegular  = !infoPtr->regularComplete;
   bool dataReturned = false;
   while (moreRegular && !dataReturned) {
     dataRead = Length;
@@ -873,15 +856,14 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
     if (handle == INVALID_HANDLE_VALUE) {
       handle = FileHandle;
     }
-    NTSTATUS subRes = addNtSearchData(
-      handle, FileName, L"", FileInformationClass, FileInformationCurrent,
-      dataRead, infoPtr->foundFiles, Event, ApcRoutine, ApcContext,
-      QueryFlags & SL_RETURN_SINGLE_ENTRY);
+    NTSTATUS subRes =
+        addNtSearchData(handle, FileName, L"", FileInformationClass,
+                        FileInformationCurrent, dataRead, infoPtr->foundFiles, Event,
+                        ApcRoutine, ApcContext, QueryFlags & SL_RETURN_SINGLE_ENTRY);
     moreRegular = subRes == STATUS_SUCCESS;
     if (moreRegular) {
       dataReturned = dataRead != 0;
-    }
-    else {
+    } else {
       infoPtr->regularComplete = true;
       infoPtr->foundFiles.clear();
       if (infoPtr->currentSearchHandle != INVALID_HANDLE_VALUE) {
@@ -897,9 +879,8 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
       if (match.realPath.size() != 0) {
         dataRead = Length;
         if (addVirtualSearchResult(FileInformationCurrent, FileInformationClass,
-          *infoPtr, match.realPath,
-          match.virtualName, QueryFlags & SL_RETURN_SINGLE_ENTRY,
-          dataRead)) {
+                                   *infoPtr, match.realPath, match.virtualName,
+                                   QueryFlags & SL_RETURN_SINGLE_ENTRY, dataRead)) {
           // a positive result here means the call returned data and there may
           // be further objects to be retrieved by repeating the call
           dataReturned = true;
@@ -1056,14 +1037,17 @@ DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryObject(
 // FileNormalizedNameInformation and FileAllInformation). Fork: called by
 // impl_NtQueryInformationFile; viaReadcache routes the real call through the
 // read cache (shadow position of FileAllInformation) instead of ntdll directly.
-namespace usvfs {
+namespace usvfs
+{
 static NTSTATUS queryInformationFileRewrite(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
                                             FILE_INFORMATION_CLASS, bool);
 }
 
-NTSTATUS usvfs::queryInformationFileRewrite(
-    HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
-    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass, bool viaReadcache)
+NTSTATUS usvfs::queryInformationFileRewrite(HANDLE FileHandle,
+                                            PIO_STATUS_BLOCK IoStatusBlock,
+                                            PVOID FileInformation, ULONG Length,
+                                            FILE_INFORMATION_CLASS FileInformationClass,
+                                            bool viaReadcache)
 {
   NTSTATUS res = STATUS_SUCCESS;
 
@@ -1274,8 +1258,10 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     if (usvfs::metacache::isWriteIntent(DesiredAccess, FILE_OPEN)) {
       // opened for writing/deleting: forget and never cache the file (both its
       // virtual and its real path) and its directory
-      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(fullName), usvfs::metacache::Hook::NtOpenFile);
-      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(redir.path), usvfs::metacache::Hook::NtOpenFile);
+      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(fullName),
+                                  usvfs::metacache::Hook::NtOpenFile);
+      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(redir.path),
+                                  usvfs::metacache::Hook::NtOpenFile);
     }
 
     PRE_REALCALL
@@ -1308,20 +1294,22 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
   return res;
 }
 
-NTSTATUS WINAPI usvfs::impl_NtOpenFile(PHANDLE FileHandle,
-                                         ACCESS_MASK DesiredAccess,
-                                         POBJECT_ATTRIBUTES ObjectAttributes,
-                                         PIO_STATUS_BLOCK IoStatusBlock,
-                                         ULONG ShareAccess, ULONG OpenOptions)
+NTSTATUS WINAPI usvfs::impl_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+                                       POBJECT_ATTRIBUTES ObjectAttributes,
+                                       PIO_STATUS_BLOCK IoStatusBlock,
+                                       ULONG ShareAccess, ULONG OpenOptions)
 {
   usvfs::metacache::noteHook(usvfs::metacache::Hook::NtOpenFile);
-  NTSTATUS res = ntdll_mess_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, OpenOptions);
+  NTSTATUS res = ntdll_mess_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
+                                       IoStatusBlock, ShareAccess, OpenOptions);
   if (res >= 0 && FileHandle)
     forgetHandleState(*FileHandle);  // backstop against handle value reuse
-  if (res >= 0 && FileHandle && usvfs::metacache::isWriteIntent(DesiredAccess, 1 /* FILE_OPEN */) &&
+  if (res >= 0 && FileHandle &&
+      usvfs::metacache::isWriteIntent(DesiredAccess, 1 /* FILE_OPEN */) &&
       GetFileType(*FileHandle) == FILE_TYPE_DISK)
     usvfs::readcache::noteFileWritten(*FileHandle);
-  if (res >= 0 && ObjectAttributes && FileHandle && GetFileType(*FileHandle) == FILE_TYPE_DISK)
+  if (res >= 0 && ObjectAttributes && FileHandle &&
+      GetFileType(*FileHandle) == FILE_TYPE_DISK)
     ntdllHandleTracker.insert(*FileHandle, CreateUnicodeString(ObjectAttributes));
   return res;
 }
@@ -1497,21 +1485,27 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
   return res;
 }
 
-NTSTATUS WINAPI usvfs::impl_NtCreateFile(
-  PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
-  POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
-  PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
-  ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer,
-  ULONG EaLength)
+NTSTATUS WINAPI usvfs::impl_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+                                         POBJECT_ATTRIBUTES ObjectAttributes,
+                                         PIO_STATUS_BLOCK IoStatusBlock,
+                                         PLARGE_INTEGER AllocationSize,
+                                         ULONG FileAttributes, ULONG ShareAccess,
+                                         ULONG CreateDisposition, ULONG CreateOptions,
+                                         PVOID EaBuffer, ULONG EaLength)
 {
   usvfs::metacache::noteHook(usvfs::metacache::Hook::NtCreateFile);
-  NTSTATUS res = ntdll_mess_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+  NTSTATUS res = ntdll_mess_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
+                                         IoStatusBlock, AllocationSize, FileAttributes,
+                                         ShareAccess, CreateDisposition, CreateOptions,
+                                         EaBuffer, EaLength);
   if (res >= 0 && FileHandle)
     forgetHandleState(*FileHandle);  // backstop against handle value reuse
-  if (res >= 0 && FileHandle && usvfs::metacache::isWriteIntent(DesiredAccess, CreateDisposition) &&
+  if (res >= 0 && FileHandle &&
+      usvfs::metacache::isWriteIntent(DesiredAccess, CreateDisposition) &&
       GetFileType(*FileHandle) == FILE_TYPE_DISK)
     usvfs::readcache::noteFileWritten(*FileHandle);
-  if (res >= 0 && ObjectAttributes && FileHandle && GetFileType(*FileHandle) == FILE_TYPE_DISK)
+  if (res >= 0 && ObjectAttributes && FileHandle &&
+      GetFileType(*FileHandle) == FILE_TYPE_DISK)
     ntdllHandleTracker.insert(*FileHandle, CreateUnicodeString(ObjectAttributes));
   return res;
 }
@@ -1532,8 +1526,8 @@ NTSTATUS WINAPI usvfs::impl_NtClose(HANDLE Handle)
   if ((::GetFileType(Handle) == FILE_TYPE_DISK)) {
     HookContext::Ptr context = WRITE_CONTEXT();
 
-    { // clean up search data associated with this handle part 1
-      Searches &activeSearches = context->customData<Searches>(SearchInfo);
+    {  // clean up search data associated with this handle part 1
+      Searches& activeSearches = context->customData<Searches>(SearchInfo);
       std::shared_ptr<Searches::Info> infoPtr;
       {
         std::lock_guard<std::mutex> mapLock(activeSearches.mapMutex);
@@ -1580,8 +1574,7 @@ NTSTATUS WINAPI usvfs::impl_NtClose(HANDLE Handle)
 }
 
 NTSTATUS WINAPI usvfs::impl_NtQueryAttributesFile(
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    PFILE_BASIC_INFORMATION FileInformation)
+    POBJECT_ATTRIBUTES ObjectAttributes, PFILE_BASIC_INFORMATION FileInformation)
 {
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
@@ -1601,10 +1594,9 @@ NTSTATUS WINAPI usvfs::impl_NtQueryAttributesFile(
       return neg;
   }
 
-  RedirectionInfo redir
-      = applyReroute(READ_CONTEXT(), callContext, inPath);
-  unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
-      = makeObjectAttributes(redir, ObjectAttributes);
+  RedirectionInfo redir = applyReroute(READ_CONTEXT(), callContext, inPath);
+  unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes =
+      makeObjectAttributes(redir, ObjectAttributes);
 
   std::wstring cacheKey;
   // case-sensitive lookups would differ from our case-insensitive keys
@@ -1638,8 +1630,7 @@ NTSTATUS WINAPI usvfs::impl_NtQueryAttributesFile(
 }
 
 NTSTATUS WINAPI usvfs::impl_NtQueryFullAttributesFile(
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    PFILE_NETWORK_OPEN_INFORMATION FileInformation)
+    POBJECT_ATTRIBUTES ObjectAttributes, PFILE_NETWORK_OPEN_INFORMATION FileInformation)
 {
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
@@ -1658,17 +1649,17 @@ NTSTATUS WINAPI usvfs::impl_NtQueryFullAttributesFile(
     return ::NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
   }
 
-  if (ObjectAttributes && (ObjectAttributes->Attributes & 0x40 /* OBJ_CASE_INSENSITIVE */) != 0 &&
+  if (ObjectAttributes &&
+      (ObjectAttributes->Attributes & 0x40 /* OBJ_CASE_INSENSITIVE */) != 0 &&
       usvfs::metacache::negativeEnabled()) {
     const NTSTATUS neg = usvfs::metacache::negativeNt(static_cast<LPCWSTR>(inPath));
     if (neg != STATUS_SUCCESS)
       return neg;
   }
 
-  RedirectionInfo redir
-      = applyReroute(READ_CONTEXT(), callContext, inPath);
-  unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
-      = makeObjectAttributes(redir, ObjectAttributes);
+  RedirectionInfo redir = applyReroute(READ_CONTEXT(), callContext, inPath);
+  unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes =
+      makeObjectAttributes(redir, ObjectAttributes);
 
   std::wstring cacheKey;
   // case-sensitive lookups would differ from our case-insensitive keys
@@ -1708,10 +1699,11 @@ void usvfs::forgetWorkerHandle(HANDLE handle)
   usvfs::metacache::onClose(handle);
 }
 
-NTSTATUS WINAPI usvfs::impl_NtReadFile(
-  HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
-  PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
-  PLARGE_INTEGER ByteOffset, PULONG Key)
+NTSTATUS WINAPI usvfs::impl_NtReadFile(HANDLE FileHandle, HANDLE Event,
+                                       PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+                                       PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+                                       ULONG Length, PLARGE_INTEGER ByteOffset,
+                                       PULONG Key)
 {
   usvfs::metacache::noteHook(usvfs::metacache::Hook::NtReadFile);
   // read cache switched off: plain passthrough
@@ -1753,13 +1745,13 @@ NTSTATUS WINAPI usvfs::impl_NtReadFile(
   HOOK_END
 
   // only reached if the shim threw; nothing was read yet in that case
-  return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                      Buffer, Length, ByteOffset, Key);
+  return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer,
+                      Length, ByteOffset, Key);
 }
 
 NTSTATUS WINAPI usvfs::impl_NtQueryInformationFile(
-  HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
-  ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
+    HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
   usvfs::metacache::noteHook(usvfs::metacache::Hook::NtQueryInformationFile);
   const bool cacheOn = usvfs::readcache::enabled();
@@ -1779,12 +1771,13 @@ NTSTATUS WINAPI usvfs::impl_NtQueryInformationFile(
   const bool nameQuery = FileInformationClass == FileNameInformation ||
                          FileInformationClass == FileNormalizedNameInformation ||
                          FileInformationClass == FileAllInformation;
-  const bool positionQuery = cacheOn && (FileInformationClass == FilePositionInformation ||
-                                         FileInformationClass == FileAllInformation);
+  const bool positionQuery =
+      cacheOn && (FileInformationClass == FilePositionInformation ||
+                  FileInformationClass == FileAllInformation);
 
   if (!nameQuery && !positionQuery) {
-    return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
-                                    Length, FileInformationClass);
+    return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                    FileInformationClass);
   }
 
   if (nameQuery) {
@@ -1796,22 +1789,21 @@ NTSTATUS WINAPI usvfs::impl_NtQueryInformationFile(
 
   HOOK_START_GROUP(MutExHookGroup::ALL_GROUPS)
   if (!callContext.active()) {
-    return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
-                                    Length, FileInformationClass);
+    return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                    FileInformationClass);
   }
 
-  return usvfs::readcache::queryInformation(FileHandle, IoStatusBlock,
-                                            FileInformation, Length,
-                                            FileInformationClass);
+  return usvfs::readcache::queryInformation(FileHandle, IoStatusBlock, FileInformation,
+                                            Length, FileInformationClass);
   HOOK_END
 
-  return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
-                                  Length, FileInformationClass);
+  return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                  FileInformationClass);
 }
 
 NTSTATUS WINAPI usvfs::impl_NtSetInformationFile(
-  HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
-  ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
+    HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
   if (!usvfs::metacache::isMutatingClass(FileInformationClass))
     usvfs::metacache::noteHook(usvfs::metacache::Hook::NtSetInformationFile);
@@ -1826,12 +1818,14 @@ NTSTATUS WINAPI usvfs::impl_NtSetInformationFile(
         std::wstring root;
         if (FileInformation && Length >= sizeof(HANDLE) * 2) {
           // rename/link information may name a root directory handle
-          HANDLE rootHandle = nullptr;
+          HANDLE rootHandle       = nullptr;
           const size_t rootOffset = sizeof(HANDLE);  // after the flags (padded)
           if (usvfs::readcache::guardedCopy(
                   &rootHandle, static_cast<const char*>(FileInformation) + rootOffset,
-                  sizeof(rootHandle)) && rootHandle != nullptr) {
-            root = std::wstring(static_cast<LPCWSTR>(ntdllHandleTracker.lookup(rootHandle)));
+                  sizeof(rootHandle)) &&
+              rootHandle != nullptr) {
+            root = std::wstring(
+                static_cast<LPCWSTR>(ntdllHandleTracker.lookup(rootHandle)));
           }
         }
         usvfs::metacache::noteSetInformation(
@@ -1842,32 +1836,29 @@ NTSTATUS WINAPI usvfs::impl_NtSetInformationFile(
     }
   }
 
-  if (!usvfs::readcache::enabled() ||
-      FileInformationClass != FilePositionInformation) {
-    return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
-                                  Length, FileInformationClass);
+  if (!usvfs::readcache::enabled() || FileInformationClass != FilePositionInformation) {
+    return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                  FileInformationClass);
   }
 
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
   HOOK_START_GROUP(MutExHookGroup::ALL_GROUPS)
   if (!callContext.active()) {
-    return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
-                                  Length, FileInformationClass);
+    return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                  FileInformationClass);
   }
 
-  return usvfs::readcache::setInformation(FileHandle, IoStatusBlock,
-                                          FileInformation, Length,
-                                          FileInformationClass);
+  return usvfs::readcache::setInformation(FileHandle, IoStatusBlock, FileInformation,
+                                          Length, FileInformationClass);
   HOOK_END
 
-  return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
-                                Length, FileInformationClass);
+  return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                FileInformationClass);
 }
 
-NTSTATUS WINAPI usvfs::hook_NtTerminateProcess(
-  HANDLE ProcessHandle,
-  NTSTATUS ExitStatus)
+NTSTATUS WINAPI usvfs::hook_NtTerminateProcess(HANDLE ProcessHandle,
+                                               NTSTATUS ExitStatus)
 {
   // this hook is normally called when terminating another process, in which
   // case there's nothing to do

@@ -530,14 +530,16 @@ typedef struct _FILE_NETWORK_OPEN_INFORMATION
   ULONG FileAttributes;
 } FILE_NETWORK_OPEN_INFORMATION, *PFILE_NETWORK_OPEN_INFORMATION;
 
-typedef struct _USVFS_FILE_ATTRIBUTE_TAG_INFORMATION {
+typedef struct _USVFS_FILE_ATTRIBUTE_TAG_INFORMATION
+{
   ULONG FileAttributes;
   ULONG ReparseTag;
 } USVFS_FILE_ATTRIBUTE_TAG_INFORMATION;
 
 // own name: newer SDKs define FILE_STAT_INFORMATION themselves
 // FileStatInformation (Windows 10 1709+, Wine): everything an fstat provides
-typedef struct _USVFS_FILE_STAT_INFORMATION {
+typedef struct _USVFS_FILE_STAT_INFORMATION
+{
   LARGE_INTEGER FileId;
   LARGE_INTEGER CreationTime;
   LARGE_INTEGER LastAccessTime;
@@ -551,13 +553,15 @@ typedef struct _USVFS_FILE_STAT_INFORMATION {
   ACCESS_MASK EffectiveAccess;
 } USVFS_FILE_STAT_INFORMATION;
 
-typedef enum _FS_INFORMATION_CLASS {
+typedef enum _FS_INFORMATION_CLASS
+{
   FileFsVolumeInformation = 1,
   FileFsDeviceInformation = 4
 } FS_INFORMATION_CLASS,
     *PFS_INFORMATION_CLASS;
 
-typedef struct _FILE_FS_VOLUME_INFORMATION {
+typedef struct _FILE_FS_VOLUME_INFORMATION
+{
   LARGE_INTEGER VolumeCreationTime;
   ULONG VolumeSerialNumber;
   ULONG VolumeLabelLength;
@@ -565,7 +569,8 @@ typedef struct _FILE_FS_VOLUME_INFORMATION {
   WCHAR VolumeLabel[1];
 } FILE_FS_VOLUME_INFORMATION, *PFILE_FS_VOLUME_INFORMATION;
 
-typedef struct _FILE_FS_DEVICE_INFORMATION {
+typedef struct _FILE_FS_DEVICE_INFORMATION
+{
   ULONG DeviceType;
   ULONG Characteristics;
 } FILE_FS_DEVICE_INFORMATION, *PFILE_FS_DEVICE_INFORMATION;
@@ -604,7 +609,7 @@ typedef struct _FILE_FS_DEVICE_INFORMATION {
 
 // Nt
 
-using NtQueryDirectoryFile_type   = NTSTATUS(WINAPI*)(HANDLE, HANDLE, PIO_APC_ROUTINE,
+using NtQueryDirectoryFile_type = NTSTATUS(WINAPI*)(HANDLE, HANDLE, PIO_APC_ROUTINE,
                                                     PVOID, PIO_STATUS_BLOCK, PVOID,
                                                     ULONG, FILE_INFORMATION_CLASS,
                                                     BOOLEAN, PUNICODE_STRING, BOOLEAN);
@@ -630,22 +635,22 @@ using NtQueryInformationByName_type = NTSTATUS(WINAPI*)(
     ULONG Length, FILE_INFORMATION_CLASS FileInformationClass);
 
 using NtOpenFile_type   = NTSTATUS(WINAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
-                                          PIO_STATUS_BLOCK, ULONG, ULONG);
+                                            PIO_STATUS_BLOCK, ULONG, ULONG);
 using NtCreateFile_type = NTSTATUS(WINAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
                                             PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG,
                                             ULONG, ULONG, ULONG, PVOID, ULONG);
 
 using NtClose_type = NTSTATUS(WINAPI*)(HANDLE);
-typedef NTSTATUS(WINAPI *NtReadFile_type)(HANDLE, HANDLE, PIO_APC_ROUTINE,
-                                          PVOID, PIO_STATUS_BLOCK, PVOID, ULONG,
+typedef NTSTATUS(WINAPI* NtReadFile_type)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+                                          PIO_STATUS_BLOCK, PVOID, ULONG,
                                           PLARGE_INTEGER, PULONG);
 
-typedef NTSTATUS(WINAPI *NtSetInformationFile_type)(HANDLE, PIO_STATUS_BLOCK,
-                                                    PVOID, ULONG,
-                                                    FILE_INFORMATION_CLASS);
+typedef NTSTATUS(WINAPI* NtSetInformationFile_type)(HANDLE, PIO_STATUS_BLOCK, PVOID,
+                                                    ULONG, FILE_INFORMATION_CLASS);
 
-typedef NTSTATUS(WINAPI *NtQueryVolumeInformationFile_type)(
-    HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
+typedef NTSTATUS(WINAPI* NtQueryVolumeInformationFile_type)(HANDLE, PIO_STATUS_BLOCK,
+                                                            PVOID, ULONG,
+                                                            FS_INFORMATION_CLASS);
 
 using NtTerminateProcess_type = NTSTATUS(WINAPI*)(HANDLE ProcessHandle,
                                                   NTSTATUS ExitStatus);

@@ -20,10 +20,10 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #include "usvfs.h"
 #include "hookmanager.h"
+#include "loghelpers.h"
+#include "mappingdump.h"
 #include "maptracker.h"
 #include "readcache.h"
-#include "mappingdump.h"
-#include "loghelpers.h"
 #include "redirectiontree.h"
 #include "usvfs_version.h"
 #include "usvfsparametersprivate.h"
@@ -465,8 +465,9 @@ BOOL WINAPI usvfsCreateVFS(const usvfsParameters* p)
 BOOL WINAPI usvfsConnectVFS(const usvfsParameters* params)
 {
   if (usvfs::mapdump::enabled())
-    usvfs::mapdump::setParams(params->instanceName, params->debugMode, (int)params->logLevel,
-                              (int)params->crashDumpsType, params->crashDumpsPath, params->delayProcessMs);
+    usvfs::mapdump::setParams(params->instanceName, params->debugMode,
+                              (int)params->logLevel, (int)params->crashDumpsType,
+                              params->crashDumpsPath, params->delayProcessMs);
   if (spdlog::get("usvfs").get() == nullptr) {
     // create temporary logger so we don't get null-pointer exceptions
     spdlog::create<spdlog::sinks::null_sink_mt>("usvfs");
@@ -672,7 +673,9 @@ BOOL WINAPI usvfsVirtualLinkFile(LPCWSTR source, LPCWSTR destination,
                                  unsigned int flags)
 {
   if (usvfs::mapdump::enabled())
-    usvfs::mapdump::add("LINKFILE", {usvfs::mapdump::utf8(source), usvfs::mapdump::utf8(destination), std::to_string(flags)});
+    usvfs::mapdump::add("LINKFILE",
+                        {usvfs::mapdump::utf8(source),
+                         usvfs::mapdump::utf8(destination), std::to_string(flags)});
   usvfs::MappingChangeGuard mappingChange;
   // TODO difference between winapi and ntdll api regarding system32 vs syswow64
   // (and other windows links?)
@@ -740,7 +743,9 @@ BOOL WINAPI usvfsVirtualLinkDirectoryStatic(LPCWSTR source, LPCWSTR destination,
 {
   usvfs::mapdump::NestGuard nest;
   if (nest.outer && usvfs::mapdump::enabled())
-    usvfs::mapdump::add("LINKDIR", {usvfs::mapdump::utf8(source), usvfs::mapdump::utf8(destination), std::to_string(flags)});
+    usvfs::mapdump::add("LINKDIR",
+                        {usvfs::mapdump::utf8(source),
+                         usvfs::mapdump::utf8(destination), std::to_string(flags)});
   usvfs::MappingChangeGuard mappingChange;
   // TODO change notification not yet implemented
   try {
@@ -945,7 +950,8 @@ VOID WINAPI usvfsClearSkipDirectories()
 VOID WINAPI usvfsForceLoadLibrary(LPCWSTR processName, LPCWSTR libraryPath)
 {
   if (usvfs::mapdump::enabled())
-    usvfs::mapdump::add("FORCELOAD", {usvfs::mapdump::utf8(processName), usvfs::mapdump::utf8(libraryPath)});
+    usvfs::mapdump::add("FORCELOAD", {usvfs::mapdump::utf8(processName),
+                                      usvfs::mapdump::utf8(libraryPath)});
   context->forceLoadLibrary(processName, libraryPath);
 }
 
