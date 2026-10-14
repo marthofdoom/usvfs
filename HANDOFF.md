@@ -27,7 +27,9 @@ inside the injected usvfs DLL (see `/mnt/gaming/modlists/Projects/Linux-Storage-
   `_PREWARM_CLASSES`. Replay processes must set USVFS_METACACHE=1 explicitly to test it.
   Front cache (`USVFS_METACACHE_FRONT=0` off): GetFileAttributesW/ExW answers keyed by the virtual path as
   passed (`logic::frontKey`), served in impl_* right after the active/interestingPath check; valid only while
-  the store generation is unchanged (any invalidation or `noteMappingChange()` from maptracker.h drops all).
+  the store generation is unchanged (any invalidation or `noteMappingChange()` from maptracker.h and the
+  exported usvfs mutators drops all). Negative GetFileAttributes answers now rely on the frozen-modlist
+  assumption too: tree edits by other processes are not seen.
 - Trace (harness): `src/usvfs_dll/trace.{h,cpp}`, `trace_format.h`. `USVFS_TRACE=<win path>`,
   `USVFS_TRACE_CRC=1`. Init logs one line to the usvfs log ("trace enabled/disabled: reason").
 

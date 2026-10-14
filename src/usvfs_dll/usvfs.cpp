@@ -21,6 +21,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "usvfs.h"
 #include "usvfs_version.h"
 #include "hookmanager.h"
+#include "maptracker.h"
 #include "readcache.h"
 #include "usvfsparametersprivate.h"
 #include "redirectiontree.h"
@@ -565,6 +566,7 @@ BOOL WINAPI usvfsGetVFSProcessList2(size_t* count, DWORD** buffer)
 
 void WINAPI usvfsClearVirtualMappings()
 {
+  usvfs::MappingChangeGuard mappingChange;
   context->redirectionTable()->clear();
   context->inverseTable()->clear();
 }
@@ -650,6 +652,7 @@ static bool fileNameInSkipDirectories(const std::string& directoryNameUtf8,
 BOOL WINAPI usvfsVirtualLinkFile(LPCWSTR source, LPCWSTR destination,
                             unsigned int flags)
 {
+  usvfs::MappingChangeGuard mappingChange;
   // TODO difference between winapi and ntdll api regarding system32 vs syswow64
   // (and other windows links?)
   try {
@@ -713,6 +716,7 @@ static usvfs::shared::TreeFlags convertRedirectionFlags(unsigned int flags)
 
 BOOL WINAPI usvfsVirtualLinkDirectoryStatic(LPCWSTR source, LPCWSTR destination, unsigned int flags)
 {
+  usvfs::MappingChangeGuard mappingChange;
   // TODO change notification not yet implemented
   try {
     if ((flags & LINKFLAG_FAILIFEXISTS)

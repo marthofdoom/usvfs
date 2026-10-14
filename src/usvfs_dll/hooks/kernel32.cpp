@@ -359,7 +359,8 @@ BOOL WINAPI usvfs::impl_GetFileAttributesExW(
     if (usvfs::metacache::frontLookup(true, lpFileName, cached, front) &&
         (!cached.ok ||
          usvfs::readcache::guardedCopy(lpFileInformation, &cached.data, sizeof(cached.data)))) {
-      callContext.updateLastError(cached.err);
+      if (!cached.ok)
+        callContext.updateLastError(cached.err);
       return cached.ok ? TRUE : FALSE;
     }
   }
@@ -407,7 +408,8 @@ BOOL WINAPI usvfs::impl_GetFileAttributesExW(
     result.err = fixedError;
     if (!result.ok || usvfs::readcache::guardedCopy(&result.data, lpFileInformation,
                                                      sizeof(result.data)))
-      usvfs::metacache::frontStore(front, true, result, reroute.fileName());
+      usvfs::metacache::frontStore(front, true, result, reroute.fileName(),
+                                      canonicalFile.c_str());
   }
 
   if (reroute.wasRerouted() || fixedError != originalError) {
@@ -447,7 +449,8 @@ DWORD WINAPI usvfs::impl_GetFileAttributesW(LPCWSTR lpFileName)
   {
     usvfs::metacache::FrontResult cached;
     if (usvfs::metacache::frontLookup(false, lpFileName, cached, front)) {
-      callContext.updateLastError(cached.err);
+      if (!cached.ok)
+        callContext.updateLastError(cached.err);
       return cached.ok ? cached.attr : INVALID_FILE_ATTRIBUTES;
     }
   }
@@ -494,7 +497,8 @@ DWORD WINAPI usvfs::impl_GetFileAttributesW(LPCWSTR lpFileName)
     result.ok   = res != INVALID_FILE_ATTRIBUTES;
     result.err  = fixedError;
     result.attr = res;
-    usvfs::metacache::frontStore(front, false, result, reroute.fileName());
+    usvfs::metacache::frontStore(front, false, result, reroute.fileName(),
+                                    canonicalFile.c_str());
   }
 
   if (reroute.wasRerouted() || fixedError != originalError) {

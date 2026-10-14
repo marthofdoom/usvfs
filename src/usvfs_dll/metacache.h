@@ -112,9 +112,10 @@ struct FrontResult
 // true if answered (`out` is filled); on a miss `ticket` is for frontStore()
 bool frontLookup(bool ex, const wchar_t* name, FrontResult& out, FrontTicket& ticket);
 // `reroutedName`: the real path the call was redirected to (nothing is cached
-// if that is excluded or written)
+// if that is excluded or written). `canonicalName`: the absolute path the call
+// resolved the name to; must match the ticket key (cwd changed meanwhile otherwise)
 void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
-                const wchar_t* reroutedName);
+                const wchar_t* reroutedName, const wchar_t* canonicalName);
 
 // the usvfs mappings (redirection tree, delete / fake-directory trackers) changed
 void noteMappingChange();

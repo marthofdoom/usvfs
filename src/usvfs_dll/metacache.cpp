@@ -352,7 +352,7 @@ struct FrontState
   std::unordered_map<std::wstring, FrontEntry> entries;  // key + kind char
   std::atomic<uint64_t> hits{0};
   std::atomic<uint64_t> misses{0};
-  static constexpr size_t kMaxEntries = 400000;
+  size_t maxEntries = 100000;  // set from the memory cap in init()
 };
 
 FrontState* gFront = nullptr;  // allocated in init() when enabled, never freed
@@ -924,7 +924,11 @@ void init()
     registerOverwrite();
   const char* fr = env("USVFS_METACACHE_FRONT", buf, sizeof(buf));
   if (enabled && (fr ? readcache::logic::parseFlag(fr, true) : true))
+  {
     gFront = new FrontState();
+    // ~400 bytes per entry, at most a quarter of the cap
+    gFront->maxEntries = static_cast<size_t>(std::clamp<uint64_t>((mb << 20) / 4 / 400, 1000, 400000));
+  }
 
   const char* pw = env("USVFS_METACACHE_PREWARM", buf, sizeof(buf));
   g->prewarm = pw ? readcache::logic::parseFlag(pw, false) : isGameProcess();
@@ -1030,7 +1034,7 @@ bool frontLookup(bool ex, const wchar_t* name, FrontResult& out, FrontTicket& ti
 }
 
 void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
-                const wchar_t* reroutedName)
+                const wchar_t* reroutedName, const wchar_t* canonicalName)
 {
   FrontState* f = gFront;
   if (!f || !g || !enabled() || ticket.key.empty())
@@ -1038,6 +1042,12 @@ void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
   if (!result.ok && result.err != ERROR_FILE_NOT_FOUND && result.err != ERROR_PATH_NOT_FOUND)
     return;
   (void)ex;
+  // the key was built with the cwd at lookup time, the call resolved the name
+  // with the cwd at its own time: they must agree
+  if (!canonicalName ||
+      logic::frontKey(canonicalName, std::wstring_view()) !=
+          std::wstring_view(ticket.key).substr(0, ticket.key.size() - 1))
+    return;
   if (ticket.key.size() < 3 || ticket.key[1] != L':')
     return;
   // virtual path (without the kind char) and the real path it resolved to must
@@ -1057,7 +1067,7 @@ void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
   std::unique_lock<std::shared_mutex> lock(f->mutex);
   if (g->store.generation() != ticket.gen)
     return;  // something was invalidated meanwhile
-  if (f->entries.size() >= FrontState::kMaxEntries)
+  if (f->entries.size() >= f->maxEntries)
     f->entries.clear();
   FrontEntry& e = f->entries[ticket.key];
   e.gen    = ticket.gen;
