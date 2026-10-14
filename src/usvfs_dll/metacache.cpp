@@ -324,6 +324,15 @@ struct State
   int stopPct = 75;               // front pre-warm stops when a front cache is this full
   unsigned listingPct = 60;       // pre-warm stops storing listings above this store fullness
   std::string dataRoot;           // normalized ('/', lower case) directory visited first; may be empty
+  bool dataRootDerived = false;   // dataRoot is the <exe dir>/Data default (checked against the tree at the front pre-warm)
+  // real outcomes of the queries that missed: [found, FILE_NOT_FOUND, PATH_NOT_FOUND, other]
+  std::atomic<uint64_t> frontOutcome[4]{};
+  std::atomic<uint64_t> ntOutcome[2][4]{};  // [0] NtQueryAttributesFile, [1] NtQueryFullAttributesFile
+  // negative derivation (USVFS_METACACHE_NEGATIVE)
+  bool negative = false;
+  std::atomic<uint64_t> negTried{0};
+  std::atomic<uint64_t> negHitFront[2]{};  // [FILE_NOT_FOUND, PATH_NOT_FOUND]
+  std::atomic<uint64_t> negHitNt[2]{};
   std::atomic<uint64_t> frontAttrSynth{0};  // attr front entries synthesized by the main pre-warm
   std::atomic<uint64_t> frontDirsDone{0};
   std::atomic<uint64_t> frontListsDone{0};
@@ -608,6 +617,18 @@ void logSummary(const char* prefix)
   if (gFront) {
     logger->info("{}: attr front misses first-time={} repeat={}", prefix,
                  ld(gFront->missesFirst), ld(gFront->missesRepeat));
+  }
+  logger->info("{}: miss outcomes [found/FILE_NOT_FOUND/PATH_NOT_FOUND/other]: attr front {}/{}/{}/{}, "
+               "NtQueryAttributesFile {}/{}/{}/{}, NtQueryFullAttributesFile {}/{}/{}/{}",
+               prefix, ld(g->frontOutcome[0]), ld(g->frontOutcome[1]), ld(g->frontOutcome[2]),
+               ld(g->frontOutcome[3]), ld(g->ntOutcome[0][0]), ld(g->ntOutcome[0][1]),
+               ld(g->ntOutcome[0][2]), ld(g->ntOutcome[0][3]), ld(g->ntOutcome[1][0]),
+               ld(g->ntOutcome[1][1]), ld(g->ntOutcome[1][2]), ld(g->ntOutcome[1][3]));
+  if (g->negative) {
+    logger->info("{}: negative derivation: tried={} answered front FILE_NOT_FOUND={} PATH_NOT_FOUND={}, "
+                 "Nt FILE_NOT_FOUND={} PATH_NOT_FOUND={}",
+                 prefix, ld(g->negTried), ld(g->negHitFront[0]), ld(g->negHitFront[1]),
+                 ld(g->negHitNt[0]), ld(g->negHitNt[1]));
   }
   if (gEnum) {
     std::string rj;
@@ -1182,6 +1203,21 @@ void frontLogProgress(const char* what, uint64_t sinceMs, size_t frontNow, uint6
 void frontPrewarmJob()
 {
   trace::setInternalThread(true);
+  if (g->dataRootDerived && !g->dataRoot.empty()) {
+    // the default <exe dir>/Data must be a node of the usvfs tree, else the name heuristic ranks
+    bool present = false;
+    try {
+      HookContext::ConstPtr context = HookContext::readAccess("metacache data root");
+      present = context->redirectionTable()->findNode(boost::filesystem::path(g->dataRoot)).get() != nullptr;
+    } catch (const std::exception&) {
+    }
+    if (!present) {
+      if (auto logger = spdlog::get("usvfs"))
+        logger->info("metacache: data root '{}' is not in the virtual tree, using the name heuristic",
+                     g->dataRoot);
+      g->dataRoot.clear();
+    }
+  }
   const uint64_t start = GetTickCount64();
   g->frontStartTick.store(start);
   auto job  = std::make_shared<FrontJob>();
@@ -1484,7 +1520,7 @@ void init()
 
   {
     // game process only (the pre-warm job needs the game's frozen modlist)
-    const bool frontOk = config::flag("USVFS_METACACHE_FRONT_PREWARM", true);
+    const bool frontOk = config::flag("USVFS_METACACHE_FRONT_PREWARM", false);
     g->frontPrewarm    = frontOk && enabled && g->prewarm && gameProcess;
     g->frontPrewarmSec = static_cast<int>(config::number("USVFS_METACACHE_FRONT_PREWARM_SEC", 0));
     g->frontPrewarmThreads = static_cast<int>(config::number("USVFS_METACACHE_FRONT_PREWARM_THREADS", 4, 1, 16));
@@ -1493,6 +1529,7 @@ void init()
   {
     std::string root = config::text("USVFS_METACACHE_DATA_ROOT");
     if (root.empty() && gameProcess) {
+      g->dataRootDerived = true;
       wchar_t path[MAX_PATH * 2] = {};
       const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
       if (n > 0 && n < MAX_PATH * 2) {
@@ -1504,6 +1541,8 @@ void init()
     }
     g->dataRoot = logic::normalizeDataRoot(root);
   }
+
+  g->negative = enabled && config::flag("USVFS_METACACHE_NEGATIVE", false);
 
   if (enabled && config::flag("USVFS_METACACHE_FRONT_ENUM", true)) {
     gEnum           = new EnumState();
@@ -1618,6 +1657,9 @@ void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
   FrontState* f = gFront;
   if (!f || !g || !enabled() || ticket.key.empty())
     return;
+  g->frontOutcome[result.ok ? 0 : result.err == ERROR_FILE_NOT_FOUND ? 1
+                  : result.err == ERROR_PATH_NOT_FOUND ? 2 : 3]
+      .fetch_add(1, std::memory_order_relaxed);
   if (!result.ok && result.err != ERROR_FILE_NOT_FOUND && result.err != ERROR_PATH_NOT_FOUND)
     return;
   (void)ex;
@@ -1969,15 +2011,145 @@ bool lookupFull(const std::wstring& key, PFILE_NETWORK_OPEN_INFORMATION out, NTS
   return true;
 }
 
+// ---- negative derivation ----
+
+// 0 unknown, 1 FILE_NOT_FOUND, 2 PATH_NOT_FOUND for the virtual absolute drive path
+// `path` ("\\??\\C:\\..." or "C:\\..."), from the tree and complete listings only
+static int negativeCore(std::wstring_view path)
+{
+  if (!g || !g->negative || !enabled())
+    return 0;
+  std::vector<std::wstring> comps;
+  if (!logic::negSplit(path, comps))
+    return 0;
+  g->negTried.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t gen0 = g->store.generation();
+
+  auto join = [&](size_t n, wchar_t sep) {
+    std::wstring out;
+    for (size_t i = 0; i < n; ++i) {
+      if (i)
+        out.push_back(sep);
+      out += comps[i];
+    }
+    return out;
+  };
+  const std::wstring fullKey = makeKey(LR"(\??\)" + join(comps.size(), L'\\'));
+  if (fullKey.empty() || g->store.isVolatile(fullKey))
+    return 0;
+
+  try {
+    HookContext::ConstPtr context = HookContext::readAccess("metacache negative");
+    const RedirectionTreeContainer& table = context->redirectionTable();
+    auto findNode = [&](size_t n) {
+      return table->findNode(boost::filesystem::path(narrow(join(n, L'/'))));
+    };
+
+    const auto node = [&](size_t n) -> logic::NegNode {
+      auto nd = findNode(n);
+      if (nd.get() == nullptr)
+        return logic::NegNode::None;
+      const std::string link = nd->data().linkTarget.c_str();
+      const bool dummy = nd->hasFlag(shared::FLAG_DUMMY);
+      // see listChildren: a file link does not end in a separator
+      if (!dummy && !link.empty() && link.back() != '\\' && link.back() != '/')
+        return logic::NegNode::File;
+      return logic::NegNode::Dir;
+    };
+
+    const auto child = [&](size_t p) -> logic::NegChild {
+      const std::wstring& name = comps[p];
+      if (logic::negMayBeShortName(name))
+        return logic::NegChild::Unknown;
+      const std::wstring dirKey = makeKey(LR"(\??\)" + join(p, L'\\'));
+      if (dirKey.empty() || g->store.isBlockedPath(dirKey))
+        return logic::NegChild::Unknown;
+      // The listing under the directory's key is that of the directory the usvfs
+      // enumeration really reads. It stands for the game directory itself only if
+      // that is the same directory (no link to another one).
+      auto nd = findNode(p);
+      if (nd.get() == nullptr)
+        return logic::NegChild::Unknown;
+      std::string link = nd->data().linkTarget.c_str();
+      if (!link.empty()) {
+        while (!link.empty() && (link.back() == '\\' || link.back() == '/'))
+          link.pop_back();
+        std::wstring wlink;
+        try {
+          wlink = shared::string_cast<std::wstring>(link.c_str(), shared::CodePage::UTF8);
+        } catch (const std::exception&) {
+          return logic::NegChild::Unknown;
+        }
+        if (logic::normalizePath(wlink) != logic::normalizePath(join(p, L'\\')))
+          return logic::NegChild::Unknown;
+      }
+      std::shared_ptr<const Listing> all = g->store.lookupAnyStar(dirKey);
+      if (!all)
+        return logic::NegChild::Unknown;
+      std::wstring folded;
+      for (wchar_t c : name)
+        folded.push_back(logic::foldChar(c));
+      return all->findLiteral(folded).empty() ? logic::NegChild::Absent
+                                              : logic::NegChild::Present;
+    };
+
+    const logic::NegVerdict v = logic::deriveNegative(comps.size(), node, child);
+    if (v == logic::NegVerdict::Unknown || g->store.generation() != gen0)
+      return 0;
+    return v == logic::NegVerdict::FileNotFound ? 1 : 2;
+  } catch (const std::exception&) {
+    return 0;
+  }
+}
+
+bool negativeEnabled()
+{
+  return g && g->negative && enabled();
+}
+
+bool frontNegative(const FrontTicket& ticket, FrontResult& out)
+{
+  if (!negativeEnabled() || ticket.key.size() < 4)
+    return false;
+  const int v = negativeCore(std::wstring_view(ticket.key).substr(0, ticket.key.size() - 1));
+  if (v == 0)
+    return false;
+  g->negHitFront[v - 1].fetch_add(1, std::memory_order_relaxed);
+  out.ok  = false;
+  out.err = v == 1 ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND;
+  return true;
+}
+
+NTSTATUS negativeNt(std::wstring_view virtualNtPath)
+{
+  if (!negativeEnabled())
+    return STATUS_SUCCESS;
+  const int v = negativeCore(virtualNtPath);
+  if (v == 0)
+    return STATUS_SUCCESS;
+  g->negHitNt[v - 1].fetch_add(1, std::memory_order_relaxed);
+  return v == 1 ? kStatusObjectNameNotFound : kStatusObjectPathNotFound;
+}
+
 uint64_t generation()
 {
   return g ? g->store.generation() : 0;
 }
 
+static void noteNtOutcome(int which, NTSTATUS status)
+{
+  g->ntOutcome[which][status >= 0 ? 0 : status == kStatusObjectNameNotFound ? 1
+                      : status == kStatusObjectPathNotFound ? 2 : 3]
+      .fetch_add(1, std::memory_order_relaxed);
+}
+
 void storeBasic(const std::wstring& key, NTSTATUS status,
                 const FILE_BASIC_INFORMATION* info, uint64_t gen)
 {
-  if (!g || !cacheableStatus(status))
+  if (!g)
+    return;
+  noteNtOutcome(0, status);
+  if (!cacheableStatus(status))
     return;
   FILE_BASIC_INFORMATION copy;
   std::memset(&copy, 0, sizeof(copy));
@@ -1990,7 +2162,10 @@ void storeBasic(const std::wstring& key, NTSTATUS status,
 void storeFull(const std::wstring& key, NTSTATUS status,
                const FILE_NETWORK_OPEN_INFORMATION* info, uint64_t gen)
 {
-  if (!g || !cacheableStatus(status))
+  if (!g)
+    return;
+  noteNtOutcome(1, status);
+  if (!cacheableStatus(status))
     return;
   FILE_NETWORK_OPEN_INFORMATION copy;
   std::memset(&copy, 0, sizeof(copy));
@@ -2000,14 +2175,37 @@ void storeFull(const std::wstring& key, NTSTATUS status,
   g->store.putAttr(key, toAttr(status, &copy), gen);
 }
 
-void feedFull(const std::wstring& ntPath, const FILE_NETWORK_OPEN_INFORMATION& info)
+void feedFull(const std::wstring& ntPath, const FILE_NETWORK_OPEN_INFORMATION& info, uint64_t gen)
 {
   if (!g || !enabled())
     return;
   const std::wstring key = makeKey(ntPath);
   if (key.empty() || g->store.hasAttr(key))
     return;
-  g->store.putAttr(key, toAttr(STATUS_SUCCESS, &info), g->store.generation());
+  // Wine's path query adds HIDDEN to dot-leaves, the handle query does not
+  const size_t slash = key.rfind(L'\\');
+  if (slash == std::wstring::npos || slash + 1 >= key.size() || key[slash + 1] == L'.')
+    return;
+  // ... and may report REPARSE_POINT for a symlinked last component, which the
+  // handle query (it follows the link) cannot show: ask by path, unhooked
+  {
+    HookCallContext blockHooks(MutExHookGroup::ALL_GROUPS);
+    UNICODE_STRING name;
+    name.Buffer        = const_cast<PWSTR>(ntPath.c_str());
+    name.Length        = static_cast<USHORT>(ntPath.size() * sizeof(WCHAR));
+    name.MaximumLength = name.Length;
+    OBJECT_ATTRIBUTES attrs;
+    std::memset(&attrs, 0, sizeof(attrs));
+    attrs.Length     = sizeof(attrs);
+    attrs.ObjectName = &name;
+    attrs.Attributes = 0x40;
+    FILE_BASIC_INFORMATION basic;
+    std::memset(&basic, 0, sizeof(basic));
+    if (::NtQueryAttributesFile(&attrs, &basic) != STATUS_SUCCESS ||
+        (basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+      return;
+  }
+  g->store.putAttr(key, toAttr(STATUS_SUCCESS, &info), gen);
 }
 
 NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK iosb,

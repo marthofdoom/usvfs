@@ -76,7 +76,12 @@ void storeBasic(const std::wstring& key, NTSTATUS status,
 // stores a full attribute record for a real file (NT path of its handle), e.g. one
 // the readcache learned at classification. Ignored if the path is not cacheable,
 // already known, excluded, or the cache is off.
-void feedFull(const std::wstring& ntPath, const FILE_NETWORK_OPEN_INFORMATION& info);
+//
+// `generation` is the generation() read before the information was obtained (the
+// record is dropped if it moved). Not fed: dot-leaves (Wine's path query adds
+// HIDDEN) and reparse points/symlinks (checked by path).
+void feedFull(const std::wstring& ntPath, const FILE_NETWORK_OPEN_INFORMATION& info,
+              uint64_t generation);
 void storeFull(const std::wstring& key, NTSTATUS status,
                const FILE_NETWORK_OPEN_INFORMATION* info, uint64_t generation);
 
@@ -95,6 +100,17 @@ NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE handle,
 
 // forget the enumeration state of a handle; call before closing it
 void onClose(HANDLE handle);
+
+// Negative derivation (USVFS_METACACHE_NEGATIVE, default off): FILE_NOT_FOUND /
+// PATH_NOT_FOUND answered without a real call when the virtual parent directory's
+// complete contents are known (it is a usvfs tree node whose real directory has a
+// complete cached "*" listing, and the name is neither a tree child nor in it).
+// Never for volatile/overwrite paths, short-name-like names, or when the
+// generation moved meanwhile.
+bool negativeEnabled();
+// virtual NT path (\??\C:\...) as the application passed it (RootDirectory
+// resolved); STATUS_SUCCESS = no answer, else the status to return
+NTSTATUS negativeNt(std::wstring_view virtualNtPath);
 
 // Front cache: the final results of GetFileAttributesW / GetFileAttributesExW
 // (GetFileExInfoStandard only) keyed by the virtual path as the application passed
@@ -122,6 +138,9 @@ bool frontLookup(bool ex, const wchar_t* name, FrontResult& out, FrontTicket& ti
 // resolved the name to; must match the ticket key (cwd changed meanwhile otherwise)
 void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
                 const wchar_t* reroutedName, const wchar_t* canonicalName);
+// negative derivation for the front miss `ticket` (see negativeEnabled): true if
+// `out` holds the answer (not found, with the Win32 error)
+bool frontNegative(const FrontTicket& ticket, FrontResult& out);
 
 // Enumeration front cache (FindFirstFileExW / FindNextFileW / FindClose). A listing
 // is recorded from what the application iterated (published only when it reached

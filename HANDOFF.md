@@ -37,7 +37,7 @@ inside the injected usvfs DLL (see `/mnt/gaming/modlists/Projects/Linux-Storage-
 - Memory: `USVFS_METACACHE_MB` (default clamp(RAM/64,256,1024)) caps the attr/listing store; the enum front gets
   up to half of it again and the attr front up to a quarter, so the metacache totals ~1.75x that value, plus the
   readcache budget (`USVFS_READCACHE_MB`, default clamp(RAM/32,256,1024)). Front pre-warm
-  (`USVFS_METACACHE_FRONT_PREWARM`, `USVFS_METACACHE_FRONT_PREWARM_THREADS`, `_SEC`): attr front entries are synthesized during the main pre-warm walk from the real
+  (`USVFS_METACACHE_FRONT_PREWARM` default OFF, `USVFS_METACACHE_FRONT_PREWARM_THREADS`, `_SEC`): attr front entries are synthesized during the main pre-warm walk from the real
   target's attributes (no hooked calls); the enum front is filled by `_THREADS` (default 4) dedicated BELOW_NORMAL threads
   running the hooked FindFirstFileExW per directory (Data first, then breadth-first), untraced (BgPool workers block all
   hooks). Progress is logged every 5 s; `_SEC` (default 0 = none) is an optional time budget.
@@ -93,12 +93,15 @@ Unit-tested parser: `config_logic.h` / `test/shared_test/config_logic_test.cpp`.
 | USVFS_METACACHE_PREWARM_THREADS | 4 (1-16) | main pre-warm workers |
 | USVFS_METACACHE_PREWARM_CLASSES | 3 | comma list of directory information classes pre-listed |
 | USVFS_METACACHE_LISTING_PCT | 60 | main pre-warm stops storing listings above this store fullness |
-| USVFS_METACACHE_FRONT_PREWARM | 1 | enum front pre-warm job (game process, needs PREWARM) |
+| USVFS_METACACHE_FRONT_PREWARM | 0 | front pre-warm (attr synthesis during the main walk + enum front job; game process, needs PREWARM). Off by default: replay measured +3-5% slower and no extra hits |
+| USVFS_METACACHE_NEGATIVE | 0 | negative derivation: GetFileAttributes(Ex)W (front level) and NtQuery(Full)AttributesFile answer FILE_NOT_FOUND / PATH_NOT_FOUND with no real call when the virtual parent is a usvfs tree node whose real directory (must be the same dir, no link elsewhere) has a complete cached "*" listing at the current generation and the name is in neither the tree nor the listing (names containing '~' never). Never for volatile/overwrite paths or if the generation moved. Counters in the summary ("negative derivation"); decision logic unit-tested (`MetaCacheNegative`) |
 | USVFS_METACACHE_FRONT_PREWARM_THREADS | 4 (1-16) | its worker threads |
 | USVFS_METACACHE_FRONT_PREWARM_SEC | 0 | optional time budget (0 = none) |
 | USVFS_METACACHE_STOP_PCT | 75 | the front pre-warm (and attr synthesis) stops when a front cache is this full |
-| USVFS_METACACHE_DATA_ROOT | `<game exe dir>/Data` | directory the enum pre-warm visits first (it, its direct children and its ancestors rank 0, the rest breadth-first). Virtual path, e.g. `Z:/Games/Skyrim/Data`; empty outside the game process = name heuristic ("data" segment) |
+| USVFS_METACACHE_DATA_ROOT | `<game exe dir>/Data` | directory the enum pre-warm visits first (default is used only if it is a node of the usvfs tree, else the name heuristic) (it, its direct children and its ancestors rank 0, the rest breadth-first). Virtual path, e.g. `Z:/Games/Skyrim/Data`; empty outside the game process = name heuristic ("data" segment) |
 | USVFS_TRACE / USVFS_TRACE_CRC | unset | harness trace output / CRCs |
+
+Summary log lines also split front / NtQueryAttributesFile / NtQueryFullAttributesFile misses by real outcome (found / FILE_NOT_FOUND / PATH_NOT_FOUND / other).
 
 ## Hook structure
 - `hooks/ntdll.cpp`: bodies renamed `impl_Nt*` (NtCreateFile/OpenFile/ReadFile/QueryInformationFile/

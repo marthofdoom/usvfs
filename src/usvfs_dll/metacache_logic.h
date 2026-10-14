@@ -26,6 +26,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -601,6 +602,23 @@ public:
     return nullptr;
   }
 
+  // the complete "*" listing of a directory in any information class (they all
+  // carry every name); no statistics. Null if none is stored.
+  std::shared_ptr<const Listing> lookupAnyStar(const std::wstring& dir)
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto d = m_dirs.find(dir);
+    if (d == m_dirs.end())
+      return nullptr;
+    for (ListSlot& slot : d->second) {
+      if (slot.mask == L"*") {
+        touch(slot.lru);
+        return slot.listing;
+      }
+    }
+    return nullptr;
+  }
+
   void putListing(const std::wstring& dir, int cls, const std::wstring& mask,
                   std::shared_ptr<const Listing> listing, bool derived = false,
                   uint64_t generation = kAnyGeneration)
@@ -1013,5 +1031,84 @@ private:
   uint64_t m_generation = 0;
   StoreStats m_stats;
 };
+
+// ---------------------------------------------------------------------------
+// negative derivation: "X does not exist" from a virtual directory whose complete
+// contents are known (tree children + complete real listings)
+
+enum class NegVerdict { Unknown, FileNotFound, PathNotFound };
+enum class NegNode { None, Dir, File };            // node of the usvfs tree
+enum class NegChild { Present, Absent, Unknown };  // name in the known contents
+
+// Splits an absolute drive path ("\\??\\C:\\A\\B", "C:/A/B", ...) into its components
+// ("C:", "A", "B"). False for anything the system would interpret: empty
+// segments, "." / "..", wildcards, streams, trailing dot/space, device/UNC forms.
+inline bool negSplit(std::wstring_view path, std::vector<std::wstring>& comps)
+{
+  comps.clear();
+  if (path.size() >= 4 && path.compare(0, 4, L"\\??\\") == 0)
+    path.remove_prefix(4);
+  if (path.empty() || path.size() > 32000)
+    return false;
+  size_t i = 0;
+  while (i <= path.size()) {
+    size_t e = i;
+    while (e < path.size() && path[e] != L'\\' && path[e] != L'/')
+      ++e;
+    std::wstring_view seg = path.substr(i, e - i);
+    if (seg.empty() || seg == L"." || seg == L"..")
+      return false;
+    if (comps.empty()) {
+      const bool letter = (seg[0] >= L'a' && seg[0] <= L'z') || (seg[0] >= L'A' && seg[0] <= L'Z');
+      if (seg.size() != 2 || !letter || seg[1] != L':')
+        return false;
+    } else {
+      if (seg.find_first_of(L"*?<>\":|") != std::wstring_view::npos)
+        return false;
+      if (seg.back() == L'.' || seg.back() == L' ')
+        return false;
+    }
+    for (wchar_t c : seg) {
+      if (c < 0x20)
+        return false;
+    }
+    comps.emplace_back(seg);
+    if (e >= path.size())
+      return true;  // no trailing separator accepted: the loop only ends here
+    i = e + 1;
+  }
+  return false;
+}
+
+// a name that may be (or collide with) a generated 8.3 short name: never derived
+inline bool negMayBeShortName(std::wstring_view name)
+{
+  return name.find(L'~') != std::wstring_view::npos;
+}
+
+// Decision for a path of `n` components. `node(k)` classifies the tree node of
+// the first k components, `child(p)` says whether component p is present in the
+// complete contents of the directory formed by the first p components (only asked
+// for the deepest ancestor that is a directory node). FILE_NOT_FOUND when that
+// ancestor is the parent, PATH_NOT_FOUND when an intermediate directory is missing.
+inline NegVerdict deriveNegative(size_t n, const std::function<NegNode(size_t)>& node,
+                                 const std::function<NegChild(size_t)>& child)
+{
+  if (n < 2)
+    return NegVerdict::Unknown;
+  if (node(n) != NegNode::None)
+    return NegVerdict::Unknown;  // the name itself is mapped
+  for (size_t p = n - 1; p >= 1; --p) {
+    const NegNode k = node(p);
+    if (k == NegNode::None)
+      continue;
+    if (k == NegNode::File)
+      return NegVerdict::Unknown;
+    if (child(p) != NegChild::Absent)
+      return NegVerdict::Unknown;
+    return p == n - 1 ? NegVerdict::FileNotFound : NegVerdict::PathNotFound;
+  }
+  return NegVerdict::Unknown;
+}
 
 }  // namespace usvfs::metacache::logic

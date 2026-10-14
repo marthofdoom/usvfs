@@ -1449,6 +1449,15 @@ NTSTATUS WINAPI usvfs::impl_NtQueryAttributesFile(
 
   UnicodeString inPath = CreateUnicodeString(ObjectAttributes);
 
+  // derived "not found" from known directory contents (USVFS_METACACHE_NEGATIVE)
+  if (callContext.active() && ObjectAttributes &&
+      (ObjectAttributes->Attributes & 0x40 /* OBJ_CASE_INSENSITIVE */) != 0 &&
+      usvfs::metacache::negativeEnabled()) {
+    const NTSTATUS neg = usvfs::metacache::negativeNt(static_cast<LPCWSTR>(inPath));
+    if (neg != STATUS_SUCCESS)
+      return neg;
+  }
+
   RedirectionInfo redir
       = applyReroute(READ_CONTEXT(), callContext, inPath);
   unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
@@ -1504,6 +1513,13 @@ NTSTATUS WINAPI usvfs::impl_NtQueryFullAttributesFile(
     inPath = CreateUnicodeString(ObjectAttributes);
   } catch (const std::exception &) {
     return ::NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+  }
+
+  if (ObjectAttributes && (ObjectAttributes->Attributes & 0x40 /* OBJ_CASE_INSENSITIVE */) != 0 &&
+      usvfs::metacache::negativeEnabled()) {
+    const NTSTATUS neg = usvfs::metacache::negativeNt(static_cast<LPCWSTR>(inPath));
+    if (neg != STATUS_SUCCESS)
+      return neg;
   }
 
   RedirectionInfo redir

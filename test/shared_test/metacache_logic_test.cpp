@@ -451,3 +451,80 @@ TEST(MetaCacheFront, PrewarmRankExplicitRoot)
   EXPECT_GT(frontPrewarmRank("Z:/Games/Other", root), 0);
   EXPECT_GT(frontPrewarmRank("Z:/Games/Skyrim/Data2", root), 0);  // not a prefix match
 }
+
+// ---- negative derivation ---------------------------------------------------
+
+TEST(MetaCacheNegative, Split)
+{
+  std::vector<std::wstring> c;
+  ASSERT_TRUE(negSplit(LR"(\??\C:\Games\Data\x.esp)", c));
+  ASSERT_EQ(4u, c.size());
+  EXPECT_EQ(L"C:", c[0]);
+  EXPECT_EQ(L"x.esp", c[3]);
+  ASSERT_TRUE(negSplit(L"Z:/a/b", c));
+  EXPECT_EQ(3u, c.size());
+  EXPECT_FALSE(negSplit(LR"(\??\C:\a\)", c));       // trailing separator
+  EXPECT_FALSE(negSplit(LR"(\??\C:\a\..\b)", c));
+  EXPECT_FALSE(negSplit(LR"(\??\C:\a\.\b)", c));
+  EXPECT_FALSE(negSplit(LR"(\??\C:\a\b*)", c));
+  EXPECT_FALSE(negSplit(LR"(\??\C:\a\b:stream)", c));
+  EXPECT_FALSE(negSplit(LR"(\??\C:\a\b.)", c));
+  EXPECT_FALSE(negSplit(LR"(\??\C:\a\\b)", c));
+  EXPECT_FALSE(negSplit(LR"(\??\UNC\srv\share\x)", c));
+  EXPECT_FALSE(negSplit(L"rel\\x", c));
+  EXPECT_FALSE(negSplit(L"", c));
+  EXPECT_TRUE(negMayBeShortName(L"PROGRA~1"));
+  EXPECT_FALSE(negMayBeShortName(L"skyrim.esm"));
+}
+
+TEST(MetaCacheNegative, Decision)
+{
+  auto run = [](const wchar_t* path, NegChild answer) {
+    std::vector<std::wstring> c;
+    EXPECT_TRUE(negSplit(path, c));
+    auto node = [&](size_t k) {
+      std::wstring p;
+      for (size_t i = 0; i < k; ++i)
+        p += (i ? L"\\" : L"") + c[i];
+      for (wchar_t& ch : p)
+        ch = foldChar(ch);
+      if (p == L"C:" || p == L"C:\\G" || p == L"C:\\G\\DATA" || p == L"C:\\G\\DATA\\MESHES")
+        return NegNode::Dir;
+      return p == L"C:\\G\\DATA\\A.ESP" ? NegNode::File : NegNode::None;
+    };
+    return deriveNegative(c.size(), node, [&](size_t) { return answer; });
+  };
+  // parent is a directory node, name not in its contents
+  EXPECT_EQ(NegVerdict::FileNotFound, run(LR"(C:\g\data\b.esp)", NegChild::Absent));
+  // present / unknown contents: no answer
+  EXPECT_EQ(NegVerdict::Unknown, run(LR"(C:\g\data\b.esp)", NegChild::Present));
+  EXPECT_EQ(NegVerdict::Unknown, run(LR"(C:\g\data\b.esp)", NegChild::Unknown));
+  // the name itself is mapped
+  EXPECT_EQ(NegVerdict::Unknown, run(LR"(C:\g\data\a.esp)", NegChild::Absent));
+  EXPECT_EQ(NegVerdict::Unknown, run(LR"(C:\g\data\meshes)", NegChild::Absent));
+  // intermediate directory absent: PATH_NOT_FOUND
+  EXPECT_EQ(NegVerdict::PathNotFound, run(LR"(C:\g\data\textures\x.dds)", NegChild::Absent));
+  EXPECT_EQ(NegVerdict::PathNotFound, run(LR"(C:\g\data\textures\a\x.dds)", NegChild::Absent));
+  // a file used as a directory, and no tree ancestor below the drive
+  EXPECT_EQ(NegVerdict::Unknown, run(LR"(C:\g\data\a.esp\x)", NegChild::Absent));
+  EXPECT_EQ(NegVerdict::Unknown, run(LR"(D:\x\y)", NegChild::Absent));
+  EXPECT_EQ(NegVerdict::FileNotFound, run(L"C:\\x", NegChild::Absent));  // parent = drive node
+}
+
+TEST(MetaCacheNegative, ListingAnyStar)
+{
+  Store store(1 << 20);
+  const std::wstring dir = LR"(\??\C:\G\DATA)";
+  EXPECT_EQ(nullptr, store.lookupAnyStar(dir));
+  auto l = std::make_shared<Listing>();
+  l->add(std::string("rec"), L"Skyrim.esm");
+  store.putListing(dir, 3, L"*", l, false, store.generation());
+  store.putListing(dir, 3, L"FOO.ESP", std::make_shared<Listing>());
+  auto got = store.lookupAnyStar(dir);
+  ASSERT_NE(nullptr, got);
+  EXPECT_EQ(1u, got->findLiteral(L"SKYRIM.ESM").size());  // folded compare
+  EXPECT_TRUE(got->findLiteral(L"OTHER.ESM").empty());
+  // a write below invalidates the directory's listing
+  store.invalidatePath(dir + L"\\new.esp");
+  EXPECT_EQ(nullptr, store.lookupAnyStar(dir));
+}

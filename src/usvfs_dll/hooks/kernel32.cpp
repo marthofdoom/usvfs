@@ -363,6 +363,11 @@ BOOL WINAPI usvfs::impl_GetFileAttributesExW(
         callContext.updateLastError(cached.err);
       return cached.ok ? TRUE : FALSE;
     }
+    usvfs::metacache::FrontResult neg;
+    if (!front.key.empty() && usvfs::metacache::frontNegative(front, neg)) {
+      callContext.updateLastError(neg.err);
+      return FALSE;
+    }
   }
 
   fs::path canonicalFile = RerouteW::canonizePath(RerouteW::absolutePath(lpFileName));
@@ -452,6 +457,11 @@ DWORD WINAPI usvfs::impl_GetFileAttributesW(LPCWSTR lpFileName)
       if (!cached.ok)
         callContext.updateLastError(cached.err);
       return cached.ok ? cached.attr : INVALID_FILE_ATTRIBUTES;
+    }
+    usvfs::metacache::FrontResult neg;
+    if (!front.key.empty() && usvfs::metacache::frontNegative(front, neg)) {
+      callContext.updateLastError(neg.err);
+      return INVALID_FILE_ATTRIBUTES;
     }
   }
 

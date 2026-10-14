@@ -232,6 +232,7 @@ struct HandleState
   size_t snapSlot          = 0;
   uint64_t snapFileGen     = 0;
   uint64_t snapGlobalGen   = 0;
+  uint64_t snapMetaGen     = 0;  // metacache generation before the snapshot was taken
   // position of a probation handle, tracked from the reads and seeks we see
   std::atomic<uint64_t> probPos{0};
   std::atomic<bool> probKnown{false};
@@ -1801,6 +1802,7 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
   if (Eligibility r = logic::evaluateEligibility(a, g->limits); early(r))
     return r;
 
+  const uint64_t metaGen = metacache::generation();  // before the snapshot is read
   FileAttrs info;
   st = queryAttrs(h, info);
   if (st != STATUS_SUCCESS) {
@@ -1842,6 +1844,7 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
   hs.snapSlot      = fileGenSlot(info.fileId);
   hs.snapFileGen   = g_fileGen[hs.snapSlot].load(std::memory_order_acquire);
   hs.snapGlobalGen = g_writeGeneration.load(std::memory_order_acquire);
+  hs.snapMetaGen   = metaGen;
   hs.probPos.store(info.position < 0 ? 0 : static_cast<uint64_t>(info.position),
                    std::memory_order_relaxed);
   hs.probKnown.store(info.position >= 0, std::memory_order_release);
@@ -1953,7 +1956,8 @@ bool admit(HandleState& hs, HANDLE h)
   if (g_shareToMeta && !e.ntPath.empty() && metacache::enabled() &&
       hs.snapFileGen == g_fileGen[hs.snapSlot].load(std::memory_order_acquire) &&
       hs.snapGlobalGen == g_writeGeneration.load(std::memory_order_acquire) &&
-      (hs.snap.attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+      (hs.snap.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&
+      hs.snap.reparseTag == 0) {
     FILE_NETWORK_OPEN_INFORMATION n;
     std::memset(&n, 0, sizeof(n));
     n.CreationTime.QuadPart   = hs.snap.creation;
@@ -1963,7 +1967,7 @@ bool admit(HandleState& hs, HANDLE h)
     n.AllocationSize.QuadPart = hs.snap.allocation;
     n.EndOfFile.QuadPart      = hs.snap.endOfFile;
     n.FileAttributes          = hs.snap.attributes;
-    metacache::feedFull(e.ntPath, n);
+    metacache::feedFull(e.ntPath, n, hs.snapMetaGen);
   }
 
   dropWindows(hs);  // served mode takes over
