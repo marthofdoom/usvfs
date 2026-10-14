@@ -45,7 +45,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 // real one; the position queries/updates are patched accordingly and any read
 // we cannot serve first writes the shadow position back to the real pointer.
 //
-// Layer 2 (USVFS_READCACHE_ASYNC=1, default off): instead of filling in the
+// Layer 2 (on by default, USVFS_READCACHE_ASYNC=0 disables): instead of filling in the
 // calling thread, the fill is queued to a small worker pool. Workers read the
 // file in 1 MiB chunks through their own handle and publish progress in
 // CacheEntry::loadedBytes; readers wait only for the range they need.
@@ -256,6 +256,13 @@ struct Stats
   std::atomic<uint64_t> ineligible{0};
   std::atomic<uint64_t> byReason[static_cast<int>(Eligibility::Count)]{};
   BucketStats bucket[logic::kSizeBuckets];
+  // layer 2
+  std::atomic<uint64_t> asyncFills{0};          // completed on workers
+  std::atomic<uint64_t> asyncFillFailures{0};
+  std::atomic<uint64_t> syncFallbacks{0};       // queueFill failed, filled on the caller
+  std::atomic<uint64_t> fallbackNameQuery{0};
+  std::atomic<uint64_t> fallbackPoolStart{0};
+  std::atomic<uint64_t> fallbackOther{0};
   std::atomic<uint64_t> fills{0};
   std::atomic<uint64_t> fillBytes{0};
   std::atomic<uint64_t> evictions{0};      // entries dropped
@@ -561,6 +568,11 @@ void logSummary(const char* prefix)
         ld(b.served), ld(b.bytesServed), ld(b.probationEnd));
   }
   logger->info("{} by file size:{}", prefix, buckets);
+  logger->info(
+      "{} layer 2: asyncFills={} asyncFillFailures={} syncFallbacks={} "
+      "[name-query-failed={} pool-start-failed={} other={}]",
+      prefix, ld(s.asyncFills), ld(s.asyncFillFailures), ld(s.syncFallbacks),
+      ld(s.fallbackNameQuery), ld(s.fallbackPoolStart), ld(s.fallbackOther));
 
   const BigStats& b = s.big;
   std::string bigs;
@@ -1038,15 +1050,21 @@ bool submitTask(std::function<void()> task)
 // back to the synchronous fill)
 bool queueFill(HANDLE h, const std::shared_ptr<CacheEntry>& e)
 {
+  Stats& st = g->stats;
   {
     std::lock_guard<std::mutex> lock(e->m);
     if (e->state.load(std::memory_order_acquire) != kEmpty)
       return true;  // somebody else already took care of it
-    if (!queryObjectName(h, e->ntPath))
+    if (!queryObjectName(h, e->ntPath)) {
+      st.syncFallbacks.fetch_add(1, std::memory_order_relaxed);
+      st.fallbackNameQuery.fetch_add(1, std::memory_order_relaxed);
       return false;
+    }
     try {
       g->store.allocate(*e, g->limits.budgetBytes, g->stats);
     } catch (...) {
+      st.syncFallbacks.fetch_add(1, std::memory_order_relaxed);
+      st.fallbackOther.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
     e->state.store(kLoading, std::memory_order_release);
@@ -1059,11 +1077,15 @@ bool queueFill(HANDLE h, const std::shared_ptr<CacheEntry>& e)
     } catch (...) {
       ok = false;
     }
+    (ok ? g->stats.asyncFills : g->stats.asyncFillFailures)
+        .fetch_add(1, std::memory_order_relaxed);
     finishEntry(*e, ok);
     if (!ok)
       g->store.discard(e);
   });
   if (!queued) {
+    st.syncFallbacks.fetch_add(1, std::memory_order_relaxed);
+    st.fallbackPoolStart.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> elock(e->m);
     e->state.store(kEmpty, std::memory_order_release);
     return false;
@@ -1737,6 +1759,11 @@ void notePassthrough()
   maybeLog();
 }
 
+bool guardedCopy(void* dst, const void* src, size_t length)
+{
+  return sehCopy(dst, src, length);
+}
+
 bool inProtectedCopy()
 {
   return t_inProtectedCopy;
@@ -1771,7 +1798,7 @@ void init()
   g->raCapBytes =
       logic::parseNumber(env("USVFS_READCACHE_RA_MB", buf, sizeof(buf)), 64) << 20;
   g->async =
-      logic::parseFlag(env("USVFS_READCACHE_ASYNC", buf, sizeof(buf)), false);
+      logic::parseFlag(env("USVFS_READCACHE_ASYNC", buf, sizeof(buf)), true);
   g->threads = static_cast<int>(std::clamp<uint64_t>(
       logic::parseNumber(env("USVFS_READCACHE_THREADS", buf, sizeof(buf)), 4), 1, 16));
   g->lastLogTick.store(GetTickCount64());
@@ -1785,7 +1812,7 @@ void init()
       logger->info("readcache: enabled, budget {} MiB, max file {} MiB, admit after {} small reads, {}",
                    g->limits.budgetBytes >> 20, g->limits.maxFileBytes >> 20,
                    g->admitReads,
-                   g->async ? std::format("async fill with {} threads", g->threads)
+                   g->async ? std::format("async fill with {} threads (USVFS_READCACHE_ASYNC=0 for sync)", g->threads)
                             : std::string("synchronous fill"));
     } else {
       logger->info("readcache: disabled by USVFS_READCACHE");
