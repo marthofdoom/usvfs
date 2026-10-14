@@ -30,6 +30,10 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 //   USVFS_READCACHE_MB=1024        LRU budget in MiB
 //   USVFS_READCACHE_MAXFILE_MB=64  largest cached file in MiB
 //   USVFS_READCACHE_ADMIT_READS=8  small reads of a file before it is cached
+//   USVFS_READCACHE_SPLIT=1        split big reads over worker threads (default on)
+//   USVFS_READCACHE_SPLIT_MIN_KB=256, USVFS_READCACHE_SPLIT_CHUNK_KB=256
+//   USVFS_READCACHE_RA=1           sequential readahead (default on)
+//   USVFS_READCACHE_RA_MB=64       memory cap of all readahead windows
 //   USVFS_READCACHE_ASYNC=1        fill in background workers (default off)
 //   USVFS_READCACHE_THREADS=4      number of background workers
 
@@ -48,7 +52,7 @@ void init();
 // off. Must NOT be called from DllMain (it waits for the workers).
 void shutdown();
 
-enum class Peek { Unknown, Passthrough, Serve };
+enum class Peek { Unknown, Passthrough, Serve, Big };
 
 // cheap look at the classification of a handle (no reference counting, no
 // hook context): Passthrough handles (ineligible, or still on probation and not

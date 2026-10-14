@@ -220,6 +220,152 @@ inline const char* sizeBucketName(size_t bucket)
 }
 
 // ---------------------------------------------------------------------------
+// layer 3: splitting big reads and sequential readahead
+
+// a handle whose big reads may be split / read ahead (it need not be cacheable)
+inline bool splitCapable(const HandleAttrs& a)
+{
+  return a.deviceType != 0 && (a.deviceType == kDeviceTypeDisk ||
+                               a.deviceType == kDeviceTypeDiskFileSystem) &&
+         !a.directory &&
+         (a.mode & (kModeSynchronousAlert | kModeSynchronousNonAlert)) != 0 &&
+         (a.mode & kModeNoIntermediateBuffering) == 0 &&
+         (a.access & kAccessReadData) != 0 &&
+         (a.access & (kAccessWriteData | kAccessAppendData)) == 0;
+}
+
+constexpr size_t kBigBuckets = 4;
+
+// reads of at least kSmallReadLimit: 64-256K, 256K-1M, 1-4M, 4M+
+inline size_t bigBucket(uint64_t length)
+{
+  if (length < (256ull << 10))
+    return 0;
+  if (length < (1ull << 20))
+    return 1;
+  if (length < (4ull << 20))
+    return 2;
+  return 3;
+}
+
+inline const char* bigBucketName(size_t bucket)
+{
+  switch (bucket) {
+  case 0:  return "64-256K";
+  case 1:  return "256K-1M";
+  case 2:  return "1-4M";
+  default: return "4M+";
+  }
+}
+
+struct Chunk
+{
+  uint64_t offset = 0;
+  uint64_t length = 0;
+};
+
+enum class SplitAction : int
+{
+  Passthrough,  // not worth splitting
+  EndOfFile,    // offset is at/after the end: STATUS_END_OF_FILE, information 0
+  Split
+};
+
+struct SplitPlan
+{
+  SplitAction action = SplitAction::Passthrough;
+  uint64_t total     = 0;  // bytes the request will return (up to EOF)
+  std::vector<Chunk> chunks;
+};
+
+// `minLength`: requests shorter than this are not split. `chunk` must be > 0.
+inline SplitPlan planSplit(uint64_t offset, uint64_t length, uint64_t fileSize,
+                           uint64_t minLength, uint64_t chunk)
+{
+  SplitPlan plan;
+  if (length == 0 || chunk == 0)
+    return plan;
+  if (offset >= fileSize) {
+    plan.action = SplitAction::EndOfFile;
+    return plan;
+  }
+  plan.total = std::min<uint64_t>(length, fileSize - offset);
+  if (length < minLength || plan.total <= chunk)
+    return plan;  // a single chunk gains nothing
+
+  plan.action = SplitAction::Split;
+  for (uint64_t done = 0; done < plan.total; done += chunk) {
+    plan.chunks.push_back({offset + done, std::min<uint64_t>(chunk, plan.total - done)});
+  }
+  return plan;
+}
+
+// per-handle detection of sequential big reads
+struct SeqState
+{
+  bool valid       = false;
+  uint64_t lastEnd = 0;
+  uint32_t run     = 0;  // consecutive reads that continued the previous one
+};
+
+// records a read of [offset, offset+total); returns true if it continued the
+// previous one. Anything else restarts the run.
+inline bool updateSequential(SeqState& s, uint64_t offset, uint64_t total)
+{
+  const bool sequential = s.valid && offset == s.lastEnd;
+  s.run     = sequential ? s.run + 1 : 0;
+  s.lastEnd = offset + total;
+  s.valid   = true;
+  return sequential;
+}
+
+// readahead starts after this many sequential continuations in a row
+constexpr uint32_t kSequentialRunForReadahead = 2;
+
+struct WindowPlan
+{
+  uint64_t start  = 0;
+  uint64_t length = 0;  // 0: no window
+};
+
+constexpr uint64_t kMaxWindow = 4ull << 20;
+
+// next readahead window: 2x the last read, capped at kMaxWindow, the end of the
+// file and what is left of the readahead memory budget
+inline WindowPlan planWindow(uint64_t lastEnd, uint64_t lastReadSize,
+                             uint64_t fileSize, uint64_t budgetLeft)
+{
+  WindowPlan w;
+  if (lastEnd >= fileSize)
+    return w;
+  uint64_t len = std::min<uint64_t>(lastReadSize * 2, kMaxWindow);
+  len          = std::min<uint64_t>(len, fileSize - lastEnd);
+  len          = std::min<uint64_t>(len, budgetLeft);
+  if (len == 0)
+    return w;
+  w.start  = lastEnd;
+  w.length = len;
+  return w;
+}
+
+// true if [offset, offset+total) lies completely inside the window
+inline bool windowCovers(uint64_t winStart, uint64_t winLength, uint64_t offset,
+                         uint64_t total)
+{
+  return total > 0 && offset >= winStart && offset + total <= winStart + winLength;
+}
+
+// a new window is due if there is none, or the current one can't satisfy
+// another read of the size just done
+inline bool needNewWindow(bool hasWindow, uint64_t winStart, uint64_t winLength,
+                          uint64_t lastEnd, uint64_t lastReadSize)
+{
+  if (!hasWindow)
+    return true;
+  return lastEnd < winStart || lastEnd + lastReadSize > winStart + winLength;
+}
+
+// ---------------------------------------------------------------------------
 // LRU budget
 
 struct EvictCandidate

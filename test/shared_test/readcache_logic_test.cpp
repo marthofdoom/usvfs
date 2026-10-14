@@ -297,6 +297,135 @@ TEST(ReadCacheAdmission, SizeBuckets)
   EXPECT_LT(sizeBucket(UINT64_MAX), kSizeBuckets);
 }
 
+// ---- layer 3 ---------------------------------------------------------------
+
+TEST(ReadCacheSplit, Capability)
+{
+  auto a = goodAttrs();
+  EXPECT_TRUE(splitCapable(a));
+  a.deviceType = kDeviceTypeDiskFileSystem;
+  EXPECT_TRUE(splitCapable(a));
+  a.deviceType = 0x14;
+  EXPECT_FALSE(splitCapable(a));
+  a = goodAttrs(); a.directory = true;
+  EXPECT_FALSE(splitCapable(a));
+  a = goodAttrs(); a.mode = 0;
+  EXPECT_FALSE(splitCapable(a));
+  a = goodAttrs(); a.mode |= kModeNoIntermediateBuffering;
+  EXPECT_FALSE(splitCapable(a));
+  a = goodAttrs(); a.access |= kAccessWriteData;
+  EXPECT_FALSE(splitCapable(a));
+  a = goodAttrs(); a.access = 0;
+  EXPECT_FALSE(splitCapable(a));
+}
+
+TEST(ReadCacheSplit, PlansEqualChunks)
+{
+  const uint64_t K = 1024;
+  SplitPlan p = planSplit(0, 1024 * K, 10000 * K, 256 * K, 256 * K);
+  ASSERT_EQ(SplitAction::Split, p.action);
+  EXPECT_EQ(1024 * K, p.total);
+  ASSERT_EQ(4u, p.chunks.size());
+  uint64_t sum = 0;
+  for (size_t i = 0; i < p.chunks.size(); ++i) {
+    EXPECT_EQ(i * 256 * K, p.chunks[i].offset);
+    sum += p.chunks[i].length;
+  }
+  EXPECT_EQ(1024 * K, sum);
+}
+
+TEST(ReadCacheSplit, ShortTailChunk)
+{
+  const uint64_t K = 1024;
+  SplitPlan p = planSplit(100, 600 * K, 10000 * K, 256 * K, 256 * K);
+  ASSERT_EQ(SplitAction::Split, p.action);
+  ASSERT_EQ(3u, p.chunks.size());
+  EXPECT_EQ(100u, p.chunks[0].offset);
+  EXPECT_EQ(600 * K - 512 * K, p.chunks[2].length);
+  EXPECT_EQ(100 + 512 * K, p.chunks[2].offset);
+}
+
+TEST(ReadCacheSplit, ClampsToEndOfFile)
+{
+  const uint64_t K = 1024;
+  // 1 MiB requested but only 300 KiB left
+  SplitPlan p = planSplit(1000 * K, 1024 * K, 1300 * K, 256 * K, 256 * K);
+  ASSERT_EQ(SplitAction::Split, p.action);
+  EXPECT_EQ(300 * K, p.total);
+  ASSERT_EQ(2u, p.chunks.size());
+  EXPECT_EQ(256 * K, p.chunks[0].length);
+  EXPECT_EQ(44 * K, p.chunks[1].length);
+}
+
+TEST(ReadCacheSplit, EndOfFileAndNotWorthIt)
+{
+  const uint64_t K = 1024;
+  EXPECT_EQ(SplitAction::EndOfFile, planSplit(1000 * K, 1024 * K, 1000 * K, 256 * K, 256 * K).action);
+  EXPECT_EQ(SplitAction::EndOfFile, planSplit(2000 * K, 1024 * K, 1000 * K, 256 * K, 256 * K).action);
+  // below the minimum length
+  EXPECT_EQ(SplitAction::Passthrough, planSplit(0, 128 * K, 10000 * K, 256 * K, 256 * K).action);
+  // only one chunk worth of data left
+  EXPECT_EQ(SplitAction::Passthrough, planSplit(900 * K, 1024 * K, 1000 * K, 256 * K, 256 * K).action);
+  EXPECT_EQ(SplitAction::Passthrough, planSplit(0, 0, 1000 * K, 256 * K, 256 * K).action);
+}
+
+TEST(ReadCacheSequential, Detection)
+{
+  SeqState s;
+  EXPECT_FALSE(updateSequential(s, 0, 100));     // first read
+  EXPECT_TRUE(updateSequential(s, 100, 100));    // continues
+  EXPECT_EQ(1u, s.run);
+  EXPECT_TRUE(updateSequential(s, 200, 50));
+  EXPECT_EQ(2u, s.run);
+  EXPECT_GE(s.run, kSequentialRunForReadahead);
+  EXPECT_FALSE(updateSequential(s, 1000, 50));   // jump
+  EXPECT_EQ(0u, s.run);
+  EXPECT_TRUE(updateSequential(s, 1050, 10));
+  EXPECT_EQ(1u, s.run);
+}
+
+TEST(ReadCacheReadahead, WindowPlanning)
+{
+  const uint64_t M = 1u << 20;
+  WindowPlan w = planWindow(10 * M, 1 * M, 100 * M, 64 * M);
+  EXPECT_EQ(10 * M, w.start);
+  EXPECT_EQ(2 * M, w.length);
+
+  // capped at 4 MiB
+  EXPECT_EQ(4 * M, planWindow(0, 8 * M, 100 * M, 64 * M).length);
+  // capped by the end of the file
+  EXPECT_EQ(1 * M, planWindow(99 * M, 4 * M, 100 * M, 64 * M).length);
+  EXPECT_EQ(0u, planWindow(100 * M, 1 * M, 100 * M, 64 * M).length);
+  // capped by the memory budget left, none if exhausted
+  EXPECT_EQ(512u * 1024, planWindow(0, 1 * M, 100 * M, 512 * 1024).length);
+  EXPECT_EQ(0u, planWindow(0, 1 * M, 100 * M, 0).length);
+}
+
+TEST(ReadCacheReadahead, CoverageAndRenewal)
+{
+  EXPECT_TRUE(windowCovers(100, 100, 100, 100));
+  EXPECT_TRUE(windowCovers(100, 100, 150, 50));
+  EXPECT_FALSE(windowCovers(100, 100, 150, 51));
+  EXPECT_FALSE(windowCovers(100, 100, 99, 10));
+  EXPECT_FALSE(windowCovers(100, 100, 100, 0));
+
+  EXPECT_TRUE(needNewWindow(false, 0, 0, 0, 10));
+  EXPECT_FALSE(needNewWindow(true, 100, 100, 100, 50));   // room for another read
+  EXPECT_FALSE(needNewWindow(true, 100, 100, 150, 50));
+  EXPECT_TRUE(needNewWindow(true, 100, 100, 151, 50));    // can't satisfy the next one
+  EXPECT_TRUE(needNewWindow(true, 100, 100, 50, 10));     // behind the window
+}
+
+TEST(ReadCacheReadahead, BigBuckets)
+{
+  EXPECT_EQ(0u, bigBucket(64 * 1024));
+  EXPECT_EQ(0u, bigBucket(256 * 1024 - 1));
+  EXPECT_EQ(1u, bigBucket(256 * 1024));
+  EXPECT_EQ(2u, bigBucket(1u << 20));
+  EXPECT_EQ(3u, bigBucket(4u << 20));
+  EXPECT_LT(bigBucket(UINT64_MAX), kBigBuckets);
+}
+
 // ---- configuration ---------------------------------------------------------
 
 TEST(ReadCacheConfig, ParseNumber)
