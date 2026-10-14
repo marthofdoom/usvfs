@@ -59,12 +59,17 @@ std::wstring makeKey(std::wstring_view ntPath);
 
 // attribute cache. Return true if answered from the cache (status is the
 // result to return).
+// generation counter to hand to the store*() calls (read it before asking the
+// system; results from before an invalidation are then dropped)
+uint64_t generation();
+
 bool lookupBasic(const std::wstring& key, PFILE_BASIC_INFORMATION out, NTSTATUS& status);
 bool lookupFull(const std::wstring& key, PFILE_NETWORK_OPEN_INFORMATION out,
                 NTSTATUS& status);
-void storeBasic(const std::wstring& key, NTSTATUS status, const FILE_BASIC_INFORMATION* info);
+void storeBasic(const std::wstring& key, NTSTATUS status,
+                const FILE_BASIC_INFORMATION* info, uint64_t generation);
 void storeFull(const std::wstring& key, NTSTATUS status,
-               const FILE_NETWORK_OPEN_INFORMATION* info);
+               const FILE_NETWORK_OPEN_INFORMATION* info, uint64_t generation);
 
 // replacement for the real NtQueryDirectoryFile (synchronous calls without
 // event/apc, RestartScan FALSE) used by usvfs's directory merging. `dirPath` is

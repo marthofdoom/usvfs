@@ -159,6 +159,7 @@ struct Cursor
   size_t next = 0;
   uint64_t calls = 0;
   std::shared_ptr<Listing> building;  // record
+  uint64_t generation = 0;            // store generation when the recording began
   bool buildOk = true;
 };
 
@@ -297,6 +298,8 @@ struct State
   std::atomic<uint64_t> prewarmLockWaits{0};
   std::atomic<int> prewarmLimit{4};            // concurrently working pre-warm jobs
   std::atomic<int> prewarmRunning{0};
+  std::mutex gateMutex;
+  std::condition_variable gateCv;
   std::atomic<uint64_t> prewarmStart{0};
   std::atomic<bool> prewarmDone{false};
   std::atomic<bool> prewarmCapped{false};
@@ -657,9 +660,11 @@ void finishPrewarmJob()
 void prewarmDirectory(const std::string& vpath, const std::string& link)
 {
   // at most prewarmLimit jobs work at the same time
-  while (g->prewarmRunning.fetch_add(1) >= g->prewarmLimit.load() && !g->pool.stopping()) {
-    g->prewarmRunning.fetch_sub(1);
-    Sleep(1);
+  {
+    std::unique_lock<std::mutex> lock(g->gateMutex);
+    while (g->prewarmRunning.load() >= g->prewarmLimit.load() && !g->pool.stopping())
+      g->gateCv.wait_for(lock, chr::milliseconds(100));
+    g->prewarmRunning.fetch_add(1);
   }
 
   if (!g->pool.stopping() && !g->prewarmCapped.load()) {
@@ -695,7 +700,11 @@ void prewarmDirectory(const std::string& vpath, const std::string& link)
       }
     }
   }
-  g->prewarmRunning.fetch_sub(1);
+  {
+    std::lock_guard<std::mutex> lock(g->gateMutex);
+    g->prewarmRunning.fetch_sub(1);
+  }
+  g->gateCv.notify_one();
   finishPrewarmJob();
 }
 
@@ -893,7 +902,13 @@ bool lookupFull(const std::wstring& key, PFILE_NETWORK_OPEN_INFORMATION out, NTS
   return true;
 }
 
-void storeBasic(const std::wstring& key, NTSTATUS status, const FILE_BASIC_INFORMATION* info)
+uint64_t generation()
+{
+  return g ? g->store.generation() : 0;
+}
+
+void storeBasic(const std::wstring& key, NTSTATUS status,
+                const FILE_BASIC_INFORMATION* info, uint64_t gen)
 {
   if (!g || !cacheableStatus(status))
     return;
@@ -902,11 +917,11 @@ void storeBasic(const std::wstring& key, NTSTATUS status, const FILE_BASIC_INFOR
   if (status == STATUS_SUCCESS &&
       (!info || !readcache::guardedCopy(&copy, info, sizeof(copy))))
     return;
-  g->store.putAttr(key, toAttr(status, &copy));
+  g->store.putAttr(key, toAttr(status, &copy), gen);
 }
 
 void storeFull(const std::wstring& key, NTSTATUS status,
-               const FILE_NETWORK_OPEN_INFORMATION* info)
+               const FILE_NETWORK_OPEN_INFORMATION* info, uint64_t gen)
 {
   if (!g || !cacheableStatus(status))
     return;
@@ -915,7 +930,7 @@ void storeFull(const std::wstring& key, NTSTATUS status,
   if (status == STATUS_SUCCESS &&
       (!info || !readcache::guardedCopy(&copy, info, sizeof(copy))))
     return;
-  g->store.putAttr(key, toAttr(status, &copy));
+  g->store.putAttr(key, toAttr(status, &copy), gen);
 }
 
 NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK iosb,
@@ -962,8 +977,9 @@ NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK 
         c->listing = std::move(l);
         g->dirReplayed.fetch_add(1, std::memory_order_relaxed);
       } else {
-        c->mode     = Cursor::kRecord;
-        c->building = std::make_shared<Listing>();
+        c->mode       = Cursor::kRecord;
+        c->building   = std::make_shared<Listing>();
+        c->generation = g->store.generation();
       }
     }
 
@@ -988,7 +1004,8 @@ NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK 
                         *c->building))
         c->mode = Cursor::kReal;
     } else if (res == STATUS_NO_MORE_FILES || res == STATUS_NO_SUCH_FILE) {
-      g->store.putListing(c->dir, static_cast<int>(cls), c->mask, c->building);
+      g->store.putListing(c->dir, static_cast<int>(cls), c->mask, c->building, false,
+                          c->generation);
       g->dirRecorded.fetch_add(1, std::memory_order_relaxed);
       c->building.reset();
       c->mode = Cursor::kReal;
@@ -1022,9 +1039,14 @@ void noteWrite(std::wstring_view ntPath)
 {
   if (!g || !enabled())
     return;
+  while (ntPath.size() > 1 && (ntPath.back() == L'\\' || ntPath.back() == L'/'))
+    ntPath.remove_suffix(1);
   const std::wstring key = makeKey(ntPath);
-  if (!key.empty())
+  if (key.empty()) {
+    g->store.clear();  // can't tell what this is: forget everything
+  } else {
     g->store.invalidatePath(key);
+  }
 }
 
 bool isMutatingClass(FILE_INFORMATION_CLASS cls)
@@ -1124,7 +1146,9 @@ void noteDosPath(const wchar_t* dosPath, bool tree)
   if (!g || !enabled() || !dosPath || !*dosPath)
     return;
   std::wstring nt;
-  const std::wstring_view p(dosPath);
+  std::wstring_view p(dosPath);
+  while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/'))
+    p.remove_suffix(1);
   if (p.size() >= 4 && p.compare(0, 4, LR"(\\?\)") == 0) {
     nt = std::wstring(p);
     nt[1] = L'?';

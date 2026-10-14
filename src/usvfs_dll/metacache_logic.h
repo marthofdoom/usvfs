@@ -220,10 +220,22 @@ struct StoreStats
   uint64_t invalidations = 0, evictions = 0;
 };
 
+// passed to put*() to skip the generation check
+constexpr uint64_t kAnyGeneration = UINT64_MAX;
+
 class Store
 {
 public:
   explicit Store(uint64_t capBytes) : m_cap(capBytes) {}
+
+  // Bumped by every invalidation. A query reads it before asking the system
+  // and hands it to put*(): a result obtained before an invalidation that
+  // happened meanwhile is dropped instead of re-storing stale data.
+  uint64_t generation() const
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_generation;
+  }
 
   // ---- attributes (keys are normalized paths) ----
 
@@ -266,10 +278,11 @@ public:
     return m_attrs.find(path) != m_attrs.end();
   }
 
-  void putAttr(const std::wstring& path, const Attr& attr)
+  void putAttr(const std::wstring& path, const Attr& attr,
+               uint64_t generation = kAnyGeneration)
   {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (isBlocked(path))
+    if (isBlocked(path) || (generation != kAnyGeneration && generation != m_generation))
       return;
     auto it = m_attrs.find(path);
     if (it != m_attrs.end()) {
@@ -306,10 +319,12 @@ public:
   }
 
   void putListing(const std::wstring& dir, int cls, const std::wstring& mask,
-                  std::shared_ptr<const Listing> listing, bool derived = false)
+                  std::shared_ptr<const Listing> listing, bool derived = false,
+                  uint64_t generation = kAnyGeneration)
   {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (isBlocked(dir) || m_volatileDirs.count(dir))
+    if (isBlocked(dir) || m_volatileDirs.count(dir) ||
+        (generation != kAnyGeneration && generation != m_generation))
       return;
     std::vector<ListSlot>& slots = m_dirs[dir];
     for (ListSlot& slot : slots) {
@@ -337,6 +352,7 @@ public:
   {
     std::lock_guard<std::mutex> lock(m_mutex);
     ++m_stats.invalidations;
+    ++m_generation;
     markVolatile(path);
   }
 
@@ -346,6 +362,7 @@ public:
   {
     std::lock_guard<std::mutex> lock(m_mutex);
     ++m_stats.invalidations;
+    ++m_generation;
     markVolatile(path);
 
     if (m_attrs.size() + m_dirs.size() > kTreeScanLimit) {
@@ -576,6 +593,7 @@ private:
 
   void clearLocked()
   {
+    ++m_generation;
     m_attrs.clear();
     m_dirs.clear();
     m_lru.clear();
@@ -592,6 +610,7 @@ private:
   std::unordered_set<std::wstring> m_volatileDirs;
   std::vector<std::wstring> m_noCache;
   bool m_overflowed = false;
+  uint64_t m_generation = 0;
   StoreStats m_stats;
 };
 

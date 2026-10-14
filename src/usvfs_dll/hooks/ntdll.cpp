@@ -1459,12 +1459,14 @@ NTSTATUS WINAPI usvfs::hook_NtQueryAttributesFile(
       return res;
   }
 
+  const uint64_t cacheGen = cacheKey.empty() ? 0 : usvfs::metacache::generation();
+
   PRE_REALCALL
   res = ::NtQueryAttributesFile(adjustedAttributes.get(), FileInformation);
   POST_REALCALL
 
   if (!cacheKey.empty() && FileInformation)
-    usvfs::metacache::storeBasic(cacheKey, res, FileInformation);
+    usvfs::metacache::storeBasic(cacheKey, res, FileInformation, cacheGen);
 
   if (redir.redirected) {
     LOG_CALL()
@@ -1514,12 +1516,14 @@ NTSTATUS WINAPI usvfs::hook_NtQueryFullAttributesFile(
       return res;
   }
 
+  const uint64_t cacheGen = cacheKey.empty() ? 0 : usvfs::metacache::generation();
+
   PRE_REALCALL
   res = ::NtQueryFullAttributesFile(adjustedAttributes.get(), FileInformation);
   POST_REALCALL
 
   if (!cacheKey.empty() && FileInformation)
-    usvfs::metacache::storeFull(cacheKey, res, FileInformation);
+    usvfs::metacache::storeFull(cacheKey, res, FileInformation, cacheGen);
 
   if (redir.redirected) {
     LOG_CALL()
@@ -1535,7 +1539,7 @@ NTSTATUS WINAPI usvfs::hook_NtQueryFullAttributesFile(
 
 void usvfs::forgetWorkerHandle(HANDLE handle)
 {
-  // not readcache::onClose: this runs while that holds its handle map lock
+  // worker handles have no read cache state, only the hooks' own bookkeeping
   ntdllHandleTracker.erase(handle);
   usvfs::metacache::onClose(handle);
 }

@@ -300,3 +300,22 @@ TEST(MetaCachePath, NonAsciiFoldingUsesTheHookWhenSet)
   EXPECT_EQ(normalizePath(L"\xE9"), normalizePath(L"\xC9"));
   g_upcaseHook = nullptr;
 }
+
+TEST(MetaCacheStore, StaleResultFromBeforeAnInvalidationIsDropped)
+{
+  Store s(1 << 20);
+  const uint64_t gen = s.generation();
+  s.invalidatePath(L"\\D\\OTHER");  // happens while a query is in flight
+  s.putAttr(L"\\D\\F", existing(), gen);
+  Attr out;
+  EXPECT_FALSE(s.lookupAttr(L"\\D\\F", true, out));
+
+  s.putAttr(L"\\D\\F", existing(), s.generation());
+  EXPECT_TRUE(s.lookupAttr(L"\\D\\F", true, out));
+
+  const uint64_t gen2 = s.generation();
+  s.clear();
+  auto l = std::make_shared<Listing>();
+  s.putListing(L"\\X", 37, L"*", l, false, gen2);
+  EXPECT_EQ(nullptr, s.lookupListing(L"\\X", 37, L"*"));
+}

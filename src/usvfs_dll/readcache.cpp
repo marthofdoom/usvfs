@@ -439,6 +439,7 @@ struct State
   std::atomic<bool> stop{false};
   std::atomic<uint64_t> lastLogTick{0};
   std::atomic<uint64_t> lastLogActivity{0};
+  std::atomic<uint64_t> lastSweepTick{0};
 };
 
 // intentionally leaked: detached workers may outlive the static destructors
@@ -478,6 +479,7 @@ struct RaWindow
   std::atomic<int> state{0};  // 0 loading, 1 done, 2 failed/cancelled
   std::atomic<bool> cancel{false};
   std::atomic<bool> started{false};  // a worker has picked the window up
+  std::atomic<uint64_t> lastUse{0};  // tick of creation / last read served from it
   std::mutex m;
   std::condition_variable cv;
 
@@ -601,8 +603,19 @@ void logSummary(const char* prefix)
       ld(b.raWaits), ld(b.raWaitUs), ld(b.fallbacks));
 }
 
+void sweepIdleWindows();
+
 void maybeLog()
 {
+  {
+    // readahead windows of handles that went quiet give their memory back
+    const uint64_t t = GetTickCount64();
+    uint64_t lastSweep = g->lastSweepTick.load(std::memory_order_relaxed);
+    if (t - lastSweep >= 10000 &&
+        g->lastSweepTick.compare_exchange_strong(lastSweep, t))
+      sweepIdleWindows();
+  }
+
   const uint64_t now  = GetTickCount64();
   uint64_t last       = g->lastLogTick.load(std::memory_order_relaxed);
   if (now - last < kLogIntervalMs)
@@ -1349,6 +1362,24 @@ void dropWindows(HandleState& hs)
   dropWindow(hs.window2);
 }
 
+// drops readahead windows nobody has read from for a while
+void sweepIdleWindows()
+{
+  constexpr uint64_t kIdleMs = 10000;
+  const uint64_t now = GetTickCount64();
+  std::shared_lock<std::shared_mutex> lock(g->handlesLock);
+  for (auto& kv : g->handles) {
+    HandleState& hs = *kv.second;
+    std::unique_lock<std::mutex> hl(hs.m, std::try_to_lock);
+    if (!hl.owns_lock())
+      continue;
+    for (std::shared_ptr<RaWindow>* w : {&hs.window, &hs.window2}) {
+      if (*w && now - (*w)->lastUse.load(std::memory_order_relaxed) > kIdleMs)
+        dropWindow(*w);
+    }
+  }
+}
+
 void raTask(const std::shared_ptr<RaWindow>& w, const std::shared_ptr<WFile>& wf)
 {
   w->started.store(true, std::memory_order_release);
@@ -1402,6 +1433,7 @@ void issueWindow(HandleState& hs, HANDLE h, uint64_t start, uint64_t lastRead,
     return;
   }
   w->length = wp.length;  // from here the destructor returns the reservation
+  w->lastUse.store(GetTickCount64(), std::memory_order_relaxed);
   w->start  = wp.start;
   w->buf.reset(new uint8_t[static_cast<size_t>(wp.length)]);
 
@@ -1465,6 +1497,7 @@ bool serveFromWindow(HandleState& hs, std::shared_ptr<RaWindow>& slot, HANDLE h,
     return true;
   }
 
+  w->lastUse.store(GetTickCount64(), std::memory_order_relaxed);
   g->stats.big.raServed.fetch_add(1, std::memory_order_relaxed);
   g->stats.big.raServedBytes.fetch_add(total, std::memory_order_relaxed);
   status = STATUS_SUCCESS;
@@ -2217,8 +2250,14 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
     return readImpl(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                     Buffer, Length, ByteOffset, Key);
   } catch (...) {
-    if (!t_ioStarted)
+    if (!t_ioStarted) {
+      // a served handle's real file pointer is stale: re-issuing the request
+      // there would read from the wrong place
+      std::shared_ptr<HandleState> hs = lookup(FileHandle);
+      if (hs && hs->served())
+        return static_cast<NTSTATUS>(0xC000009AL);  // STATUS_INSUFFICIENT_RESOURCES
       throw;
+    }
     return static_cast<NTSTATUS>(0xC0000001L);  // STATUS_UNSUCCESSFUL; unreachable in practice: see bigRead
   }
 }
