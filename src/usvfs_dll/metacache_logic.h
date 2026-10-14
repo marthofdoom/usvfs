@@ -151,7 +151,7 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
     return fail(10);
   if (infoLevel != 0 && infoLevel != 1)
     return fail(11);
-  if (flags != 0 && flags != 2)
+  if ((flags & ~6ul) != 0)  // large fetch / on-disk-only do not change the result
     return fail(12);
   const size_t pos = path.find_last_of(L"\\/");
   std::wstring dir;
@@ -265,6 +265,26 @@ inline bool maskMatches(std::wstring_view pattern, std::wstring_view name)
   while (p < pattern.size() && pattern[p] == L'*')
     ++p;
   return p == pattern.size();
+}
+
+// Key of the "*" listing of the same directory/level/flags as `key` (built by
+// frontEnumKey); empty if `key` is malformed.
+inline std::wstring frontEnumStarKey(const std::wstring& key)
+{
+  const size_t last = key.rfind(L'\x03');
+  if (last == std::wstring::npos || last == 0)
+    return std::wstring();
+  return key.substr(0, last + 1) + L"*";
+}
+
+// A mask whose result can be derived from the "*" listing with maskMatches: no
+// DOS wildcards, no "*.*" (dot semantics differ between implementations), no
+// trailing dot or space (stripped by the system).
+inline bool isDerivableMask(std::wstring_view mask)
+{
+  if (mask.empty() || mask == L"*" || mask == L"*.*" || !isCacheableMask(mask))
+    return false;
+  return mask.back() != L'.' && mask.back() != L' ';
 }
 
 // ---------------------------------------------------------------------------

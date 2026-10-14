@@ -406,6 +406,7 @@ struct EnumState
   std::atomic<uint64_t> keyedWild{0};
   std::atomic<uint64_t> keyedLiteral{0};
   std::atomic<uint64_t> unfinished{0};
+  std::atomic<uint64_t> derived{0};
   static constexpr size_t kMaxEntries = 50000;  // per listing
 };
 
@@ -466,8 +467,9 @@ void logSummary(const char* prefix)
                  "14 bare-mask-no-cwd,15 mask empty/long,16 mask bad char,20+k dir key reject k "
                  "(2 empty,3 UNC/device/rooted,4 drive-rel,5 rel-no-cwd,6 bad segment,7 bad char/wildcard,"
                  "8 trailing sep),30 no data,31 filter,32 searchOp) keyed wildcard={} literal={} "
-                 "searches closed unfinished={}",
-                 prefix, rj, ld(gEnum->keyedWild), ld(gEnum->keyedLiteral), ld(gEnum->unfinished));
+                 "searches closed unfinished={} derived-from-star hits={}",
+                 prefix, rj, ld(gEnum->keyedWild), ld(gEnum->keyedLiteral), ld(gEnum->unfinished),
+                 ld(gEnum->derived));
   }
   logger->info(
       "{}: attr hits={} negativeHits={} misses={} | dir enumerations replayed={} "
@@ -1231,13 +1233,15 @@ bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, D
       logic::frontEnumKey(name, frontCwd(name), infoLevel, flags, &dirKey, &why);
   if (key.empty())
     return reject(why);
+  std::wstring_view maskView;
   {
     const wchar_t* sep = wcsrchr(name, L'\\');
     const wchar_t* sep2 = wcsrchr(name, L'/');
     if (sep2 > sep)
       sep = sep2;
-    const std::wstring_view mask = sep ? std::wstring_view(sep + 1) : std::wstring_view(name);
-    (logic::isLiteralMask(mask) ? e->keyedLiteral : e->keyedWild).fetch_add(1, std::memory_order_relaxed);
+    maskView = sep ? std::wstring_view(sep + 1) : std::wstring_view(name);
+    (logic::isLiteralMask(maskView) ? e->keyedLiteral : e->keyedWild)
+        .fetch_add(1, std::memory_order_relaxed);
   }
   const uint64_t gen = g->store.generation();
   tick();
@@ -1262,6 +1266,45 @@ bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, D
         err              = 0;
         e->hits.fetch_add(1, std::memory_order_relaxed);
         return true;
+      }
+    }
+    // not recorded for this mask: derive it from the "*" listing of the same
+    // directory, level and flags (existence checks, narrower wildcards)
+    if (logic::isDerivableMask(maskView)) {
+      auto st = e->listings.find(logic::frontEnumStarKey(key));
+      if (st != e->listings.end() && st->second.gen == gen) {
+        const std::shared_ptr<const EnumListing>& all = st->second.listing;
+        if (all->failed) {
+          res = INVALID_HANDLE_VALUE;
+          err = all->err;
+          e->hits.fetch_add(1, std::memory_order_relaxed);
+          e->derived.fetch_add(1, std::memory_order_relaxed);
+          return true;
+        }
+        auto l = std::make_shared<EnumListing>();
+        for (const WIN32_FIND_DATAW& fd : all->entries) {
+          if (logic::maskMatches(maskView, fd.cFileName) ||
+              (fd.cAlternateFileName[0] != 0 && logic::maskMatches(maskView, fd.cAlternateFileName)))
+            l->entries.push_back(fd);
+        }
+        if (l->entries.empty()) {
+          res = INVALID_HANDLE_VALUE;
+          err = ERROR_FILE_NOT_FOUND;
+          e->hits.fetch_add(1, std::memory_order_relaxed);
+          e->derived.fetch_add(1, std::memory_order_relaxed);
+          return true;
+        }
+        if (readcache::guardedCopy(data, &l->entries[0], sizeof(WIN32_FIND_DATAW))) {
+          auto s    = std::make_shared<EnumSearch>();
+          s->replay = l;
+          s->next   = 1;
+          res       = s.get();
+          e->searches[res] = std::move(s);
+          err              = 0;
+          e->hits.fetch_add(1, std::memory_order_relaxed);
+          e->derived.fetch_add(1, std::memory_order_relaxed);
+          return true;
+        }
       }
     }
   }
