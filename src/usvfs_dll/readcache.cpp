@@ -190,6 +190,16 @@ struct CacheEntry
   std::wstring ntPath;  // layer 2: name used by the worker to reopen the file
 };
 
+// what the system told us about a file at classification; valid for the whole
+// life of an eligible handle (read-only, and the cache key holds size and times)
+struct FileSnapshot
+{
+  int64_t fileId = 0, creation = 0, lastAccess = 0, written = 0, changed = 0;
+  int64_t allocation = 0, endOfFile = 0;
+  ULONG attributes = 0, reparseTag = 0, links = 1;
+  ACCESS_MASK effectiveAccess = 0;
+};
+
 struct WFile;
 struct RaWindow;
 
@@ -206,6 +216,7 @@ struct HandleState
   std::mutex m;
   std::atomic<int> mode{kHandleNone};
   uint64_t shadowPos = 0;  // guarded by m
+  FileSnapshot snap;       // set during classification, immutable afterwards
   FileSnapshot snap;       // set during classification, immutable afterwards
   std::shared_ptr<CacheEntry> entry;
 
@@ -232,16 +243,6 @@ struct BucketStats
   std::atomic<uint64_t> served{0};
   std::atomic<uint64_t> bytesServed{0};
   std::atomic<uint64_t> probationEnd{0};  // handles closed/left on probation
-};
-
-// what the system told us about a file at classification; valid for the whole
-// life of an eligible handle (read-only, and the cache key holds size and times)
-struct FileSnapshot
-{
-  int64_t fileId = 0, creation = 0, lastAccess = 0, written = 0, changed = 0;
-  int64_t allocation = 0, endOfFile = 0;
-  ULONG attributes = 0, reparseTag = 0, links = 1;
-  ACCESS_MASK effectiveAccess = 0;
 };
 
 struct BigStats
