@@ -30,10 +30,6 @@ DLLEXPORT NTSTATUS WINAPI hook_NtQueryObject(
     HANDLE Handle, OBJECT_INFORMATION_CLASS ObjectInformationClass,
     PVOID ObjectInformation, ULONG ObjectInformationLength, PULONG ReturnLength);
 
-DLLEXPORT NTSTATUS WINAPI hook_NtQueryInformationFile(
-    HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
-    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass);
-
 DLLEXPORT NTSTATUS WINAPI hook_NtQueryInformationByName(
     POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, FILE_INFORMATION_CLASS FileInformationClass);

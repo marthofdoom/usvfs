@@ -1052,9 +1052,13 @@ DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryObject(
   return res;
 }
 
-DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryInformationFile(
+// 0.5.7.2 upstream hook body (name rewriting for FileNameInformation,
+// FileNormalizedNameInformation and FileAllInformation). Fork: called by
+// impl_NtQueryInformationFile; viaReadcache routes the real call through the
+// read cache (shadow position of FileAllInformation) instead of ntdll directly.
+static NTSTATUS queryInformationFileRewrite(
     HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
-    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
+    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass, bool viaReadcache)
 {
   NTSTATUS res = STATUS_SUCCESS;
 
@@ -1065,8 +1069,12 @@ DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryInformationFile(
   }
 
   PRE_REALCALL
-  res = ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
-                                 FileInformationClass);
+  res = viaReadcache
+            ? usvfs::readcache::queryInformation(FileHandle, IoStatusBlock,
+                                                 FileInformation, Length,
+                                                 FileInformationClass)
+            : ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                       Length, FileInformationClass);
   POST_REALCALL
 
   // we handle both SUCCESS and BUFFER_OVERFLOW since the fixed name might be
@@ -1749,25 +1757,34 @@ NTSTATUS WINAPI usvfs::impl_NtQueryInformationFile(
   ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
   usvfs::metacache::noteHook(usvfs::metacache::Hook::NtQueryInformationFile);
-  if (!usvfs::readcache::enabled()) {
-    return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
-                                    Length, FileInformationClass);
-  }
+  const bool cacheOn = usvfs::readcache::enabled();
 
   // eligible handles: basic/standard/stat/... come from the snapshot taken at
   // classification, which saves the system an fstat+xattr per call
-  {
+  if (cacheOn) {
     NTSTATUS served = STATUS_SUCCESS;
     if (usvfs::readcache::tryServeInfo(FileHandle, IoStatusBlock, FileInformation,
                                        Length, FileInformationClass, served))
       return served;
   }
 
-  // otherwise only the position is of interest
-  if (FileInformationClass != FilePositionInformation &&
-      FileInformationClass != FileAllInformation) {
+  // names are rewritten for redirected files (upstream), the position of
+  // FilePosition/FileAll queries comes from the read cache; everything else
+  // goes straight to the real function
+  const bool nameQuery = FileInformationClass == FileNameInformation ||
+                         FileInformationClass == FileNormalizedNameInformation ||
+                         FileInformationClass == FileAllInformation;
+  const bool positionQuery = cacheOn && (FileInformationClass == FilePositionInformation ||
+                                         FileInformationClass == FileAllInformation);
+
+  if (!nameQuery && !positionQuery) {
     return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
                                     Length, FileInformationClass);
+  }
+
+  if (nameQuery) {
+    return queryInformationFileRewrite(FileHandle, IoStatusBlock, FileInformation,
+                                       Length, FileInformationClass, positionQuery);
   }
 
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;

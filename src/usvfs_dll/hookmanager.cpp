@@ -330,7 +330,6 @@ void HookManager::initHooks()
   installHook(ntdllMod, nullptr, "NtCreateFile", hook_NtCreateFile);
   installHook(ntdllMod, nullptr, "NtClose", hook_NtClose);
   installHook(ntdllMod, nullptr, "NtReadFile", hook_NtReadFile);
-  installHook(ntdllMod, nullptr, "NtQueryInformationFile", hook_NtQueryInformationFile);
   installHook(ntdllMod, nullptr, "NtSetInformationFile", hook_NtSetInformationFile);
   installHook(ntdllMod, nullptr, "NtTerminateProcess", hook_NtTerminateProcess);
 
