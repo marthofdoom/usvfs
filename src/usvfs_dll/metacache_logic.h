@@ -687,7 +687,13 @@ public:
       return;
     }
     for (auto it = m_attrs.begin(); it != m_attrs.end();) {
-      if (isUnderPrefix(attrPath(it->first), path)) {
+      // compare the interned directory first: no string is built for entries that
+      // are clearly outside (or inside) the tree
+      const std::wstring& entryDir = *m_dirNames[it->first.dir];
+      const bool under = entryDir.size() >= path.size()
+                             ? isUnderPrefix(entryDir, path)
+                             : isUnderPrefix(attrPath(it->first), path);
+      if (under) {
         m_bytes -= std::min(m_bytes, it->second.lru->bytes);
         m_lru.erase(it->second.lru);
         it = m_attrs.erase(it);

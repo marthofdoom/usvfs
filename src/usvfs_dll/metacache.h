@@ -49,6 +49,31 @@ namespace usvfs::metacache
 
 extern std::atomic<bool> g_enabled;
 
+// hooks of the per-hook profile printed in the summary line (calls, µs spent inside
+// metacache code)
+enum class Hook : int
+{
+  NtCreateFile,
+  NtOpenFile,
+  NtClose,
+  NtReadFile,
+  NtQueryInformationFile,
+  NtSetInformationFile,
+  NtQueryDirectoryFile,
+  NtQueryAttributesFile,
+  NtQueryFullAttributesFile,
+  GetFileAttributesW,
+  GetFileAttributesExW,
+  FindFirstFileExW,
+  FindNextFileW,
+  FindClose,
+  Kernel32Misc,
+  Count
+};
+
+// counts a call of a hook that otherwise does no metacache work (profile only)
+void noteHook(Hook h);
+
 inline bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
 
 void init();
@@ -177,7 +202,7 @@ void noteMappingChange();
 
 // invalidation
 bool isWriteIntent(ACCESS_MASK desiredAccess, ULONG createDisposition);
-void noteWrite(std::wstring_view ntPath);
+void noteWrite(std::wstring_view ntPath, Hook hook = Hook::NtCreateFile);
 
 // like noteWrite, for a Win32 path as seen by the kernel32 hooks. `tree`: the
 // path may be a directory whose content goes along (remove, rename). Relative

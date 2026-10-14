@@ -347,6 +347,102 @@ struct State
 // intentionally leaked (detached threads may outlive static destruction)
 State* g = nullptr;
 
+// ---- profiling: time spent inside metacache code per hook (QPC) ----
+
+struct ProfSlot
+{
+  alignas(64) std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> us{0};
+  std::atomic<uint64_t> maxUs{0};
+  void add(uint64_t d)
+  {
+    us.fetch_add(d, std::memory_order_relaxed);
+    uint64_t m = maxUs.load(std::memory_order_relaxed);
+    while (d > m && !maxUs.compare_exchange_weak(m, d, std::memory_order_relaxed)) {
+    }
+  }
+};
+
+struct Prof
+{
+  ProfSlot hook[static_cast<int>(Hook::Count)];
+  ProfSlot invTree, clr, invPath;  // store invalidations (calls, us, max us)
+  ProfSlot noteWrites;             // noteWrite() bodies
+  std::atomic<uint64_t> noteWriteClasses[3]{};  // classifyWriteName 0 ignore / 1 file / 2 relative(clear)
+  std::atomic<uint64_t> recAbandoned{0};  // recordings that never published (closed early, class change, error)
+};
+Prof gProf;
+
+const char* const kHookNames[] = {"NtCreateFile", "NtOpenFile", "NtClose", "NtReadFile",
+                                  "NtQueryInformationFile", "NtSetInformationFile",
+                                  "NtQueryDirectoryFile", "NtQueryAttributesFile",
+                                  "NtQueryFullAttributesFile", "GetFileAttributesW",
+                                  "GetFileAttributesExW", "FindFirstFileExW", "FindNextFileW",
+                                  "FindClose", "kernel32Misc"};
+static_assert(sizeof(kHookNames) / sizeof(kHookNames[0]) == static_cast<size_t>(Hook::Count),
+              "hook names");
+
+// counts one call of `h` (when `count`) and adds the time between construction and
+// destruction (minus pause()d intervals) to the hook's total
+class ProfScope
+{
+public:
+  explicit ProfScope(Hook h, bool count = true)
+  {
+    if (!enabled())
+      return;
+    m_slot = &gProf.hook[static_cast<int>(h)];
+    if (count)
+      m_slot->calls.fetch_add(1, std::memory_order_relaxed);
+    m_t0 = nowUs();
+  }
+  ~ProfScope()
+  {
+    if (m_slot)
+      m_slot->add(nowUs() - m_t0 - m_excl);
+  }
+  void pause()
+  {
+    if (m_slot)
+      m_pauseAt = nowUs();
+  }
+  void resume()
+  {
+    if (m_slot)
+      m_excl += nowUs() - m_pauseAt;
+  }
+  ProfScope(const ProfScope&) = delete;
+  ProfScope& operator=(const ProfScope&) = delete;
+
+private:
+  ProfSlot* m_slot = nullptr;
+  uint64_t m_t0 = 0, m_excl = 0, m_pauseAt = 0;
+};
+
+void timedClear()
+{
+  const uint64_t t0 = nowUs();
+  g->store.clear();
+  gProf.clr.calls.fetch_add(1, std::memory_order_relaxed);
+  gProf.clr.add(nowUs() - t0);
+}
+
+void timedTree(const std::wstring& key)
+{
+  const uint64_t t0 = nowUs();
+  g->store.invalidateTree(key);
+  gProf.invTree.calls.fetch_add(1, std::memory_order_relaxed);
+  gProf.invTree.add(nowUs() - t0);
+}
+
+void timedPath(const std::wstring& key)
+{
+  const uint64_t t0 = nowUs();
+  g->store.invalidatePath(key);
+  gProf.invPath.calls.fetch_add(1, std::memory_order_relaxed);
+  gProf.invPath.add(nowUs() - t0);
+}
+
 std::string narrow(const std::wstring& w)
 {
   try {
@@ -588,7 +684,8 @@ uint64_t activity()
          s.attrHits + s.attrMisses + s.attrNegativeHits + s.invalidations +
          g->dirReplayed.load(std::memory_order_relaxed) +
          g->dirRecorded.load(std::memory_order_relaxed) +
-         g->prewarmFiles.load(std::memory_order_relaxed);
+         g->prewarmFiles.load(std::memory_order_relaxed) +
+         gProf.hook[static_cast<int>(Hook::NtReadFile)].calls.load(std::memory_order_relaxed);
 }
 
 void logSummary(const char* prefix)
@@ -643,6 +740,28 @@ void logSummary(const char* prefix)
                  "searches closed unfinished={} derived-from-star hits={}",
                  prefix, rj, ld(gEnum->keyedWild), ld(gEnum->keyedLiteral), ld(gEnum->unfinished),
                  ld(gEnum->derived));
+  }
+  {
+    // time inside metacache code per hook: calls / total ms / avg us / max us
+    std::string hp;
+    for (int i = 0; i < static_cast<int>(Hook::Count); ++i) {
+      const uint64_t c = ld(gProf.hook[i].calls), us = ld(gProf.hook[i].us);
+      if (c == 0 && us == 0)
+        continue;
+      hp += std::format(" {}={}/{}ms/{}us/max{}us", kHookNames[i], c, us / 1000, c ? us / c : 0,
+                        ld(gProf.hook[i].maxUs));
+    }
+    logger->info("{}: prof [hook=calls/total/avg/max inside metacache code]{}", prefix, hp);
+    auto sl = [&](const ProfSlot& p) {
+      return std::format("{}/{}ms/max{}us", ld(p.calls), ld(p.us) / 1000, ld(p.maxUs));
+    };
+    logger->info("{}: prof store: invalidateTree {} clear {} invalidatePath {} | noteWrite {} "
+                 "classes[ignored/file/relative]={}/{}/{} | recordings abandoned (never published)={} "
+                 "published={} | generation={}",
+                 prefix, sl(gProf.invTree), sl(gProf.clr), sl(gProf.invPath), sl(gProf.noteWrites),
+                 ld(gProf.noteWriteClasses[0]), ld(gProf.noteWriteClasses[1]),
+                 ld(gProf.noteWriteClasses[2]), ld(gProf.recAbandoned), ld(g->dirRecorded),
+                 g->store.generation());
   }
   logger->info(
       "{}: attr hits={} negativeHits={} misses={} | dir enumerations replayed={} "
@@ -1618,6 +1737,7 @@ bool frontLookup(bool ex, const wchar_t* name, FrontResult& out, FrontTicket& ti
   FrontState* f = gFront;
   if (!f || !g || !enabled() || !name)
     return false;
+  ProfScope prof(ex ? Hook::GetFileAttributesExW : Hook::GetFileAttributesW);
   std::wstring key = logic::frontKey(name, frontCwd(name));
   if (key.empty())
     return false;
@@ -1657,6 +1777,7 @@ void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
   FrontState* f = gFront;
   if (!f || !g || !enabled() || ticket.key.empty())
     return;
+  ProfScope prof(ex ? Hook::GetFileAttributesExW : Hook::GetFileAttributesW, false);
   g->frontOutcome[result.ok ? 0 : result.err == ERROR_FILE_NOT_FOUND ? 1
                   : result.err == ERROR_PATH_NOT_FOUND ? 2 : 3]
       .fetch_add(1, std::memory_order_relaxed);
@@ -1736,6 +1857,7 @@ bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, D
   EnumState* e = gEnum;
   if (!e || !g || !enabled() || !name)
     return false;
+  ProfScope prof(Hook::FindFirstFileExW);
   auto reject = [&](int why) {
     e->rejects[why & 63].fetch_add(1, std::memory_order_relaxed);
     diag(g->diagEnumRejects, [&](spdlog::logger& l) {
@@ -1849,6 +1971,7 @@ void enumRecordFirst(const EnumTicket& ticket, const wchar_t* canonicalName, int
   EnumState* e = gEnum;
   if (!e || !g || !enabled() || ticket.key.empty() || ticket.dirNt.empty() || !canonicalName)
     return;
+  ProfScope prof(Hook::FindFirstFileExW, false);
   // the key used the cwd at lookup time, the call resolved the name by itself
   if (logic::frontEnumKey(canonicalName, std::wstring_view(), infoLevel, flags) != ticket.key)
     return;
@@ -1881,6 +2004,7 @@ bool enumNext(HANDLE h, WIN32_FIND_DATAW* data, BOOL& result, DWORD& err)
   EnumState* e = gEnum;
   if (!e || !data)
     return false;
+  ProfScope prof(Hook::FindNextFileW);
   std::lock_guard<std::mutex> lock(e->mutex);
   auto it = e->searches.find(h);
   if (it == e->searches.end() || !it->second->replay)
@@ -1908,6 +2032,7 @@ void enumAfterNext(HANDLE h, BOOL result, DWORD err, const WIN32_FIND_DATAW* dat
   EnumState* e = gEnum;
   if (!e)
     return;
+  ProfScope prof(Hook::FindNextFileW, false);
   std::shared_ptr<EnumSearch> done;
   {
     std::lock_guard<std::mutex> lock(e->mutex);
@@ -1940,6 +2065,7 @@ bool enumClose(HANDLE h)
   EnumState* e = gEnum;
   if (!e)
     return false;
+  ProfScope prof(Hook::FindClose);
   std::lock_guard<std::mutex> lock(e->mutex);
   auto it = e->searches.find(h);
   if (it == e->searches.end())
@@ -1949,6 +2075,12 @@ bool enumClose(HANDLE h)
     e->unfinished.fetch_add(1, std::memory_order_relaxed);
   e->searches.erase(it);
   return synthetic;
+}
+
+void noteHook(Hook h)
+{
+  if (g && enabled())
+    gProf.hook[static_cast<int>(h)].calls.fetch_add(1, std::memory_order_relaxed);
 }
 
 void noteMappingChange()
@@ -1961,6 +2093,7 @@ bool lookupBasic(const std::wstring& key, PFILE_BASIC_INFORMATION out, NTSTATUS&
 {
   if (!g || !out)
     return false;
+  ProfScope prof(Hook::NtQueryAttributesFile);
   tick();
   logic::Attr a;
   if (!g->store.lookupAttr(key, false, a)) {
@@ -1987,6 +2120,7 @@ bool lookupFull(const std::wstring& key, PFILE_NETWORK_OPEN_INFORMATION out, NTS
 {
   if (!g || !out)
     return false;
+  ProfScope prof(Hook::NtQueryFullAttributesFile);
   tick();
   logic::Attr a;
   if (!g->store.lookupAttr(key, true, a)) {
@@ -2111,6 +2245,7 @@ bool frontNegative(const FrontTicket& ticket, FrontResult& out)
 {
   if (!negativeEnabled() || ticket.key.size() < 4)
     return false;
+  ProfScope prof(Hook::GetFileAttributesW, false);
   const int v = negativeCore(std::wstring_view(ticket.key).substr(0, ticket.key.size() - 1));
   if (v == 0)
     return false;
@@ -2124,6 +2259,7 @@ NTSTATUS negativeNt(std::wstring_view virtualNtPath)
 {
   if (!negativeEnabled())
     return STATUS_SUCCESS;
+  ProfScope prof(Hook::NtQueryAttributesFile, false);
   const int v = negativeCore(virtualNtPath);
   if (v == 0)
     return STATUS_SUCCESS;
@@ -2148,6 +2284,7 @@ void storeBasic(const std::wstring& key, NTSTATUS status,
 {
   if (!g)
     return;
+  ProfScope prof(Hook::NtQueryAttributesFile, false);
   noteNtOutcome(0, status);
   if (!cacheableStatus(status))
     return;
@@ -2164,6 +2301,7 @@ void storeFull(const std::wstring& key, NTSTATUS status,
 {
   if (!g)
     return;
+  ProfScope prof(Hook::NtQueryFullAttributesFile, false);
   noteNtOutcome(1, status);
   if (!cacheableStatus(status))
     return;
@@ -2217,6 +2355,7 @@ NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK 
       iosb == nullptr || buffer == nullptr || !classSupported(cls))
     return realQuery(h, iosb, buffer, length, cls, single, mask);
 
+  ProfScope prof(Hook::NtQueryDirectoryFile);
   std::shared_ptr<Cursor> c = findCursor(h);
   if (!c) {
     c = std::make_shared<Cursor>();
@@ -2274,17 +2413,22 @@ NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK 
   if (c->mode == Cursor::kReplay && c->cls == cls)
     return replay(*c, iosb, buffer, length, single);
 
+  prof.pause();  // the real call is not metacache time
   const NTSTATUS res = realQuery(h, iosb, buffer, length, cls, single, mask);
+  prof.resume();
   ++c->calls;
 
   if (c->mode == Cursor::kRecord) {
     if (cls != c->cls) {
       c->mode = Cursor::kReal;  // information class changed mid-enumeration
+      gProf.recAbandoned.fetch_add(1, std::memory_order_relaxed);
       g->dirRealOnly.fetch_add(1, std::memory_order_relaxed);
     } else if (res == STATUS_SUCCESS) {
       if (!parseRecords(static_cast<const unsigned char*>(buffer), iosb->Information, cls,
-                        *c->building))
+                        *c->building)) {
         c->mode = Cursor::kReal;
+        gProf.recAbandoned.fetch_add(1, std::memory_order_relaxed);
+      }
     } else if (res == STATUS_NO_MORE_FILES || res == STATUS_NO_SUCH_FILE) {
       g->store.putListing(c->dir, static_cast<int>(cls), c->mask, c->building, false,
                           c->generation);
@@ -2293,6 +2437,7 @@ NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK 
       c->mode = Cursor::kReal;
     } else {
       c->mode = Cursor::kReal;  // error or overflow: don't trust the record
+      gProf.recAbandoned.fetch_add(1, std::memory_order_relaxed);
     }
     if (c->mode == Cursor::kReal)
       c->building.reset();
@@ -2304,9 +2449,16 @@ void onClose(HANDLE handle)
 {
   if (!g || !enabled())
     return;
+  ProfScope prof(Hook::NtClose);
   std::lock_guard<std::mutex> lock(g->cursorsLock);
-  if (!g->cursors.empty())
-    g->cursors.erase(handle);
+  if (!g->cursors.empty()) {
+    auto it = g->cursors.find(handle);
+    if (it != g->cursors.end()) {
+      if (it->second->mode == Cursor::kRecord)
+        gProf.recAbandoned.fetch_add(1, std::memory_order_relaxed);  // closed before the end
+      g->cursors.erase(it);
+    }
+  }
 }
 
 bool isWriteIntent(ACCESS_MASK access, ULONG disposition)
@@ -2350,18 +2502,28 @@ static int classifyWriteName(std::wstring_view p)
   return 0;  // \??\ConDrv, hid#..., Volume{...}, etc.
 }
 
-void noteWrite(std::wstring_view ntPath)
+void noteWrite(std::wstring_view ntPath, Hook hook)
 {
   if (!g || !enabled())
     return;
+  ProfScope prof(hook, false);
+  const uint64_t pt0 = nowUs();
   while (ntPath.size() > 1 && (ntPath.back() == L'\\' || ntPath.back() == L'/'))
     ntPath.remove_suffix(1);
 
-  switch (classifyWriteName(ntPath)) {
+  const int writeClass = classifyWriteName(ntPath);
+  gProf.noteWriteClasses[writeClass].fetch_add(1, std::memory_order_relaxed);
+  gProf.noteWrites.calls.fetch_add(1, std::memory_order_relaxed);
+  struct NoteTimer
+  {
+    uint64_t t0;
+    ~NoteTimer() { gProf.noteWrites.add(nowUs() - t0); }
+  } noteTimer{pt0};
+  switch (writeClass) {
   case 0:
     return;
   case 2:
-    g->store.clear();  // an unresolved relative name: can't tell what it touches
+    timedClear();  // an unresolved relative name: can't tell what it touches
     return;
   default:
     break;
@@ -2372,9 +2534,9 @@ void noteWrite(std::wstring_view ntPath)
     full = LR"(\??\)" + full;  // plain drive path
   const std::wstring key = makeKey(full);
   if (key.empty()) {
-    g->store.clear();
+    timedClear();
   } else {
-    g->store.invalidatePath(key);
+    timedPath(key);
   }
 }
 
@@ -2416,6 +2578,7 @@ void noteSetInformation(std::wstring_view handlePath, std::wstring_view rootPath
 {
   if (!g || !enabled())
     return;
+  ProfScope prof(Hook::NtSetInformationFile);
 
   const int c = static_cast<int>(cls);
   const bool structural = c == 10 || c == 11 || c == 13 || c == 64 || c == 65 || c == 72;
@@ -2425,22 +2588,22 @@ void noteSetInformation(std::wstring_view handlePath, std::wstring_view rootPath
   const std::wstring key = makeKey(handlePath);
   if (key.empty()) {
     // we don't know what this handle is: forget everything
-    g->store.clear();
+    timedClear();
   } else if (structural) {
-    g->store.invalidateTree(key);
+    timedTree(key);
   } else {
-    g->store.invalidatePath(key);
+    timedPath(key);
   }
 
   if ((c == 10 || c == 11 || c == 65 || c == 72)) {
     // rename / link: the target appears
     if (!info || length < offsetof(RenameInfo, FileName)) {
-      g->store.clear();
+      timedClear();
       return;
     }
     RenameInfo hdr;
     if (!readcache::guardedCopy(&hdr, info, offsetof(RenameInfo, FileName))) {
-      g->store.clear();
+      timedClear();
       return;
     }
     const size_t bytes = std::min<size_t>(hdr.FileNameLength, length - offsetof(RenameInfo, FileName));
@@ -2448,13 +2611,13 @@ void noteSetInformation(std::wstring_view handlePath, std::wstring_view rootPath
     if (!readcache::guardedCopy(name.data(),
                                 static_cast<const char*>(info) + offsetof(RenameInfo, FileName),
                                 bytes)) {
-      g->store.clear();
+      timedClear();
       return;
     }
     std::wstring full;
     if (hdr.RootDirectory) {
       if (rootPath.empty()) {
-        g->store.clear();  // relative to a handle we know nothing about
+        timedClear();  // relative to a handle we know nothing about
         return;
       }
       full = std::wstring(rootPath) + L"\\" + name;
@@ -2463,9 +2626,9 @@ void noteSetInformation(std::wstring_view handlePath, std::wstring_view rootPath
     }
     const std::wstring targetKey = makeKey(full);
     if (targetKey.empty()) {
-      g->store.clear();  // a bare relative name or an unusual prefix
+      timedClear();  // a bare relative name or an unusual prefix
     } else {
-      g->store.invalidateTree(targetKey);
+      timedTree(targetKey);
     }
   }
 }
@@ -2474,6 +2637,7 @@ void noteDosPath(const wchar_t* dosPath, bool tree)
 {
   if (!g || !enabled() || !dosPath || !*dosPath)
     return;
+  ProfScope prof(Hook::Kernel32Misc);
   std::wstring nt;
   std::wstring_view p(dosPath);
   while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/'))
@@ -2484,18 +2648,18 @@ void noteDosPath(const wchar_t* dosPath, bool tree)
   } else if (p.size() >= 3 && p[1] == L':' && (p[2] == L'\\' || p[2] == L'/')) {
     nt = LR"(\??\)" + std::wstring(p);
   } else {
-    g->store.clear();  // relative or unusual: can't tell which entries it touches
+    timedClear();  // relative or unusual: can't tell which entries it touches
     return;
   }
   const std::wstring key = makeKey(nt);
   if (key.empty()) {
-    g->store.clear();
+    timedClear();
     return;
   }
   if (tree) {
-    g->store.invalidateTree(key);
+    timedTree(key);
   } else {
-    g->store.invalidatePath(key);
+    timedPath(key);
   }
 }
 

@@ -1218,8 +1218,8 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle,
     if (usvfs::metacache::isWriteIntent(DesiredAccess, FILE_OPEN)) {
       // opened for writing/deleting: forget and never cache the file (both its
       // virtual and its real path) and its directory
-      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(fullName));
-      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(redir.path));
+      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(fullName), usvfs::metacache::Hook::NtOpenFile);
+      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(redir.path), usvfs::metacache::Hook::NtOpenFile);
     }
 
     PRE_REALCALL
@@ -1259,6 +1259,7 @@ NTSTATUS WINAPI usvfs::impl_NtOpenFile(PHANDLE FileHandle,
                                          PIO_STATUS_BLOCK IoStatusBlock,
                                          ULONG ShareAccess, ULONG OpenOptions)
 {
+  usvfs::metacache::noteHook(usvfs::metacache::Hook::NtOpenFile);
   NTSTATUS res = ntdll_mess_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, OpenOptions);
   if (res >= 0 && FileHandle)
     forgetHandleState(*FileHandle);  // backstop against handle value reuse
@@ -1420,6 +1421,7 @@ NTSTATUS WINAPI usvfs::impl_NtCreateFile(
   ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer,
   ULONG EaLength)
 {
+  usvfs::metacache::noteHook(usvfs::metacache::Hook::NtCreateFile);
   NTSTATUS res = ntdll_mess_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
   if (res >= 0 && FileHandle)
     forgetHandleState(*FileHandle);  // backstop against handle value reuse
@@ -1628,6 +1630,7 @@ NTSTATUS WINAPI usvfs::impl_NtReadFile(
   PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
   PLARGE_INTEGER ByteOffset, PULONG Key)
 {
+  usvfs::metacache::noteHook(usvfs::metacache::Hook::NtReadFile);
   // read cache switched off: plain passthrough
   if (!usvfs::readcache::enabled()) {
     return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
@@ -1675,6 +1678,7 @@ NTSTATUS WINAPI usvfs::impl_NtQueryInformationFile(
   HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
   ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
+  usvfs::metacache::noteHook(usvfs::metacache::Hook::NtQueryInformationFile);
   if (!usvfs::readcache::enabled()) {
     return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
                                     Length, FileInformationClass);
@@ -1717,6 +1721,8 @@ NTSTATUS WINAPI usvfs::impl_NtSetInformationFile(
   HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
   ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
+  if (!usvfs::metacache::isMutatingClass(FileInformationClass))
+    usvfs::metacache::noteHook(usvfs::metacache::Hook::NtSetInformationFile);
   if (usvfs::metacache::isMutatingClass(FileInformationClass)) {
     // cached file information of this file is stale from now on
     if (::GetFileType(FileHandle) == FILE_TYPE_DISK)
