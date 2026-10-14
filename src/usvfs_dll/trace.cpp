@@ -1,6 +1,7 @@
 #include "trace.h"
 #include "trace_format.h"
 #include "hookcallcontext.h"
+#include "readcache.h"
 
 #include <algorithm>
 #include <chrono>
@@ -288,10 +289,14 @@ void Scope::begin()
   if (t_depth > 0)
     return;  // nested call made by one of our own hooks
   {
-    // threads that run with all hook groups blocked are our workers
-    HookCallContext probe(MutExHookGroup::ALL_GROUPS);
-    if (!probe.active())
-      return;
+    // Skip when ANY hook group is active on this thread: that is either one of
+    // our worker threads (ALL_GROUPS) or an ntdll call made by a kernel32 hook,
+    // whose paths may be rerouted and are not what the application asked for.
+    for (int g = 0; g <= static_cast<int>(MutExHookGroup::LAST); ++g) {
+      HookCallContext probe(static_cast<MutExHookGroup>(g));
+      if (!probe.active())
+        return;
+    }
   }
   m_err = ::GetLastError();
   m_start = qpc();
@@ -308,6 +313,14 @@ void Scope::end()
 namespace
 {
 uint64_t h64(HANDLE h) { return reinterpret_cast<uint64_t>(h); }
+
+uint64_t ioInfo(PIO_STATUS_BLOCK iosb, NTSTATUS status)
+{
+  ULONG_PTR got = 0;
+  if (iosb && status >= 0 && readcache::guardedCopy(&got, &iosb->Information, sizeof(got)))
+    return got;
+  return 0;
+}
 }  // namespace
 
 void recCreate(const Scope& s, bool isOpen, PHANDLE FileHandle, POBJECT_ATTRIBUTES oa,
@@ -341,13 +354,30 @@ void recRead(const Scope& s, HANDLE handle, HANDLE event, PIO_STATUS_BLOCK iosb,
   r.h = h64(handle);
   r.a = length;
   r.b = byteOffset ? 1 : 0;
-  r.off = byteOffset ? byteOffset->QuadPart : 0;
-  if (iosb && status >= 0)
-    r.info = iosb->Information;
-  if (g_state->crc && status == 0 && !event && buffer && iosb &&
-      iosb->Information <= length) {
-    r.hasCrc = true;
-    r.crc = crc32Update(0, buffer, iosb->Information);
+  LONGLONG off = 0;
+  if (byteOffset && !readcache::guardedCopy(&off, byteOffset, sizeof(off)))
+    r.b = 0;
+  r.off = off;
+  ULONG_PTR got = 0;
+  const bool haveInfo = iosb && status >= 0 &&
+                        readcache::guardedCopy(&got, &iosb->Information, sizeof(got));
+  if (haveInfo)
+    r.info = got;
+  if (g_state->crc && status == 0 && !event && buffer && haveInfo && got <= length) {
+    // checksum through guarded copies: the buffer is application memory
+    uint32_t crc = 0;
+    bool ok = true;
+    uint8_t chunk[16384];
+    for (ULONG_PTR pos = 0; pos < got && ok; pos += sizeof(chunk)) {
+      const size_t n = static_cast<size_t>(std::min<ULONG_PTR>(sizeof(chunk), got - pos));
+      ok = readcache::guardedCopy(chunk, static_cast<const uint8_t*>(buffer) + pos, n);
+      if (ok)
+        crc = crc32Update(crc, chunk, n);
+    }
+    if (ok) {
+      r.hasCrc = true;
+      r.crc = crc;
+    }
   }
   submit(s, r, nullptr, false);
 }
@@ -363,8 +393,7 @@ void recQueryInfo(const Scope& s, HANDLE handle, PIO_STATUS_BLOCK iosb, ULONG le
   r.h = h64(handle);
   r.a = static_cast<uint64_t>(cls);
   r.b = length;
-  if (iosb && status >= 0)
-    r.info = iosb->Information;
+  r.info = ioInfo(iosb, status);
   submit(s, r, nullptr, false);
 }
 
@@ -379,10 +408,12 @@ void recSetInfo(const Scope& s, HANDLE handle, PIO_STATUS_BLOCK iosb, PVOID info
   r.h = h64(handle);
   r.a = static_cast<uint64_t>(cls);
   r.b = length;
-  if (cls == FilePositionInformation && info && length >= sizeof(LONGLONG))
-    r.off = static_cast<const FILE_POSITION_INFORMATION*>(info)->CurrentByteOffset.QuadPart;
-  if (iosb && status >= 0)
-    r.info = iosb->Information;
+  if (cls == FilePositionInformation && info && length >= sizeof(LONGLONG)) {
+    LONGLONG pos = 0;
+    if (readcache::guardedCopy(&pos, info, sizeof(pos)))
+      r.off = pos;
+  }
+  r.info = ioInfo(iosb, status);
   submit(s, r, nullptr, false);
 }
 
@@ -399,8 +430,7 @@ void recQueryDir(const Scope& s, bool ex, HANDLE handle, PIO_STATUS_BLOCK iosb,
   r.a = static_cast<uint64_t>(cls);
   r.b = length;
   r.c = flags;
-  if (iosb && status >= 0)
-    r.info = iosb->Information;
+  r.info = ioInfo(iosb, status);
   submit(s, r, mask, mask != nullptr);
 }
 
