@@ -328,8 +328,9 @@ typedef struct _FILE_NAME_INFORMATION {
   WCHAR FileName[1];
 } FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
 
+// own name: newer SDKs define FILE_STAT_INFORMATION themselves
 // FileStatInformation (Windows 10 1709+, Wine): everything an fstat provides
-typedef struct _FILE_STAT_INFORMATION {
+typedef struct _USVFS_FILE_STAT_INFORMATION {
   LARGE_INTEGER FileId;
   LARGE_INTEGER CreationTime;
   LARGE_INTEGER LastAccessTime;
@@ -341,7 +342,7 @@ typedef struct _FILE_STAT_INFORMATION {
   ULONG ReparseTag;
   ULONG NumberOfLinks;
   ACCESS_MASK EffectiveAccess;
-} FILE_STAT_INFORMATION, *PFILE_STAT_INFORMATION;
+} USVFS_FILE_STAT_INFORMATION;
 
 // the name at the end is variable-length; a call with a buffer that is too
 // small fails with STATUS_BUFFER_OVERFLOW but still fills in the fixed part

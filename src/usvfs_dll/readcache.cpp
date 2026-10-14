@@ -530,7 +530,7 @@ NTSTATUS queryAttrs(HANDLE h, FileAttrs& out)
 {
   IO_STATUS_BLOCK iosb;
   if (!g_noStatInfo.load(std::memory_order_relaxed)) {
-    FILE_STAT_INFORMATION stat;
+    USVFS_FILE_STAT_INFORMATION stat;
     std::memset(&stat, 0, sizeof(stat));
     std::memset(&iosb, 0, sizeof(iosb));
     const NTSTATUS st = ::NtQueryInformationFile(h, &iosb, &stat, sizeof(stat),
