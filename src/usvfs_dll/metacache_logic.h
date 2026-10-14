@@ -169,8 +169,9 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
     if (dir.size() == 2 && dir[1] == L':')
       dir.push_back(L'\\');
   }
-  // the directory of a bare mask is the cwd: it may carry a trailing separator
-  while (dir.size() > 3 && frontIsSep(dir.back()) && pos == std::wstring_view::npos)
+  // the directory may carry trailing separators (the cwd of a bare mask, or a
+  // doubled separator in "dir\\*"): Win32 normalisation collapses them
+  while (dir.size() > 3 && frontIsSep(dir.back()))
     dir.pop_back();
   if (mask.empty() || mask.size() > 255)
     return fail(15);
@@ -345,11 +346,33 @@ struct Attr
   uint32_t attributes = 0;
 };
 
+// strings stored back to back (no per-string header or allocation)
+template <typename Ch>
+class PackedSeq
+{
+public:
+  size_t size() const { return m_ends.size(); }
+  void push_back(std::basic_string_view<Ch> v)
+  {
+    m_data.append(v.data(), v.size());
+    m_ends.push_back(static_cast<uint32_t>(m_data.size()));
+  }
+  std::basic_string_view<Ch> operator[](size_t i) const
+  {
+    const size_t b = i ? m_ends[i - 1] : 0;
+    return std::basic_string_view<Ch>(m_data.data() + b, m_ends[i] - b);
+  }
+
+private:
+  std::basic_string<Ch> m_data;
+  std::vector<uint32_t> m_ends;
+};
+
 struct Listing
 {
-  std::vector<std::string> records;  // raw records, NextEntryOffset zeroed
+  PackedSeq<char> records;  // raw records, NextEntryOffset zeroed
   std::vector<size_t> rawLengths;
-  std::vector<std::wstring> names;
+  PackedSeq<wchar_t> names;
   // hash of the folded name -> index (a multimap: collisions are verified against
   // `names`); much smaller than a map keyed by the folded strings
   std::unordered_multimap<uint64_t, uint32_t> byHash;
@@ -365,14 +388,14 @@ struct Listing
     return h;
   }
 
-  void add(std::string record, std::wstring name)
+  void add(std::string_view record, std::wstring_view name)
   {
     rawLengths.push_back(record.size());
     // payload plus the container overheads of one entry (headers, hash node)
-    bytes += record.size() + name.size() * sizeof(wchar_t) + 96;
+    bytes += record.size() + name.size() * sizeof(wchar_t) + 64;
     byHash.emplace(hashFolded(name, true), static_cast<uint32_t>(records.size()));
-    records.push_back(std::move(record));
-    names.push_back(std::move(name));
+    records.push_back(record);
+    names.push_back(name);
   }
 
   // indices (ascending) of the entries whose name equals `foldedName` (already
@@ -382,7 +405,7 @@ struct Listing
     std::vector<uint32_t> out;
     auto range = byHash.equal_range(hashFolded(foldedName, false));
     for (auto it = range.first; it != range.second; ++it) {
-      const std::wstring& n = names[it->second];
+      const std::wstring_view n = names[it->second];
       if (n.size() != foldedName.size())
         continue;
       bool same = true;

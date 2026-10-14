@@ -770,7 +770,7 @@ NTSTATUS replay(Cursor& c, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length,
   std::string out(info, '\0');
   size_t off = 0;
   for (size_t i = 0; i < n; ++i) {
-    const std::string& rec = l.records[c.next + i];
+    const std::string_view rec = l.records[c.next + i];
     std::memcpy(out.data() + off, rec.data(), rec.size());
     const uint32_t next = (i + 1 < n) ? static_cast<uint32_t>(logic::alignedSize(rec.size())) : 0;
     std::memcpy(out.data() + off, &next, sizeof(next));

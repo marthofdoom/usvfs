@@ -402,6 +402,17 @@ TEST(MetaCacheFront, EnumKey)
   EXPECT_EQ(L"", frontEnumKey(L"C:*", LR"(C:\G)", 0, 0));
 }
 
+TEST(MetaCacheFront, EnumKeyDoubledSeparators)
+{
+  const std::wstring k = frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 0, 0);
+  EXPECT_EQ(k, frontEnumKey(LR"(C:\Game\Data\\*.esp)", L"", 0, 0));
+  EXPECT_EQ(k, frontEnumKey(LR"(C:\Game\Data/\*.esp)", L"", 0, 0));
+  EXPECT_FALSE(frontEnumKey(LR"(C:\\*)", L"", 0, 0).empty());
+  EXPECT_EQ(frontEnumKey(LR"(C:\*)", L"", 0, 0), frontEnumKey(LR"(C:\\*)", L"", 0, 0));
+  // still rejected: doubled separator inside the path
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\Game\\Data\*)", L"", 0, 0));
+}
+
 TEST(MetaCacheFront, EnumKeyRejected)
 {
   EXPECT_EQ(L"", frontEnumKey(L"", LR"(C:\G)", 0, 0));
