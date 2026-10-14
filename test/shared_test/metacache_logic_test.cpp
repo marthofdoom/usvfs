@@ -394,7 +394,8 @@ TEST(MetaCacheFront, EnumKey)
   EXPECT_EQ(k, frontEnumKey(L"*.esp", LR"(C:\Game\Data\)", 0, 0));
   // search parameters are part of the key
   EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 1, 0));
-  EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 0, 2));
+  EXPECT_EQ(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 0, 2));  // large fetch: same result
+  EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 0, 4));  // on-disk only
   EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esm)", L"", 0, 0));
   // drive root
   EXPECT_FALSE(frontEnumKey(LR"(C:\*)", L"", 0, 0).empty());
