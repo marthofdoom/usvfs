@@ -283,7 +283,7 @@ TEST(MetaCacheStore, TooManyWrittenPathsSwitchCachingOff)
 {
   Store s(1 << 20);
   s.putAttr(L"\\A", existing());
-  for (int i = 0; i < 110000; ++i)
+  for (int i = 0; i < 210000; ++i)
     s.invalidatePath(L"\\W\\" + std::to_wstring(i));
   EXPECT_TRUE(s.overflowed());
 
