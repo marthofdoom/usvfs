@@ -75,6 +75,7 @@ and `Tools/harness-cold.sh DIR...` (posix_fadvise DONTNEED for cold runs).
   paths). Look at the .log first when something dies.
 - Handles: reused handle values are resolved by time (instance = latest create returned before the use);
   find handles separately. Window mode re-opens handles open at window start (file positions restart at 0).
+- Response files: any `@<path>` argument is replaced by the args in that file (UTF-8/UTF-16 BOM, whitespace separated, `#` comment lines, `"..."` groups); expanded list is logged in the .log.
 - Safety: opens with write/delete/non-FILE_OPEN intent and non-position SetInformation are skipped.
 
 ## Known fidelity limits

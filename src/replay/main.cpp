@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <latch>
 #include <map>
 #include <memory>
@@ -1396,15 +1397,71 @@ void usage()
       stderr);
 }
 
+// Response files: "@path" arguments are replaced by the tokens read from that file (UTF-8 or UTF-16 with BOM;
+// whitespace separated; a line starting with '#' is a comment; double quotes group a token with spaces).
+bool readResponseFile(const std::wstring& path, std::vector<std::wstring>& out)
+{
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  std::wstring text;
+  auto u8 = [](const char* p, size_t n) {
+    if (!n) return std::wstring();
+    const int len = ::MultiByteToWideChar(CP_UTF8, 0, p, (int)n, nullptr, 0);
+    std::wstring w((size_t)len, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, p, (int)n, w.data(), len);
+    return w;
+  };
+  const auto* b = reinterpret_cast<const unsigned char*>(raw.data());
+  if (raw.size() >= 2 && b[0] == 0xFF && b[1] == 0xFE) {
+    text.assign(reinterpret_cast<const wchar_t*>(raw.data() + 2), (raw.size() - 2) / 2);
+  } else if (raw.size() >= 2 && b[0] == 0xFE && b[1] == 0xFF) {
+    for (size_t i = 2; i + 1 < raw.size(); i += 2) text.push_back((wchar_t)((b[i] << 8) | b[i + 1]));
+  } else if (raw.size() >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) {
+    text = u8(raw.data() + 3, raw.size() - 3);
+  } else {
+    text = u8(raw.data(), raw.size());
+  }
+  std::wstring cur;
+  bool inTok = false, inQuote = false, lineStart = true;
+  auto flush = [&] { if (inTok) out.push_back(cur); cur.clear(); inTok = false; };
+  for (size_t i = 0; i < text.size(); ++i) {
+    const wchar_t c = text[i];
+    if (!inQuote && lineStart && c == L'#') {
+      while (i < text.size() && text[i] != L'\n') ++i;
+      continue;
+    }
+    if (c == L'\n') { if (!inQuote) { flush(); lineStart = true; continue; } }
+    else if (!inQuote && (c == L' ' || c == L'\t' || c == L'\r')) { flush(); continue; }
+    if (c == L'"') { inQuote = !inQuote; inTok = true; lineStart = false; continue; }
+    cur.push_back(c); inTok = true; lineStart = false;
+  }
+  flush();
+  return true;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv)
 {
   Options o;
   std::vector<Config> configs;
+  std::vector<std::wstring> args;
+  bool expanded = false;
   for (int i = 1; i < argc; ++i) {
     const std::wstring a = argv[i];
-    auto next = [&]() -> std::wstring { return i + 1 < argc ? argv[++i] : std::wstring(); };
+    if (a.size() > 1 && a[0] == L'@') {
+      expanded = true;
+      if (!readResponseFile(a.substr(1), args)) {
+        std::fprintf(stderr, "replay: cannot read response file '%s'\n", toUtf8(a.substr(1)).c_str());
+        return 1;
+      }
+    } else args.push_back(a);
+  }
+  const int n = (int)args.size();
+  for (int i = 0; i < n; ++i) {
+    const std::wstring a = args[i];
+    auto next = [&]() -> std::wstring { return i + 1 < n ? args[++i] : std::wstring(); };
     if (a == L"--timing") o.timingOriginal = next() == L"original";
     else if (a == L"--verify") o.verify = true;
     else if (a == L"--threads-as-recorded") o.singleThread = false;
@@ -1420,8 +1477,8 @@ int wmain(int argc, wchar_t** argv)
     else if (a == L"--config") {
       Config c;
       c.name = toUtf8(next());
-      while (i + 1 < argc && std::wstring(argv[i + 1]).rfind(L"--", 0) != 0) {
-        const std::wstring kv = argv[++i];
+      while (i + 1 < n && args[i + 1].rfind(L"--", 0) != 0) {
+        const std::wstring kv = args[++i];
         const size_t eq = kv.find(L'=');
         if (eq == std::wstring::npos || eq == 0) { std::fprintf(stderr, "replay: bad KEY=VAL '%s'\n", toUtf8(kv).c_str()); return 1; }
         c.env.push_back({kv.substr(0, eq), kv.substr(eq + 1)});
@@ -1437,6 +1494,11 @@ int wmain(int argc, wchar_t** argv)
   if (o.outPath.empty()) o.outPath = o.tracePath + L".results.json";
   o.logPath = o.outPath + L".log";
   g_logPath = o.logPath;
+  if (expanded) {
+    std::string l;
+    for (auto& x : args) l += (l.empty() ? "" : " ") + toUtf8(x);
+    logf("expanded arguments: %s", l.c_str());
+  }
   logf("replay start: trace %s, %zu config(s), window %g..%g s (limit %g), timing %s", toUtf8(o.tracePath).c_str(),
        configs.size(), o.fromSec, o.toSec, o.limitSec, o.timingOriginal ? "original" : "asap");
   if (::GetFileAttributesW(o.tracePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
