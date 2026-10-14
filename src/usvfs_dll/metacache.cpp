@@ -293,8 +293,7 @@ struct State
   // pre-warm
   bool prewarm = false;
   int prewarmThreads = 4;
-  std::vector<int> prewarmClasses{FileBothDirectoryInformation,
-                                  FileIdBothDirectoryInformation};
+  std::vector<int> prewarmClasses{FileBothDirectoryInformation};  // the game only uses class 3
   std::atomic<int64_t> prewarmPending{0};
   std::atomic<uint64_t> prewarmDirs{0};
   std::atomic<uint64_t> prewarmFiles{0};
@@ -587,9 +586,15 @@ void logSummary(const char* prefix)
       classes += std::format(" {}={}", i, ld(g->dirClassCount[i]));
   }
 
-  logger->info("{}: store bytes/attr-entry={} (attr {} listings {} memory {}B)", prefix,
-               g->store.attrCount() ? g->store.bytes() / g->store.attrCount() : 0,
-               g->store.attrCount(), g->store.listingCount(), g->store.bytes());
+  {
+    uint64_t ab = 0, lb = 0, le = 0;
+    g->store.breakdown(ab, lb, le);
+    const uint64_t ac = g->store.attrCount();
+    logger->info("{}: store memory={}B: attr {}B for {} entries ({} B/entry), listings {}B for {} "
+                 "listings / {} entries ({} B/entry)",
+                 prefix, g->store.bytes(), ab, ac, ac ? ab / ac : 0, lb, g->store.listingCount(), le,
+                 le ? lb / le : 0);
+  }
   if (gFront) {
     logger->info("{}: attr front misses first-time={} repeat={}", prefix,
                  ld(gFront->missesFirst), ld(gFront->missesRepeat));

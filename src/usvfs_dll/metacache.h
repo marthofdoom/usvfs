@@ -41,7 +41,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 //   USVFS_METACACHE_PREWARM=1|0        walk the virtual tree in the background
 //                                      (default: only in SkyrimSE.exe)
 //   USVFS_METACACHE_PREWARM_THREADS=4
-//   USVFS_METACACHE_PREWARM_CLASSES=3,37   directory information classes to
+//   USVFS_METACACHE_PREWARM_CLASSES=3        directory information classes to
 //                                      pre-list (FILE_INFORMATION_CLASS values)
 
 namespace usvfs::metacache

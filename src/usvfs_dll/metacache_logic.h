@@ -680,6 +680,19 @@ public:
     return m_attrs.size();
   }
 
+  // accounted bytes of attribute entries and of listings, and the entries in the listings
+  void breakdown(uint64_t& attrBytes, uint64_t& listBytes, uint64_t& listEntries) const
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    attrBytes = listBytes = listEntries = 0;
+    for (const Node& n : m_lru)
+      (n.isAttr ? attrBytes : listBytes) += n.bytes;
+    for (const auto& d : m_dirs) {
+      for (const ListSlot& slot : d.second)
+        listEntries += slot.listing->records.size();
+    }
+  }
+
   size_t listingCount() const
   {
     std::lock_guard<std::mutex> lock(m_mutex);
