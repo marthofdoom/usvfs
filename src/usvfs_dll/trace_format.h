@@ -31,9 +31,16 @@ enum class Op : uint8_t {
   QueryAttr = 9,
   QueryFullAttr = 10,
   Close = 11,
+  // kernel32-level calls made by the application (the usvfs kernel32 hooks)
+  GetAttr = 12,      // GetFileAttributesW
+  GetAttrEx = 13,    // GetFileAttributesExW
+  FindFirst = 14,    // FindFirstFileExW (the enumeration is replayed to its end)
+  ProfString = 15,   // GetPrivateProfileString[AW]
+  ProfSection = 16,  // GetPrivateProfileSection[AW]
+  WriteMarker = 17,  // DeleteFile/MoveFile/WritePrivateProfileString: never replayed
 };
 
-constexpr int kOpCount = 12;
+constexpr int kOpCount = 18;
 
 inline const char* opName(Op op)
 {
@@ -49,6 +56,12 @@ inline const char* opName(Op op)
   case Op::QueryAttr: return "NtQueryAttributesFile";
   case Op::QueryFullAttr: return "NtQueryFullAttributesFile";
   case Op::Close: return "NtClose";
+  case Op::GetAttr: return "GetFileAttributesW";
+  case Op::GetAttrEx: return "GetFileAttributesExW";
+  case Op::FindFirst: return "FindFirstFileExW";
+  case Op::ProfString: return "GetPrivateProfileString";
+  case Op::ProfSection: return "GetPrivateProfileSection";
+  case Op::WriteMarker: return "WriteMarker";
   }
   return "?";
 }
@@ -80,6 +93,14 @@ static_assert(sizeof(FileHeader) == 40);
 //            QueryFlags as passed), str=mask (0 = none), info=bytes returned
 //   QueryAttr/QueryFullAttr: h2=RootDirectory, str=path
 //   Close  : h
+//   kernel32 ops: `status` is the call's result (attributes / BOOL / 1 if the find
+//            handle is valid / returned length), `info` the GetLastError on failure.
+//   GetAttr: str=path.  GetAttrEx: str, a=info level.
+//   FindFirst: str=path, a=info level, b=search op, c=additional flags, h=find handle
+//   ProfString: str=file, a=app name str id (0 = NULL), b=key name str id (0 = NULL),
+//            c=nSize, d=1 if the ANSI function was called (strings stored widened)
+//   ProfSection: str=file, a=app name str id, c=nSize, d as above
+//   WriteMarker: str=first path, a=1 delete / 2 move / 3 profile write
 // All ops: tid, ts (QPC ticks since qpcBase, at hook entry), dur (ticks spent in
 // the call), status (NTSTATUS as returned to the application).
 struct Record {

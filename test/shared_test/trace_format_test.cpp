@@ -132,3 +132,22 @@ TEST(TraceFormat, Crc32)
   EXPECT_EQ(0xcbf43926u, c);
   EXPECT_EQ(0u, crc32Update(0, "", 0));
 }
+
+TEST(TraceFormat, Kernel32Ops)
+{
+  Record r;
+  r.op = Op::ProfString;
+  r.tid = 3;
+  r.str = 10;
+  r.a = 11;
+  r.b = 12;
+  r.c = 260;
+  r.d = 1;
+  r.status = 5;
+  EXPECT_EQ(r, roundTrip(r));
+
+  for (Op op : {Op::GetAttr, Op::GetAttrEx, Op::FindFirst, Op::ProfSection, Op::WriteMarker}) {
+    r.op = op;
+    EXPECT_EQ(r, roundTrip(r));
+  }
+}

@@ -509,6 +509,8 @@
   <ItemGroup Label="harness trace">
     <ClCompile Include="..\src\usvfs_dll\trace.cpp" />
     <ClCompile Include="..\src\usvfs_dll\hooks\ntdll_traced.cpp" />
+    <ClCompile Include="..\src\usvfs_dll\hooks\kernel32_traced.cpp" />
+    <ClInclude Include="..\src\usvfs_dll\hooks\kernel32_impl.h" />
     <ClInclude Include="..\src\usvfs_dll\trace.h" />
     <ClInclude Include="..\src\usvfs_dll\trace_format.h" />
     <ClInclude Include="..\src\usvfs_dll\hooks\ntdll_impl.h" />

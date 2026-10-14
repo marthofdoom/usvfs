@@ -49,6 +49,8 @@ public:
   Scope& operator=(const Scope&) = delete;
 
   bool on() const { return m_on; }
+  // for kernel32 hooks, whose GetLastError is the result: don't restore the old one
+  void keepLastError() { m_restore = false; }
   uint64_t startTicks() const { return m_start; }
 
 private:
@@ -56,6 +58,7 @@ private:
   void end();
 
   bool m_on = false;
+  bool m_restore = true;
   uint64_t m_start = 0;
   unsigned long m_err = 0;
 };
@@ -75,5 +78,18 @@ void recQueryDir(const Scope& s, bool ex, HANDLE handle, PIO_STATUS_BLOCK iosb,
                  PUNICODE_STRING mask, NTSTATUS status);
 void recQueryAttr(const Scope& s, bool full, POBJECT_ATTRIBUTES oa, NTSTATUS status);
 void recClose(const Scope& s, HANDLE handle, NTSTATUS status);
+
+// kernel32-level calls (usvfs kernel32 hooks), recorded with the application's
+// arguments; string pointers are application memory (`ansi`: char*, else wchar_t*).
+// `result` is the call's return value, `err` GetLastError after it.
+void recGetAttr(const Scope& s, const void* path, unsigned long result, unsigned long err);
+void recGetAttrEx(const Scope& s, const void* path, unsigned long level, int ok,
+                  unsigned long err);
+void recFindFirst(const Scope& s, const void* path, unsigned long level, unsigned long op,
+                  unsigned long flags, HANDLE result, unsigned long err);
+void recProfile(const Scope& s, bool section, bool ansi, const void* app, const void* key,
+                const void* file, unsigned long nSize, unsigned long result);
+// kind: 1 delete, 2 move, 3 profile write
+void recWriteMarker(const Scope& s, unsigned kind, bool ansi, const void* path);
 
 }  // namespace usvfs::trace

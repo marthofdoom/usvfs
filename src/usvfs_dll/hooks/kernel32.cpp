@@ -1,5 +1,6 @@
 #include "../metacache.h"
 #include "kernel32.h"
+#include "kernel32_impl.h"
 #include "sharedids.h"
 
 #include <loghelpers.h>
@@ -337,7 +338,7 @@ BOOL WINAPI usvfs::hook_CreateProcessInternalW(
   return res;
 }
 
-BOOL WINAPI usvfs::hook_GetFileAttributesExW(
+BOOL WINAPI usvfs::impl_GetFileAttributesExW(
     LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId,
     LPVOID lpFileInformation)
 {
@@ -408,7 +409,7 @@ BOOL WINAPI usvfs::hook_GetFileAttributesExW(
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetFileAttributesW(LPCWSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetFileAttributesW(LPCWSTR lpFileName)
 {
   DWORD res = 0UL;
 
@@ -494,7 +495,7 @@ DWORD WINAPI usvfs::hook_SetFileAttributesW(
   return res;
 }
 
-BOOL WINAPI usvfs::hook_DeleteFileW(LPCWSTR lpFileName)
+BOOL WINAPI usvfs::impl_DeleteFileW(LPCWSTR lpFileName)
 {
   BOOL res = FALSE;
 
@@ -563,7 +564,7 @@ BOOL WINAPI usvfs::hook_MoveFileA(LPCSTR lpExistingFileName,
   return res;
 }
 
-BOOL WINAPI usvfs::hook_MoveFileW(LPCWSTR lpExistingFileName,
+BOOL WINAPI usvfs::impl_MoveFileW(LPCWSTR lpExistingFileName,
                                     LPCWSTR lpNewFileName)
 {
   BOOL res = FALSE;
@@ -695,7 +696,7 @@ BOOL WINAPI usvfs::hook_MoveFileExA(LPCSTR lpExistingFileName,
   return res;
 }
 
-BOOL WINAPI usvfs::hook_MoveFileExW(LPCWSTR lpExistingFileName,
+BOOL WINAPI usvfs::impl_MoveFileExW(LPCWSTR lpExistingFileName,
                                       LPCWSTR lpNewFileName, DWORD dwFlags)
 {
   BOOL res = FALSE;
@@ -1295,7 +1296,7 @@ DWORD WINAPI usvfs::hook_GetModuleFileNameW(HMODULE hModule,
   return res;
 }
 
-HANDLE WINAPI usvfs::hook_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData, FINDEX_SEARCH_OPS  fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags)
+HANDLE WINAPI usvfs::impl_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData, FINDEX_SEARCH_OPS  fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags)
 {
   HANDLE res = INVALID_HANDLE_VALUE;
 
@@ -1419,7 +1420,7 @@ HRESULT WINAPI usvfs::hook_CopyFile2(PCWSTR pwszExistingFileName, PCWSTR pwszNew
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, LPCSTR lpDefault, LPSTR lpReturnedString, DWORD nSize, LPCSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, LPCSTR lpDefault, LPSTR lpReturnedString, DWORD nSize, LPCSTR lpFileName)
 {
   DWORD res = 0;
 
@@ -1453,7 +1454,7 @@ DWORD WINAPI usvfs::hook_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKey
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpDefault, LPWSTR lpReturnedString, DWORD nSize, LPCWSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpDefault, LPWSTR lpReturnedString, DWORD nSize, LPCWSTR lpFileName)
 {
   DWORD res = 0;
 
@@ -1487,7 +1488,7 @@ DWORD WINAPI usvfs::hook_GetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpK
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetPrivateProfileSectionA(LPCSTR lpAppName, LPSTR lpReturnedString, DWORD nSize, LPCSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetPrivateProfileSectionA(LPCSTR lpAppName, LPSTR lpReturnedString, DWORD nSize, LPCSTR lpFileName)
 {
   DWORD res = 0;
 
@@ -1520,7 +1521,7 @@ DWORD WINAPI usvfs::hook_GetPrivateProfileSectionA(LPCSTR lpAppName, LPSTR lpRet
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetPrivateProfileSectionW(LPCWSTR lpAppName, LPWSTR lpReturnedString, DWORD nSize, LPCWSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetPrivateProfileSectionW(LPCWSTR lpAppName, LPWSTR lpReturnedString, DWORD nSize, LPCWSTR lpFileName)
 {
   DWORD res = 0;
 
@@ -1553,7 +1554,7 @@ DWORD WINAPI usvfs::hook_GetPrivateProfileSectionW(LPCWSTR lpAppName, LPWSTR lpR
   return res;
 }
 
-BOOL WINAPI usvfs::hook_WritePrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, LPCSTR lpString, LPCSTR lpFileName)
+BOOL WINAPI usvfs::impl_WritePrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, LPCSTR lpString, LPCSTR lpFileName)
 {
   BOOL res = false;
 
@@ -1595,7 +1596,7 @@ BOOL WINAPI usvfs::hook_WritePrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKe
   return res;
 }
 
-BOOL WINAPI usvfs::hook_WritePrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpString, LPCWSTR lpFileName)
+BOOL WINAPI usvfs::impl_WritePrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpString, LPCWSTR lpFileName)
 {
   BOOL res = false;
 

@@ -261,7 +261,12 @@ public:
     std::vector<ThreadStats> stats(lists.size());
     std::vector<size_t> maxBuf(lists.size(), 0);
     for (size_t i = 0; i < lists.size(); ++i) {
-      for (size_t idx : lists[i]) maxBuf[i] = std::max<size_t>(maxBuf[i], std::max(m_t.recs[idx].a, m_t.recs[idx].b));
+      for (size_t idx : lists[i]) {
+        const Record& r = m_t.recs[idx];
+        maxBuf[i] = std::max<size_t>(maxBuf[i], std::max(r.a, r.b));
+        if (r.op == Op::ProfString || r.op == Op::ProfSection)
+          maxBuf[i] = std::max<size_t>(maxBuf[i], r.c * sizeof(wchar_t) + 16);
+      }
       stats[i].tid = m_o.singleThread ? 0 : m_t.recs[lists[i].front()].tid;
     }
 
@@ -325,6 +330,19 @@ private:
         ts.samples.push_back(b);
       }
     }
+  }
+
+  const wchar_t* str(uint32_t id) const
+  {
+    return id && id < m_t.strings.size() ? m_t.strings[id].c_str() : nullptr;
+  }
+
+  static std::string toAnsi(const wchar_t* w)
+  {
+    const int n = ::WideCharToMultiByte(CP_ACP, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, '\0');
+    if (n > 1) ::WideCharToMultiByte(CP_ACP, 0, w, -1, s.data(), n, nullptr, nullptr);
+    return s;
   }
 
   struct Name {
@@ -505,6 +523,65 @@ private:
       note(ts, r, idx, st, "close");
       break;
     }
+    case Op::GetAttr:
+    case Op::GetAttrEx:
+    case Op::FindFirst: {
+      const wchar_t* path = str(r.str);
+      if (!path) { ++ts.skipped; return; }
+      if (r.op == Op::GetAttr) {
+        t0 = qpcNow();
+        st = (NTSTATUS)::GetFileAttributesW(path);
+        t1 = qpcNow();
+        note(ts, r, idx, st, "getattr");
+      } else if (r.op == Op::GetAttrEx) {
+        WIN32_FILE_ATTRIBUTE_DATA d;
+        t0 = qpcNow();
+        const BOOL ok = ::GetFileAttributesExW(path, (GET_FILEEX_INFO_LEVELS)r.a, &d);
+        t1 = qpcNow();
+        note(ts, r, idx, ok ? 1 : 0, "getattrex");
+      } else {
+        // the app's enumeration is replayed to its end (FindNext/FindClose are not hooked)
+        WIN32_FIND_DATAW fd;
+        t0 = qpcNow();
+        HANDLE fh = ::FindFirstFileExW(path, (FINDEX_INFO_LEVELS)r.a, &fd, (FINDEX_SEARCH_OPS)r.b,
+                                       nullptr, (DWORD)r.c);
+        if (fh != INVALID_HANDLE_VALUE) {
+          while (::FindNextFileW(fh, &fd)) {}
+          ::FindClose(fh);
+        }
+        t1 = qpcNow();
+        note(ts, r, idx, fh != INVALID_HANDLE_VALUE ? 1 : 0, "findfirst");
+      }
+      break;
+    }
+    case Op::ProfString:
+    case Op::ProfSection: {
+      const wchar_t* file = str(r.str);
+      const wchar_t* app = str((uint32_t)r.a);
+      const wchar_t* key = str((uint32_t)r.b);
+      if (!file) { ++ts.skipped; return; }
+      const DWORD n = (DWORD)r.c;
+      DWORD got;
+      if (r.d) {  // the app called the ANSI function
+        const std::string f = toAnsi(file), a = app ? toAnsi(app) : std::string(), k = key ? toAnsi(key) : std::string();
+        t0 = qpcNow();
+        got = r.op == Op::ProfString
+                  ? ::GetPrivateProfileStringA(app ? a.c_str() : nullptr, key ? k.c_str() : nullptr, "",
+                                               (char*)buf.data(), n, f.c_str())
+                  : ::GetPrivateProfileSectionA(app ? a.c_str() : nullptr, (char*)buf.data(), n, f.c_str());
+      } else {
+        t0 = qpcNow();
+        got = r.op == Op::ProfString
+                  ? ::GetPrivateProfileStringW(app, key, L"", (wchar_t*)buf.data(), n, file)
+                  : ::GetPrivateProfileSectionW(app, (wchar_t*)buf.data(), n, file);
+      }
+      t1 = qpcNow();
+      note(ts, r, idx, (NTSTATUS)got, "profile");
+      break;
+    }
+    case Op::WriteMarker:
+      ++ts.skipped;  // writes are never replayed
+      return;
     default:
       return;
     }

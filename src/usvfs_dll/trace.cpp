@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <string>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -307,7 +308,8 @@ void Scope::begin()
 void Scope::end()
 {
   --t_depth;
-  ::SetLastError(m_err);
+  if (m_restore)
+    ::SetLastError(m_err);
 }
 
 namespace
@@ -454,6 +456,168 @@ void recClose(const Scope& s, HANDLE handle, NTSTATUS status)
   r.status = static_cast<uint32_t>(status);
   r.h = h64(handle);
   submit(s, r, nullptr, false);
+}
+
+// ---------------------------------------------------------------------------
+// kernel32 level
+
+namespace
+{
+
+// NUL terminated string from application memory without faulting; returns false
+// for a NULL or unreadable pointer
+bool readAppString(const void* p, bool ansi, std::wstring& out)
+{
+  out.clear();
+  if (!p)
+    return false;
+  const size_t unit = ansi ? 1 : sizeof(wchar_t);
+  const char* cur = static_cast<const char*>(p);
+  std::string narrow;
+  for (size_t total = 0; total < 65536; ) {
+    // never cross a page within one copy
+    size_t bytes = 4096 - (reinterpret_cast<uintptr_t>(cur) & 4095);
+    bytes = std::min<size_t>(bytes, 512) / unit * unit;
+    if (bytes == 0)
+      return false;  // misaligned wide string at a page end: give up
+    char chunk[512];
+    if (!readcache::guardedCopy(chunk, cur, bytes))
+      return false;
+    for (size_t i = 0; i < bytes; i += unit) {
+      if (ansi) {
+        if (chunk[i] == 0)
+          goto done;
+        narrow.push_back(chunk[i]);
+      } else {
+        wchar_t ch;
+        std::memcpy(&ch, chunk + i, sizeof(ch));
+        if (ch == 0)
+          goto done;
+        out.push_back(ch);
+      }
+    }
+    cur += bytes;
+    total += bytes;
+  }
+done:
+  if (ansi && !narrow.empty()) {
+    const int n = ::MultiByteToWideChar(CP_ACP, 0, narrow.data(), static_cast<int>(narrow.size()),
+                                        nullptr, 0);
+    out.resize(n);
+    ::MultiByteToWideChar(CP_ACP, 0, narrow.data(), static_cast<int>(narrow.size()), out.data(), n);
+  }
+  return true;
+}
+
+struct Defs {
+  Record def[4];
+  int n = 0;
+};
+
+// id of a string read from application memory (0 = NULL pointer)
+uint32_t internApp(const void* p, bool ansi, Defs& defs)
+{
+  std::wstring w;
+  if (!readAppString(p, ansi, w))
+    return 0;
+  bool isNew = false;
+  Record d;
+  const uint32_t id = intern(w.c_str(), w.size(), d, isNew);
+  if (isNew && defs.n < 4)
+    defs.def[defs.n++] = std::move(d);
+  return id;
+}
+
+void finish(const Scope& s, Record& r, Defs& defs)
+{
+  r.tid = ::GetCurrentThreadId();
+  const uint64_t now = qpc();
+  r.ts = s.startTicks() - g_state->qpcBase;
+  r.dur = now - s.startTicks();
+  const Record* recs[5];
+  int n = 0;
+  for (int i = 0; i < defs.n; ++i)
+    recs[n++] = &defs.def[i];
+  recs[n++] = &r;
+  emit(recs, n);
+}
+
+}  // namespace
+
+void recGetAttr(const Scope& s, const void* path, unsigned long result, unsigned long err)
+{
+  if (!g_state)
+    return;
+  Defs defs;
+  Record r;
+  r.op = Op::GetAttr;
+  r.str = internApp(path, false, defs);
+  r.status = result;
+  r.info = result == INVALID_FILE_ATTRIBUTES ? err : 0;
+  finish(s, r, defs);
+}
+
+void recGetAttrEx(const Scope& s, const void* path, unsigned long level, int ok,
+                  unsigned long err)
+{
+  if (!g_state)
+    return;
+  Defs defs;
+  Record r;
+  r.op = Op::GetAttrEx;
+  r.str = internApp(path, false, defs);
+  r.a = level;
+  r.status = ok ? 1 : 0;
+  r.info = ok ? 0 : err;
+  finish(s, r, defs);
+}
+
+void recFindFirst(const Scope& s, const void* path, unsigned long level, unsigned long op,
+                  unsigned long flags, HANDLE result, unsigned long err)
+{
+  if (!g_state)
+    return;
+  Defs defs;
+  Record r;
+  r.op = Op::FindFirst;
+  r.str = internApp(path, false, defs);
+  r.a = level;
+  r.b = op;
+  r.c = flags;
+  const bool ok = result != INVALID_HANDLE_VALUE;
+  r.h = ok ? h64(result) : 0;
+  r.status = ok ? 1 : 0;
+  r.info = ok ? 0 : err;
+  finish(s, r, defs);
+}
+
+void recProfile(const Scope& s, bool section, bool ansi, const void* app, const void* key,
+                const void* file, unsigned long nSize, unsigned long result)
+{
+  if (!g_state)
+    return;
+  Defs defs;
+  Record r;
+  r.op = section ? Op::ProfSection : Op::ProfString;
+  r.str = internApp(file, ansi, defs);
+  r.a = internApp(app, ansi, defs);
+  r.b = section ? 0 : internApp(key, ansi, defs);
+  r.c = nSize;
+  r.d = ansi ? 1 : 0;
+  r.status = result;
+  finish(s, r, defs);
+}
+
+void recWriteMarker(const Scope& s, unsigned kind, bool ansi, const void* path)
+{
+  if (!g_state)
+    return;
+  Defs defs;
+  Record r;
+  r.op = Op::WriteMarker;
+  r.str = internApp(path, ansi, defs);
+  r.a = kind;
+  finish(s, r, defs);
 }
 
 }  // namespace usvfs::trace
