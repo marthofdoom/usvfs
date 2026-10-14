@@ -1160,32 +1160,50 @@ bool startsWithNoCase(const std::wstring& s, const wchar_t* prefix)
   return _wcsnicmp(s.c_str(), prefix, wcslen(prefix)) == 0;
 }
 
-// UTF-16 environment block: "NAME=VALUE\0...\0\0", sorted by name
-std::vector<wchar_t> buildEnv(const Config& c, bool inherit)
+// Applies a config's env overrides to OUR OWN environment for the duration of a spawn (and, unless inherit,
+// removes inherited USVFS_* vars), restoring everything afterwards. The child then inherits it with a NULL
+// lpEnvironment and no CREATE_UNICODE_ENVIRONMENT: stock usvfs 0.5.6.1 reportedly fails (87) a spawn that passes an
+// explicit environment block (suspected; unverified), our fork does not care.
+struct EnvScope {
+  std::vector<std::pair<std::wstring, std::wstring>> saved;  // name -> old value (empty+!had = was unset)
+  std::vector<bool> had;
+  void set(const std::wstring& name, const wchar_t* value)
+  {
+    wchar_t probe[2];
+    const DWORD n = ::GetEnvironmentVariableW(name.c_str(), probe, 2);
+    std::wstring old;
+    bool exists = n != 0 || ::GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+    if (exists) {
+      std::vector<wchar_t> buf(32768);
+      const DWORD m = ::GetEnvironmentVariableW(name.c_str(), buf.data(), (DWORD)buf.size());
+      old.assign(buf.data(), m < buf.size() ? m : 0);
+    }
+    saved.emplace_back(name, old);
+    had.push_back(exists);
+    ::SetEnvironmentVariableW(name.c_str(), value);
+  }
+  ~EnvScope()
+  {
+    for (size_t i = saved.size(); i-- > 0;)
+      ::SetEnvironmentVariableW(saved[i].first.c_str(), had[i] ? saved[i].second.c_str() : nullptr);
+  }
+};
+
+void applyEnv(EnvScope& scope, const Config& c, bool inherit)
 {
-  std::vector<std::wstring> entries;
-  wchar_t* block = ::GetEnvironmentStringsW();
-  for (const wchar_t* p = block; *p; p += wcslen(p) + 1) {
-    std::wstring e = p;
-    const size_t eq = e.find(L'=', 1);  // entries like "=C:=C:\" start with '='
-    const std::wstring name = e.substr(0, eq);
-    bool overridden = false;
-    for (auto& kv : c.env) overridden |= _wcsicmp(kv.first.c_str(), name.c_str()) == 0;
-    if (overridden) continue;
-    if (!inherit && startsWithNoCase(name, L"USVFS_")) continue;
-    entries.push_back(e);
+  if (!inherit) {
+    std::vector<std::wstring> names;
+    wchar_t* block = ::GetEnvironmentStringsW();
+    for (const wchar_t* p = block; *p; p += wcslen(p) + 1) {
+      std::wstring e = p;
+      const size_t eq = e.find(L'=', 1);  // entries like "=C:=C:\" start with '='
+      const std::wstring name = e.substr(0, eq);
+      if (startsWithNoCase(name, L"USVFS_")) names.push_back(name);
+    }
+    ::FreeEnvironmentStringsW(block);
+    for (auto& n : names) scope.set(n, nullptr);
   }
-  ::FreeEnvironmentStringsW(block);
-  for (auto& kv : c.env) entries.push_back(kv.first + L"=" + kv.second);
-  std::sort(entries.begin(), entries.end(),
-            [](const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
-  std::vector<wchar_t> out;
-  for (auto& e : entries) {
-    out.insert(out.end(), e.begin(), e.end());
-    out.push_back(L'\0');
-  }
-  out.push_back(L'\0');
-  return out;
+  for (auto& kv : c.env) scope.set(kv.first, kv.second.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,9 +1405,11 @@ bool runConfig(const Options& o, const Config& c, size_t index, Result& res)
   if (o.singleThread) cmd += L" --single-thread";
   if (o.allowWrites) cmd += L" --allow-writes";
 
-  std::vector<wchar_t> env = buildEnv(c, o.inheritEnv);
-  logf("config '%s': spawning child, command line %zu chars, environment %zu chars (%zu overrides)",
-       c.name.c_str(), cmd.size(), env.size(), c.env.size());
+  EnvScope envScope;
+  applyEnv(envScope, c, o.inheritEnv);
+  logf("config '%s': spawning child, command line %zu chars, environment: parent's own, adjusted in place "
+       "(%zu overrides%s; spawn mode: NULL lpEnvironment, flags 0)",
+       c.name.c_str(), cmd.size(), c.env.size(), o.inheritEnv ? "" : ", inherited USVFS_* stripped");
   for (auto& kv : c.env) logf("  %s=%s", toUtf8(kv.first).c_str(), toUtf8(kv.second).c_str());
 
   STARTUPINFOW si{};
@@ -1400,14 +1420,16 @@ bool runConfig(const Options& o, const Config& c, size_t index, Result& res)
   for (int attempt = 1; attempt <= 3 && !started; ++attempt) {
     // normal CreateProcessW: the usvfs hooks inject the child (or, with --vfs, our own VFS instance does)
     if (g_vfs.ready)
-      started = g_vfs.createProcess(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, env.data(),
+      started = g_vfs.createProcess(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
                                     nullptr, &si, &pi) != 0;
     else
-      started = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT,
-                                 env.data(), nullptr, &si, &pi) != 0;
+      started = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                                 nullptr, nullptr, &si, &pi) != 0;
     if (!started) {
-      logf("CreateProcessW failed (attempt %d): %s; working set peak %.0f MB", attempt,
-           lastErrorText(::GetLastError()).c_str(), peakWorkingSetMb());
+      logf("CreateProcessW failed (attempt %d): %s; working set peak %.0f MB%s", attempt,
+           lastErrorText(::GetLastError()).c_str(), peakWorkingSetMb(),
+           g_vfs.ready ? " (with --vfs, 87 can also be a failed injection: see <out>.usvfs.log; stock usvfs looks up "
+                         "usvfs_x64.dll [+ usvfs_proxy_x86.exe] next to the DLL it was loaded from)" : "");
       if (attempt < 3) ::Sleep(3000);
     }
   }
