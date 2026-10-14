@@ -243,6 +243,18 @@ TEST(ReadCacheLru, StopsAsSoonAsBudgetIsMet)
   EXPECT_EQ(0u, r[0]);
 }
 
+TEST(ReadCacheLru, EvictionTargetLeavesHeadroom)
+{
+  EXPECT_EQ(900u, evictionTarget(1000));
+  EXPECT_EQ(0u, evictionTarget(0));
+  EXPECT_LT(evictionTarget(1ull << 30), 1ull << 30);
+
+  // evicting down to the target frees enough that the next small fill is free
+  std::vector<EvictCandidate> c(10, EvictCandidate{100, false});
+  auto r = selectEvictions(c, 1050, evictionTarget(1000));
+  EXPECT_EQ(2u, r.size());
+}
+
 // ---- configuration ---------------------------------------------------------
 
 TEST(ReadCacheConfig, ParseNumber)

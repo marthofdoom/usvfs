@@ -169,7 +169,14 @@ struct CacheEntry
 {
   Key key;
   uint64_t size = 0;
-  std::unique_ptr<uint8_t[]> data;
+  std::unique_ptr<uint8_t[]> data;  // null while not resident
+
+  // Readers hold dataLock shared while they look at `data`; eviction frees the
+  // buffer under an exclusive try_lock and skips entries that are busy.
+  std::shared_mutex dataLock;
+  std::atomic<uint64_t> lastUse{0};     // tick of the last serve/fill (approximate LRU)
+  std::atomic<bool> everFilled{false};  // distinguishes a refill from the first fill
+  bool counted = false;                 // data is included in the store's total; store mutex
 
   std::atomic<uint64_t> loadedBytes{0};
   std::atomic<int> state{kEmpty};
@@ -199,45 +206,56 @@ struct Stats
   std::atomic<uint64_t> bytesServed{0};
   std::atomic<uint64_t> fills{0};
   std::atomic<uint64_t> fillBytes{0};
-  std::atomic<uint64_t> evictions{0};
+  std::atomic<uint64_t> evictions{0};      // entries dropped
+  std::atomic<uint64_t> dataEvictions{0};  // buffers freed (entry kept for its handles)
+  std::atomic<uint64_t> refills{0};        // fills of an entry that had been evicted
   std::atomic<uint64_t> passthroughs{0};
   std::atomic<uint64_t> failedClassifications{0};
   std::atomic<uint64_t> classifyUs{0};  // classification time excluding sync fills
   std::atomic<uint64_t> fillUs{0};      // sync fills and async fills on workers
 };
 
-// LRU of cache entries with a byte budget
+// cache entries with a byte budget on the resident data. Eviction works on the
+// data buffers (entries stay alive for the handles that reference them) and
+// picks the least recently used ones; it runs only when over budget and then
+// evicts down to logic::evictionTarget() so that it is not repeated for every
+// fill.
 class Store
 {
 public:
   // returns the entry for the key, creating an empty one if necessary
-  std::shared_ptr<CacheEntry> acquire(const Key& key, uint64_t budget,
-                                      Stats& stats)
+  std::shared_ptr<CacheEntry> acquire(const Key& key)
   {
     std::lock_guard<std::mutex> lock(m_mutex);
 
     auto found = m_map.find(key);
-    if (found != m_map.end()) {
-      m_lru.splice(m_lru.begin(), m_lru, found->second);
-      return *found->second;
-    }
+    if (found != m_map.end())
+      return found->second;
 
     auto entry  = std::make_shared<CacheEntry>();
     entry->key  = key;
     entry->size = key.size;
-    if (entry->size > 0) {
-      entry->data.reset(new uint8_t[static_cast<size_t>(entry->size)]);
-    } else {
-      entry->state.store(kReady);
+    if (entry->size == 0)
+      entry->state.store(kReady);  // nothing to load
+    m_map.emplace(key, entry);
+    m_entriesMirror.store(m_map.size(), std::memory_order_relaxed);
+    return entry;
+  }
+
+  // allocates the buffer of an entry that has none and counts it against the
+  // budget, evicting other entries if necessary. May throw std::bad_alloc.
+  void allocate(CacheEntry& e, uint64_t budget, Stats& stats)
+  {
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[static_cast<size_t>(e.size)]);
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    e.data = std::move(buf);
+    if (!e.counted) {
+      e.counted = true;
+      m_used += e.size;
     }
-
-    m_lru.push_front(entry);
-    m_map.emplace(key, m_lru.begin());
-    m_used += entry->size;
-
     evict(budget, stats);
     m_usedMirror.store(m_used, std::memory_order_relaxed);
-    return entry;
   }
 
   // removes a failed entry so that later opens try again
@@ -245,49 +263,81 @@ public:
   {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto found = m_map.find(entry->key);
-    if (found != m_map.end() && *found->second == entry) {
-      m_used -= std::min(m_used, entry->size);
-      m_lru.erase(found->second);
+    if (found != m_map.end() && found->second == entry) {
+      if (entry->counted) {
+        entry->counted = false;
+        m_used -= std::min(m_used, entry->size);
+      }
       m_map.erase(found);
       m_usedMirror.store(m_used, std::memory_order_relaxed);
+      m_entriesMirror.store(m_map.size(), std::memory_order_relaxed);
     }
   }
 
   uint64_t used() const { return m_usedMirror.load(std::memory_order_relaxed); }
+  uint64_t entries() const { return m_entriesMirror.load(std::memory_order_relaxed); }
 
 private:
-  using List = std::list<std::shared_ptr<CacheEntry>>;
-
   void evict(uint64_t budget, Stats& stats)
   {
     if (m_used <= budget)
       return;
 
-    std::vector<logic::EvictCandidate> candidates;
-    std::vector<List::iterator> iters;
-    for (auto it = m_lru.end(); it != m_lru.begin();) {
-      --it;  // walk from the least recently used end
-      logic::EvictCandidate c;
-      c.bytes  = (*it)->size;
-      c.pinned = it->use_count() > 1;
-      candidates.push_back(c);
-      iters.push_back(it);
+    struct Cand
+    {
+      uint64_t lastUse;
+      CacheEntry* entry;
+    };
+    std::vector<Cand> cands;
+    for (auto& kv : m_map) {
+      CacheEntry* e = kv.second.get();
+      if (e->counted)
+        cands.push_back({e->lastUse.load(std::memory_order_relaxed), e});
+    }
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.lastUse < b.lastUse; });
+
+    std::vector<logic::EvictCandidate> info;
+    info.reserve(cands.size());
+    for (const Cand& c : cands) {
+      // entries being filled can't be evicted
+      info.push_back({c.entry->size,
+                      c.entry->state.load(std::memory_order_acquire) != kReady});
     }
 
-    for (size_t idx : logic::selectEvictions(candidates, m_used, budget)) {
-      List::iterator it = iters[idx];
-      m_used -= std::min(m_used, (*it)->size);
-      m_map.erase((*it)->key);
-      m_lru.erase(it);
-      stats.evictions.fetch_add(1, std::memory_order_relaxed);
+    for (size_t idx : logic::selectEvictions(info, m_used, logic::evictionTarget(budget))) {
+      CacheEntry* e = cands[idx].entry;
+      if (!e->dataLock.try_lock())
+        continue;  // a reader is copying, leave it
+      if (e->state.load(std::memory_order_acquire) == kReady) {
+        e->data.reset();
+        e->loadedBytes.store(0, std::memory_order_release);
+        e->state.store(kEmpty, std::memory_order_release);
+        e->counted = false;
+        m_used -= std::min(m_used, e->size);
+        stats.dataEvictions.fetch_add(1, std::memory_order_relaxed);
+      }
+      e->dataLock.unlock();
     }
+
+    // forget entries nobody references any more and that hold no data
+    for (auto it = m_map.begin(); it != m_map.end();) {
+      if (!it->second->counted && it->second.use_count() == 1 &&
+          it->second->state.load(std::memory_order_acquire) != kLoading) {
+        it = m_map.erase(it);
+        stats.evictions.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        ++it;
+      }
+    }
+    m_entriesMirror.store(m_map.size(), std::memory_order_relaxed);
   }
 
   std::mutex m_mutex;
-  List m_lru;  // front = most recently used
-  std::unordered_map<Key, List::iterator, KeyHash> m_map;
+  std::unordered_map<Key, std::shared_ptr<CacheEntry>, KeyHash> m_map;
   uint64_t m_used = 0;
   std::atomic<uint64_t> m_usedMirror{0};
+  std::atomic<uint64_t> m_entriesMirror{0};
 };
 
 struct Pool
@@ -359,12 +409,13 @@ void logSummary(const char* prefix)
 
   logger->info(
       "{}: handles classified={} eligible={} ineligible={} [{}] "
-      "reads served={} bytes={} passthrough={} fills={} fillBytes={} "
-      "evictions={} cached={}B classifyFailures={} classifyUs={} (avg {}) "
+      "reads served={} bytes={} passthrough={} fills={} refills={} fillBytes={} "
+      "dataEvictions={} entryEvictions={} entries={} resident={}B classifyFailures={} classifyUs={} (avg {}) "
       "fillUs={} (avg {})",
       prefix, ld(s.classified), ld(s.eligible), ld(s.ineligible), reasons,
       ld(s.served), ld(s.bytesServed), ld(s.passthroughs), ld(s.fills),
-      ld(s.fillBytes), ld(s.evictions), g->store.used(),
+      ld(s.refills), ld(s.fillBytes), ld(s.dataEvictions), ld(s.evictions),
+      g->store.entries(), g->store.used(),
       ld(s.failedClassifications), ld(s.classifyUs),
       ld(s.classified) ? ld(s.classifyUs) / ld(s.classified) : 0, ld(s.fillUs),
       ld(s.fills) ? ld(s.fillUs) / ld(s.fills) : 0);
@@ -610,6 +661,24 @@ bool fillFromHandle(HANDLE h, CacheEntry& e, uint64_t chunk, bool progressive)
   return true;
 }
 
+void touch(CacheEntry& e)
+{
+  const uint64_t now = GetTickCount64();
+  if (e.lastUse.load(std::memory_order_relaxed) != now)
+    e.lastUse.store(now, std::memory_order_relaxed);
+}
+
+void countFill(CacheEntry& e)
+{
+  if (e.everFilled.exchange(true)) {
+    g->stats.refills.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    g->stats.fills.fetch_add(1, std::memory_order_relaxed);
+  }
+  g->stats.fillBytes.fetch_add(e.size, std::memory_order_relaxed);
+  touch(e);
+}
+
 void finishEntry(CacheEntry& e, bool ok)
 {
   {
@@ -617,10 +686,8 @@ void finishEntry(CacheEntry& e, bool ok)
     e.state.store(ok ? kReady : kFailed, std::memory_order_release);
   }
   e.cv.notify_all();
-  if (ok) {
-    g->stats.fills.fetch_add(1, std::memory_order_relaxed);
-    g->stats.fillBytes.fetch_add(e.size, std::memory_order_relaxed);
-  }
+  if (ok)
+    countFill(e);
 }
 
 // layer 1: load the whole file through the caller's handle. The real file
@@ -640,7 +707,13 @@ bool fillSync(HANDLE h, const std::shared_ptr<CacheEntry>& e)
 
   e->state.store(kLoading, std::memory_order_release);
   const uint64_t t0 = nowUs();
-  const bool ok = fillFromHandle(h, *e, kSyncChunk, false);
+  bool ok = false;
+  try {
+    g->store.allocate(*e, g->limits.budgetBytes, g->stats);
+    ok = fillFromHandle(h, *e, kSyncChunk, false);
+  } catch (...) {
+    ok = false;
+  }
   const uint64_t dt = nowUs() - t0;
   g->stats.fillUs.fetch_add(dt, std::memory_order_relaxed);
   t_syncFillUs += dt;
@@ -648,8 +721,7 @@ bool fillSync(HANDLE h, const std::shared_ptr<CacheEntry>& e)
   lock.unlock();
   e->cv.notify_all();
   if (ok) {
-    g->stats.fills.fetch_add(1, std::memory_order_relaxed);
-    g->stats.fillBytes.fetch_add(e->size, std::memory_order_relaxed);
+    countFill(*e);
   } else {
     g->store.discard(e);
   }
@@ -789,6 +861,11 @@ bool queueFill(HANDLE h, const std::shared_ptr<CacheEntry>& e)
       return true;  // somebody else already took care of it
     if (!queryObjectName(h, e->ntPath))
       return false;
+    try {
+      g->store.allocate(*e, g->limits.budgetBytes, g->stats);
+    } catch (...) {
+      return false;
+    }
     e->state.store(kLoading, std::memory_order_release);
   }
 
@@ -881,7 +958,7 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
   key.changed = info.changed;
 
   std::shared_ptr<CacheEntry> entry =
-      g->store.acquire(key, g->limits.budgetBytes, g->stats);
+      g->store.acquire(key);
 
   bool loaded = false;
   if (g->async && entry->size > 0 && !g->stop.load(std::memory_order_relaxed)) {
@@ -1176,9 +1253,31 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
     break;
   }
 
-  // layer 2: the range may still be loading
-  if (!waitLoaded(e, plan.offset + plan.count)) {
+  // The buffer may have been evicted since the last read (the entry stays with
+  // the handle): refill it. While dataLock is held shared the buffer can't go.
+  std::shared_lock<std::shared_mutex> dataLock(e.dataLock);
+  bool loaded = false;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (e.state.load(std::memory_order_acquire) == kEmpty) {
+      dataLock.unlock();
+      bool refilled = false;
+      if (g->async && !g->stop.load(std::memory_order_relaxed))
+        refilled = queueFill(FileHandle, hs->entry);
+      if (!refilled)
+        refilled = fillSync(FileHandle, hs->entry);
+      dataLock.lock();
+      if (!refilled)
+        break;
+      continue;
+    }
+    // layer 2: the range may still be loading
+    loaded = waitLoaded(e, plan.offset + plan.count);
+    break;
+  }
+
+  if (!loaded) {
     // the fill failed or timed out: continue with the real file
+    dataLock.unlock();
     const uint64_t shadow = hs->shadowPos;
     hs->eligible.store(false, std::memory_order_release);
     hs->entry.reset();
@@ -1193,6 +1292,7 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
       !sehStoreStatus(IoStatusBlock, STATUS_SUCCESS, static_cast<ULONG_PTR>(plan.count))) {
     return STATUS_ACCESS_VIOLATION;
   }
+  touch(e);
 
   hs->shadowPos = plan.newPos;
   g->stats.bytesServed.fetch_add(plan.count, std::memory_order_relaxed);

@@ -189,9 +189,16 @@ struct EvictCandidate
   bool pinned    = false;  // referenced by an open handle / running fill
 };
 
+// Eviction runs only when over budget and then goes below it by this margin, so
+// that it isn't repeated for every single fill.
+inline uint64_t evictionTarget(uint64_t budget)
+{
+  return budget - budget / 10;
+}
+
 // `lruOldestFirst` lists all cached entries from least to most recently used.
 // Returns the indices (ascending order of age) to evict so that the remaining
-// total is within `budget`, never selecting pinned entries. `used` is the
+// total is within `budget`, never selecting pinned entries (those being filled). `used` is the
 // current total of all entries.
 inline std::vector<size_t>
 selectEvictions(const std::vector<EvictCandidate>& lruOldestFirst,
