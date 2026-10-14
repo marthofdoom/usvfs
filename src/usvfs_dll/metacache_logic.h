@@ -712,7 +712,7 @@ public:
                                          ? isUnderPrefix(entryDir, path)
                                          : isUnderPrefix(attrPath(it->first), path);
       if (under) {
-        m_bytes -= std::min(m_bytes, it->second.lru->bytes);
+        m_bytes -= std::min<uint64_t>(m_bytes, it->second.lru->bytes);
         m_lru.erase(it->second.lru);
         it = m_attrs.erase(it);
       } else {
@@ -722,7 +722,7 @@ public:
     for (auto it = m_dirs.begin(); it != m_dirs.end();) {
       if (isUnderPrefix(it->first, path)) {
         for (ListSlot& slot : it->second) {
-          m_bytes -= std::min(m_bytes, slot.lru->bytes);
+          m_bytes -= std::min<uint64_t>(m_bytes, slot.lru->bytes);
           m_lru.erase(slot.lru);
         }
         it = m_dirs.erase(it);
@@ -959,7 +959,7 @@ private:
 
   void eraseAttr(std::unordered_map<AttrKey, AttrSlot, AttrKeyHash>::iterator it)
   {
-    m_bytes -= std::min(m_bytes, it->second.lru->bytes);
+    m_bytes -= std::min<uint64_t>(m_bytes, it->second.lru->bytes);
     m_lru.erase(it->second.lru);
     m_attrs.erase(it);
   }
@@ -970,7 +970,7 @@ private:
     if (d == m_dirs.end())
       return;
     for (ListSlot& slot : d->second) {
-      m_bytes -= std::min(m_bytes, slot.lru->bytes);
+      m_bytes -= std::min<uint64_t>(m_bytes, slot.lru->bytes);
       m_lru.erase(slot.lru);
     }
     m_dirs.erase(d);
@@ -1010,13 +1010,13 @@ private:
       ++m_stats.evictions;
       if (victim.isAttr) {
         auto a = m_attrs.find(*victim.akey);
-        m_bytes -= std::min(m_bytes, victim.bytes);
+        m_bytes -= std::min<uint64_t>(m_bytes, victim.bytes);
         if (a != m_attrs.end())
           m_attrs.erase(a);
         m_lru.pop_back();
       } else {
         auto d = m_dirs.find(*victim.dkey);
-        m_bytes -= std::min(m_bytes, victim.bytes);
+        m_bytes -= std::min<uint64_t>(m_bytes, victim.bytes);
         if (d != m_dirs.end()) {
           auto& slots = d->second;
           slots.erase(std::remove_if(slots.begin(), slots.end(),
