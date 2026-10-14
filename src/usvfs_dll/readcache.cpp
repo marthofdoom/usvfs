@@ -225,6 +225,8 @@ struct HandleState
   // position of a probation handle, tracked from the reads and seeks we see
   std::atomic<uint64_t> probPos{0};
   std::atomic<bool> probKnown{false};
+  std::atomic<int> probInFlight{0};      // reads of this handle currently in the system
+  std::atomic<bool> probOverlap{false};  // two of them overlapped: the position is unknowable
   // readahead: windows dropped without having served anything
   uint32_t raUnused   = 0;
   bool raDisabled     = false;
@@ -1942,6 +1944,28 @@ bool admit(HandleState& hs, HANDLE h)
   return true;
 }
 
+// Reads of one handle that overlap in time leave the file pointer in an order we
+// can't know: the position becomes unknown until they are all through.
+void probEnter(HandleState& hs)
+{
+  if (hs.probInFlight.fetch_add(1, std::memory_order_acq_rel) > 0)
+    hs.probOverlap.store(true, std::memory_order_release);
+}
+
+void probLeave(HandleState& hs)
+{
+  if (hs.probInFlight.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+      hs.probOverlap.exchange(false, std::memory_order_acq_rel))
+    hs.probKnown.store(false, std::memory_order_release);
+}
+
+struct ProbFlight
+{
+  explicit ProbFlight(HandleState& h) : hs(h) { probEnter(hs); }
+  ~ProbFlight() { probLeave(hs); }
+  HandleState& hs;
+};
+
 // updates the tracked position of a probation handle after a read that went to
 // the system. Anything we can't account for makes the position unknown.
 void trackProbationRead(HandleState& hs, HANDLE ev, PIO_APC_ROUTINE apc,
@@ -2006,6 +2030,7 @@ NTSTATUS bigRead(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
   BigStats& bs = g->stats.big;
 
   // the pointer of a probation handle is only known again if this succeeds
+  ProbFlight flight(hs);
   hs.probKnown.store(false, std::memory_order_release);
 
   auto plain = [&]() {
@@ -2119,21 +2144,27 @@ Peek peek(HANDLE h, ULONG length)
   auto it = g->handles.find(h);
   if (it == g->handles.end())
     return Peek::Unknown;
-  const HandleState& hs = *it->second;
+  HandleState& hs = *it->second;
   const bool big = hs.splitOk.load(std::memory_order_acquire) && length >= logic::kSmallReadLimit &&
                    (g->splitEnabled || g->raEnabled);
   switch (hs.mode.load(std::memory_order_acquire)) {
   case kHandleServed:
     return Peek::Serve;
   case kHandleProbation: {
-    if (!logic::isSmallRead(length))
-      return big ? Peek::Big : Peek::PassthroughTracked;
+    if (!logic::isSmallRead(length)) {
+      if (big)
+        return Peek::Big;
+      probEnter(hs);  // left again by afterProbationRead()
+      return Peek::PassthroughTracked;
+    }
     CacheEntry& e = *hs.entry;
     const uint32_t count = e.smallReads.fetch_add(1, std::memory_order_relaxed) + 1;
     const int state      = e.state.load(std::memory_order_relaxed);
     const bool resident  = state == kReady || state == kLoading;
-    return logic::shouldAdmit(count, g->admitReads, resident) ? Peek::Serve
-                                                              : Peek::PassthroughTracked;
+    if (logic::shouldAdmit(count, g->admitReads, resident))
+      return Peek::Serve;
+    probEnter(hs);  // left again by afterProbationRead()
+    return Peek::PassthroughTracked;
   }
   case kHandleIneligible:
     return big ? Peek::Big : Peek::Passthrough;
@@ -2154,6 +2185,7 @@ void afterProbationRead(HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc, PIO_STATUS_BLO
   HandleState& hs = *it->second;
   if (hs.mode.load(std::memory_order_acquire) == kHandleProbation)
     trackProbationRead(hs, ev, apc, iosb, off, status);
+  probLeave(hs);
 }
 
 void notePassthrough()
@@ -2396,6 +2428,7 @@ NTSTATUS readImpl(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
     // the real file pointer is authoritative on probation
     auto trackedPassthrough = [&]() {
       lock.unlock();
+      ProbFlight flight(*hs);
       const NTSTATUS r = passthrough();
       trackProbationRead(*hs, Event, ApcRoutine, IoStatusBlock, ByteOffset, r);
       return r;
