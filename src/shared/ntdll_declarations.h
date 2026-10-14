@@ -172,6 +172,7 @@ typedef enum _FILE_INFORMATION_CLASS {
   FilePositionInformation        = 14,
   FileModeInformation            = 16,
   FileAllInformation             = 18,
+  FileStatInformation            = 68,
   FileObjectIdInformation        = 29,
   FileReparsePointInformation    = 33,
   FileIdBothDirectoryInformation = 37,
@@ -326,6 +327,21 @@ typedef struct _FILE_NAME_INFORMATION {
   ULONG FileNameLength;
   WCHAR FileName[1];
 } FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
+
+// FileStatInformation (Windows 10 1709+, Wine): everything an fstat provides
+typedef struct _FILE_STAT_INFORMATION {
+  LARGE_INTEGER FileId;
+  LARGE_INTEGER CreationTime;
+  LARGE_INTEGER LastAccessTime;
+  LARGE_INTEGER LastWriteTime;
+  LARGE_INTEGER ChangeTime;
+  LARGE_INTEGER AllocationSize;
+  LARGE_INTEGER EndOfFile;
+  ULONG FileAttributes;
+  ULONG ReparseTag;
+  ULONG NumberOfLinks;
+  ACCESS_MASK EffectiveAccess;
+} FILE_STAT_INFORMATION, *PFILE_STAT_INFORMATION;
 
 // the name at the end is variable-length; a call with a buffer that is too
 // small fails with STATUS_BUFFER_OVERFLOW but still fills in the fixed part

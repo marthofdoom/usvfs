@@ -38,7 +38,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 // unknown handle classifies the handle (see logic::evaluateEligibility). An
 // eligible handle gets a CacheEntry that holds the whole file, loaded
 // synchronously with the real NtReadFile. Entries are shared between handles
-// by {volume serial, file id, size, write time, change time}. All eligible
+// by {file id, size, write time, change time}. All eligible
 // handles keep a "shadow" file pointer, because served reads do not move the
 // real one; the position queries/updates are patched accordingly and any read
 // we cannot serve first writes the shadow position back to the real pointer.
@@ -57,6 +57,9 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 //   falls back to the synchronous path.
 //
 // Correctness rules worth remembering:
+//  * the key has no volume serial: querying it is far too expensive under Wine
+//    (mountmgr round trip per handle). A collision would need equal inode, size,
+//    write time and change time (ns precision) on two different filesystems;
 //  * the state of a handle is erased in onClose() *before* the real close:
 //    handle values get reused;
 //  * a handle is classified exactly once; negative results are stored too;
@@ -87,6 +90,7 @@ constexpr uint64_t kLogIntervalMs = 30000;
 // guarded memory access (no C++ objects with destructors in these functions)
 
 thread_local bool t_inProtectedCopy = false;
+thread_local uint64_t t_syncFillUs = 0;  // sync fill time on this thread, see classify()
 
 bool sehCopy(void* dst, const void* src, size_t n)
 {
@@ -123,7 +127,6 @@ bool sehStoreInt64(void* dst, int64_t value)
 
 struct Key
 {
-  uint32_t volume = 0;
   int64_t fileId  = 0;
   uint64_t size   = 0;
   int64_t written = 0;
@@ -131,7 +134,7 @@ struct Key
 
   bool operator==(const Key& o) const
   {
-    return volume == o.volume && fileId == o.fileId && size == o.size &&
+    return fileId == o.fileId && size == o.size &&
            written == o.written && changed == o.changed;
   }
 };
@@ -146,7 +149,6 @@ struct KeyHash
       h *= 1099511628211ull;
       h ^= h >> 29;
     };
-    mix(k.volume);
     mix(static_cast<uint64_t>(k.fileId));
     mix(k.size);
     mix(static_cast<uint64_t>(k.written));
@@ -200,6 +202,8 @@ struct Stats
   std::atomic<uint64_t> evictions{0};
   std::atomic<uint64_t> passthroughs{0};
   std::atomic<uint64_t> failedClassifications{0};
+  std::atomic<uint64_t> classifyUs{0};  // classification time excluding sync fills
+  std::atomic<uint64_t> fillUs{0};      // sync fills and async fills on workers
 };
 
 // LRU of cache entries with a byte budget
@@ -356,11 +360,14 @@ void logSummary(const char* prefix)
   logger->info(
       "{}: handles classified={} eligible={} ineligible={} [{}] "
       "reads served={} bytes={} passthrough={} fills={} fillBytes={} "
-      "evictions={} cached={}B classifyFailures={}",
+      "evictions={} cached={}B classifyFailures={} classifyUs={} (avg {}) "
+      "fillUs={} (avg {})",
       prefix, ld(s.classified), ld(s.eligible), ld(s.ineligible), reasons,
       ld(s.served), ld(s.bytesServed), ld(s.passthroughs), ld(s.fills),
       ld(s.fillBytes), ld(s.evictions), g->store.used(),
-      ld(s.failedClassifications));
+      ld(s.failedClassifications), ld(s.classifyUs),
+      ld(s.classified) ? ld(s.classifyUs) / ld(s.classified) : 0, ld(s.fillUs),
+      ld(s.fills) ? ld(s.fillUs) / ld(s.fills) : 0);
 }
 
 void maybeLog()
@@ -420,29 +427,51 @@ bool getRealPos(HANDLE h, uint64_t& pos)
   return true;
 }
 
-// copy of the fixed part of FILE_ALL_INFORMATION
-struct AllInfo
+// attributes of a file handle needed for classification
+struct FileAttrs
 {
-  FILE_BASIC_INFORMATION basic;
-  FILE_STANDARD_INFORMATION standard;
-  FILE_INTERNAL_INFORMATION internal;
-  FILE_ACCESS_INFORMATION access;
-  FILE_POSITION_INFORMATION position;
-  FILE_MODE_INFORMATION mode;
+  int64_t fileId       = 0;
+  int64_t written      = 0;
+  int64_t changed      = 0;
+  int64_t endOfFile    = 0;
+  ULONG fileAttributes = 0;
+  int64_t position     = 0;
+  ULONG mode           = 0;
+  ACCESS_MASK access   = 0;
 };
 
-// FILE_ALL_INFORMATION ends in a variable-length name. STATUS_BUFFER_OVERFLOW
-// still fills in the fixed part; if a stack buffer is too small anyway we retry
-// with a buffer that fits any path.
-NTSTATUS queryAll(HANDLE h, AllInfo& out)
+uint64_t nowUs()
+{
+  static const LONGLONG freq = [] {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return f.QuadPart > 0 ? f.QuadPart : 1;
+  }();
+  LARGE_INTEGER c;
+  QueryPerformanceCounter(&c);
+  return static_cast<uint64_t>(c.QuadPart * 1000000 / freq);
+}
+
+// set once the system says FileStatInformation does not exist
+std::atomic<bool> g_noStatInfo{false};
+
+// FileAllInformation fallback. Its name at the end is variable-length;
+// STATUS_BUFFER_OVERFLOW still fills in the fixed part; if a stack buffer is too
+// small anyway we retry with a buffer that fits any path. Some implementations
+// leave Mode/AccessFlags zeroed, so ask for them individually in that case.
+NTSTATUS queryAllFallback(HANDLE h, FileAttrs& out)
 {
   auto extract = [&out](const FILE_ALL_INFORMATION& all) {
-    out.basic    = all.BasicInformation;
-    out.standard = all.StandardInformation;
-    out.internal = all.InternalInformation;
-    out.access   = all.AccessInformation;
-    out.position = all.PositionInformation;
-    out.mode     = all.ModeInformation;
+    out.fileId         = all.InternalInformation.IndexNumber.QuadPart;
+    out.written        = all.BasicInformation.LastWriteTime.QuadPart;
+    out.changed        = all.BasicInformation.ChangeTime.QuadPart;
+    out.endOfFile      = all.StandardInformation.EndOfFile.QuadPart;
+    out.fileAttributes = all.BasicInformation.FileAttributes;
+    if (all.StandardInformation.Directory)
+      out.fileAttributes |= FILE_ATTRIBUTE_DIRECTORY;
+    out.position = all.PositionInformation.CurrentByteOffset.QuadPart;
+    out.mode     = all.ModeInformation.Mode;
+    out.access   = all.AccessInformation.AccessFlags;
   };
 
   struct
@@ -458,10 +487,8 @@ NTSTATUS queryAll(HANDLE h, AllInfo& out)
                                          FileAllInformation);
   if (st == STATUS_SUCCESS || st == STATUS_BUFFER_OVERFLOW) {
     extract(stackBuf.info);
-    return STATUS_SUCCESS;
-  }
-
-  if (st == kStatusInfoLengthMismatch || st == kStatusBufferTooSmall) {
+    st = STATUS_SUCCESS;
+  } else if (st == kStatusInfoLengthMismatch || st == kStatusBufferTooSmall) {
     std::vector<unsigned char> big(sizeof(FILE_ALL_INFORMATION) + 70000);
     std::memset(&iosb, 0, sizeof(iosb));
     st = ::NtQueryInformationFile(h, &iosb, big.data(),
@@ -471,10 +498,85 @@ NTSTATUS queryAll(HANDLE h, AllInfo& out)
       FILE_ALL_INFORMATION copy;
       std::memcpy(&copy, big.data(), sizeof(copy));
       extract(copy);
-      return STATUS_SUCCESS;
+      st = STATUS_SUCCESS;
     }
   }
-  return st;
+  if (st != STATUS_SUCCESS)
+    return st;
+
+  if (out.mode == 0) {
+    FILE_MODE_INFORMATION mi;
+    std::memset(&mi, 0, sizeof(mi));
+    std::memset(&iosb, 0, sizeof(iosb));
+    if (::NtQueryInformationFile(h, &iosb, &mi, sizeof(mi), FileModeInformation) >= 0)
+      out.mode = mi.Mode;
+  }
+  if (out.access == 0) {
+    FILE_ACCESS_INFORMATION ai;
+    std::memset(&ai, 0, sizeof(ai));
+    std::memset(&iosb, 0, sizeof(iosb));
+    if (::NtQueryInformationFile(h, &iosb, &ai, sizeof(ai), FileAccessInformation) >= 0)
+      out.access = ai.AccessFlags;
+  }
+  return STATUS_SUCCESS;
+}
+
+// Preferred path: FileStatInformation + position + mode + access. Under Wine
+// the first two are plain fstat/lseek and the other two one wineserver call
+// each, while FileAllInformation needs a server round trip to build the name
+// and reports Mode/AccessFlags as 0. (EffectiveAccess of the stat information
+// is not trustworthy under Wine, so FileAccessInformation is used instead.)
+NTSTATUS queryAttrs(HANDLE h, FileAttrs& out)
+{
+  IO_STATUS_BLOCK iosb;
+  if (!g_noStatInfo.load(std::memory_order_relaxed)) {
+    FILE_STAT_INFORMATION stat;
+    std::memset(&stat, 0, sizeof(stat));
+    std::memset(&iosb, 0, sizeof(iosb));
+    const NTSTATUS st = ::NtQueryInformationFile(h, &iosb, &stat, sizeof(stat),
+                                                 FileStatInformation);
+    if (st == STATUS_SUCCESS) {
+      FILE_POSITION_INFORMATION pos;
+      FILE_MODE_INFORMATION mode;
+      FILE_ACCESS_INFORMATION access;
+      std::memset(&pos, 0, sizeof(pos));
+      std::memset(&mode, 0, sizeof(mode));
+      std::memset(&access, 0, sizeof(access));
+
+      std::memset(&iosb, 0, sizeof(iosb));
+      NTSTATUS st2 = ::NtQueryInformationFile(h, &iosb, &pos, sizeof(pos),
+                                              FilePositionInformation);
+      if (st2 >= 0) {
+        std::memset(&iosb, 0, sizeof(iosb));
+        st2 = ::NtQueryInformationFile(h, &iosb, &mode, sizeof(mode),
+                                       FileModeInformation);
+      }
+      if (st2 >= 0) {
+        std::memset(&iosb, 0, sizeof(iosb));
+        st2 = ::NtQueryInformationFile(h, &iosb, &access, sizeof(access),
+                                       FileAccessInformation);
+      }
+      if (st2 < 0)
+        return st2;
+
+      out.fileId         = stat.FileId.QuadPart;
+      out.written        = stat.LastWriteTime.QuadPart;
+      out.changed        = stat.ChangeTime.QuadPart;
+      out.endOfFile      = stat.EndOfFile.QuadPart;
+      out.fileAttributes = stat.FileAttributes;
+      out.position       = pos.CurrentByteOffset.QuadPart;
+      out.mode           = mode.Mode;
+      out.access         = access.AccessFlags;
+      return STATUS_SUCCESS;
+    }
+    // 0xC0000003 invalid info class, 0xC0000002 not implemented,
+    // 0xC00000BB not supported
+    if (st == static_cast<NTSTATUS>(0xC0000003L) ||
+        st == static_cast<NTSTATUS>(0xC0000002L) ||
+        st == static_cast<NTSTATUS>(0xC00000BBL))
+      g_noStatInfo.store(true, std::memory_order_relaxed);
+  }
+  return queryAllFallback(h, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +639,11 @@ bool fillSync(HANDLE h, const std::shared_ptr<CacheEntry>& e)
   }
 
   e->state.store(kLoading, std::memory_order_release);
+  const uint64_t t0 = nowUs();
   const bool ok = fillFromHandle(h, *e, kSyncChunk, false);
+  const uint64_t dt = nowUs() - t0;
+  g->stats.fillUs.fetch_add(dt, std::memory_order_relaxed);
+  t_syncFillUs += dt;
   e->state.store(ok ? kReady : kFailed, std::memory_order_release);
   lock.unlock();
   e->cv.notify_all();
@@ -599,12 +705,10 @@ bool queryObjectName(HANDLE h, std::wstring& out)
   return false;
 }
 
-bool sameFile(const AllInfo& a, const Key& k)
+bool sameFile(const FileAttrs& a, const Key& k)
 {
-  return a.internal.IndexNumber.QuadPart == k.fileId &&
-         a.standard.EndOfFile.QuadPart == static_cast<LONGLONG>(k.size) &&
-         a.basic.LastWriteTime.QuadPart == k.written &&
-         a.basic.ChangeTime.QuadPart == k.changed;
+  return a.fileId == k.fileId && a.endOfFile == static_cast<LONGLONG>(k.size) &&
+         a.written == k.written && a.changed == k.changed;
 }
 
 bool fillAsync(const std::shared_ptr<CacheEntry>& e)
@@ -632,10 +736,12 @@ bool fillAsync(const std::shared_ptr<CacheEntry>& e)
     return false;
 
   bool ok = false;
-  AllInfo info;
-  std::memset(&info, 0, sizeof(info));
-  if (queryAll(file, info) == STATUS_SUCCESS && sameFile(info, e->key))
+  FileAttrs info;
+  if (queryAttrs(file, info) == STATUS_SUCCESS && sameFile(info, e->key)) {
+    const uint64_t t0 = nowUs();
     ok = fillFromHandle(file, *e, kAsyncChunk, true);
+    g->stats.fillUs.fetch_add(nowUs() - t0, std::memory_order_relaxed);
+  }
 
   ::NtClose(file);
   return ok;
@@ -745,70 +851,34 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
   if (Eligibility r = logic::evaluateEligibility(a, g->limits); early(r))
     return r;
 
-  AllInfo info;
-  std::memset(&info, 0, sizeof(info));
-  st = queryAll(h, info);
+  FileAttrs info;
+  st = queryAttrs(h, info);
   if (st != STATUS_SUCCESS) {
     g->stats.failedClassifications.fetch_add(1, std::memory_order_relaxed);
     if (g->stats.failedClassifications.load(std::memory_order_relaxed) <= 8) {
       if (auto logger = spdlog::get("usvfs")) {
-        logger->warn("readcache: FileAllInformation failed with {:#x}",
+        logger->warn("readcache: attribute query failed with {:#x}",
                      static_cast<uint32_t>(st));
       }
     }
     return Eligibility::QueryFailed;
   }
 
-  // some implementations leave the access/mode fields of FileAllInformation
-  // zeroed; ask for them individually in that case
-  ULONG mode = info.mode.Mode;
-  if (mode == 0) {
-    FILE_MODE_INFORMATION mi;
-    std::memset(&mi, 0, sizeof(mi));
-    std::memset(&iosb, 0, sizeof(iosb));
-    if (::NtQueryInformationFile(h, &iosb, &mi, sizeof(mi), FileModeInformation) >= 0)
-      mode = mi.Mode;
-  }
-  ACCESS_MASK access = info.access.AccessFlags;
-  if (access == 0) {
-    FILE_ACCESS_INFORMATION ai;
-    std::memset(&ai, 0, sizeof(ai));
-    std::memset(&iosb, 0, sizeof(iosb));
-    if (::NtQueryInformationFile(h, &iosb, &ai, sizeof(ai), FileAccessInformation) >= 0)
-      access = ai.AccessFlags;
-  }
-
-  a.directory = info.standard.Directory != FALSE ||
-                (info.basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-  a.mode      = mode;
-  a.access    = access;
-  a.endOfFile = info.standard.EndOfFile.QuadPart < 0
-                    ? UINT64_MAX
-                    : static_cast<uint64_t>(info.standard.EndOfFile.QuadPart);
+  a.directory = (info.fileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  a.mode      = info.mode;
+  a.access    = info.access;
+  a.endOfFile = info.endOfFile < 0 ? UINT64_MAX
+                                   : static_cast<uint64_t>(info.endOfFile);
 
   if (Eligibility r = logic::evaluateEligibility(a, g->limits);
       r != Eligibility::Eligible)
     return r;
 
-  // volume serial number, to tell apart equal file ids on different volumes
-  struct
-  {
-    FILE_FS_VOLUME_INFORMATION info;
-    WCHAR extra[64];
-  } vol;
-  std::memset(&vol, 0, sizeof(vol));
-  std::memset(&iosb, 0, sizeof(iosb));
-  st = ::NtQueryVolumeInformationFile(h, &iosb, &vol, sizeof(vol),
-                                      FileFsVolumeInformation);
-  if (st != STATUS_SUCCESS && st != STATUS_BUFFER_OVERFLOW)
-    return Eligibility::QueryFailed;
-
   Key key;
-  key.volume  = vol.info.VolumeSerialNumber;
-  key.fileId  = info.internal.IndexNumber.QuadPart;
+  key.fileId  = info.fileId;
   key.size    = a.endOfFile;
-  key.written = info.basic.LastWriteTime.QuadPart;
-  key.changed = info.basic.ChangeTime.QuadPart;
+  key.written = info.written;
+  key.changed = info.changed;
 
   std::shared_ptr<CacheEntry> entry =
       g->store.acquire(key, g->limits.budgetBytes, g->stats);
@@ -822,21 +892,21 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
     if (!loaded) {
       // the fill moved the real file pointer: give the original request the
       // position it expects
-      setRealPos(h, static_cast<uint64_t>(info.position.CurrentByteOffset.QuadPart));
+      setRealPos(h, static_cast<uint64_t>(info.position < 0 ? 0 : info.position));
       return Eligibility::FillFailed;
     }
   }
 
   hs.entry     = std::move(entry);
-  hs.shadowPos = info.position.CurrentByteOffset.QuadPart < 0
-                     ? 0
-                     : static_cast<uint64_t>(info.position.CurrentByteOffset.QuadPart);
+  hs.shadowPos = info.position < 0 ? 0 : static_cast<uint64_t>(info.position);
   return Eligibility::Eligible;
 }
 
 void classify(HandleState& hs, HANDLE h, bool eventOrApc, ULONG length)
 {
   Eligibility r = Eligibility::QueryFailed;
+  const uint64_t t0 = nowUs();
+  const uint64_t fill0 = t_syncFillUs;
   try {
     r = classifyImpl(hs, h, eventOrApc, length);
   } catch (...) {
@@ -845,6 +915,11 @@ void classify(HandleState& hs, HANDLE h, bool eventOrApc, ULONG length)
   }
 
   Stats& s = g->stats;
+  {
+    const uint64_t total = nowUs() - t0;
+    const uint64_t fill  = t_syncFillUs - fill0;
+    s.classifyUs.fetch_add(total > fill ? total - fill : 0, std::memory_order_relaxed);
+  }
   s.classified.fetch_add(1, std::memory_order_relaxed);
   if (r == Eligibility::Eligible) {
     s.eligible.fetch_add(1, std::memory_order_relaxed);
