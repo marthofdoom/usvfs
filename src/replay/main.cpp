@@ -1,26 +1,35 @@
 // replay.exe: replays a file-API trace recorded by the usvfs DLL (USVFS_TRACE)
 // against the current environment, to A/B usvfs cache layers without the game.
-// See README of the harness (Linux-Storage-DLL/Tools/harness.md) for usage.
+// See Linux-Storage-DLL/Tools/harness.md for usage.
 //
 //   replay.exe <trace> [--timing asap|original] [--verify] [--threads-as-recorded]
 //              [--single-thread] [--allow-writes] [--inherit-env] [--out results.json]
+//              [--from S] [--to S] [--limit-seconds N]
 //              [--config NAME KEY=VAL ...]...
 //
-// The parent process spawns itself once per --config (with that environment, so
-// the usvfs DLL injected into the child reads it); each child does one pass.
+// The parent process only orchestrates: it spawns itself once per --config (with
+// that environment, so the usvfs DLL injected into the child reads it); each child
+// maps the trace, indexes it, and replays one pass, decoding the trace lazily per
+// thread (the trace is far bigger than memory is willing to hold as records).
+// Everything is logged to <out>.log.
 
+#define PSAPI_VERSION 2
 #include <ntdll_declarations.h>
+#include <psapi.h>
 #include "../usvfs_dll/trace_format.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <latch>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -43,7 +52,11 @@ struct Options {
   bool singleThread = false;
   bool allowWrites = false;
   bool inheritEnv = false;
+  double fromSec = 0;
+  double toSec = -1;     // < 0: to the end
+  double limitSec = -1;  // < 0: none
   std::wstring outPath;
+  std::wstring logPath;
   std::wstring childResult;  // set in child mode
 };
 
@@ -59,15 +72,6 @@ std::string toUtf8(const std::wstring& w)
   std::string s(n, '\0');
   ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
   return s;
-}
-
-std::wstring fromUtf8(const std::string& s)
-{
-  if (s.empty()) return {};
-  int n = ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-  std::wstring w(n, L'\0');
-  ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
-  return w;
 }
 
 uint64_t qpcNow()
@@ -90,122 +94,248 @@ uint64_t qpcFreq()
 double ticksToUs(uint64_t ticks) { return (double)ticks * 1e6 / (double)qpcFreq(); }
 
 // ---------------------------------------------------------------------------
-// trace loading
+// log file (<out>.log): opened for append per message, so parent and child can
+// both write to it and nothing is lost if the console closes or a process dies
 
-struct Trace {
-  FileHeader hdr{};
-  std::vector<Record> recs;                     // without StringDefs
-  std::vector<std::wstring> strings;            // by id
-  std::map<uint32_t, std::vector<size_t>> perThread;  // indices into recs, ts ordered
-  // handle instance resolution (see resolveHandles)
-  std::vector<int> instOf;   // instance of rec.h (-1 = none)
-  std::vector<int> rootOf;   // instance of rec.h2
-  std::vector<int> ownInst;  // instance a successful Create/Open produced
-  int instances = 0;
-  uint64_t minTs = 0;
-};
+std::wstring g_logPath;
+const char* g_role = "parent";
 
-bool readFile(const std::wstring& path, std::vector<uint8_t>& out)
+std::string lastErrorText(DWORD err)
 {
-  HANDLE f = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (f == INVALID_HANDLE_VALUE) return false;
-  LARGE_INTEGER size;
-  ::GetFileSizeEx(f, &size);
-  out.resize((size_t)size.QuadPart);
-  size_t done = 0;
-  while (done < out.size()) {
-    DWORD got = 0;
-    DWORD want = (DWORD)std::min<size_t>(out.size() - done, 1u << 28);
-    if (!::ReadFile(f, out.data() + done, want, &got, nullptr) || got == 0) break;
-    done += got;
-  }
-  ::CloseHandle(f);
-  out.resize(done);
-  return true;
+  char buf[256] = {};
+  ::FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, err, 0, buf,
+                   sizeof(buf), nullptr);
+  std::string s = buf;
+  while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ')) s.pop_back();
+  char head[32];
+  std::snprintf(head, sizeof(head), "%lu", err);
+  return std::string(head) + (s.empty() ? "" : " (" + s + ")");
 }
 
-// A handle value is reused over the trace's lifetime: map every successful
-// create to a unique "instance" and give each later use of the value the latest
-// instance whose create had returned by then.
-void resolveHandles(Trace& t)
+double peakWorkingSetMb()
 {
-  struct Created { uint64_t exitTs; size_t rec; };
-  std::vector<Created> creates;
-  for (size_t i = 0; i < t.recs.size(); ++i) {
-    const Record& r = t.recs[i];
-    if ((r.op == Op::Create || r.op == Op::Open) && (int32_t)r.status >= 0 && r.h)
-      creates.push_back({r.ts + r.dur, i});
-  }
-  std::stable_sort(creates.begin(), creates.end(),
-                   [](const Created& a, const Created& b) { return a.exitTs < b.exitTs; });
+  PROCESS_MEMORY_COUNTERS pmc{};
+  pmc.cb = sizeof(pmc);
+  if (!::GetProcessMemoryInfo(::GetCurrentProcess(), &pmc, sizeof(pmc))) return 0;
+  return (double)pmc.PeakWorkingSetSize / (1024.0 * 1024.0);
+}
 
+void logf(const char* fmt, ...)
+{
+  char msg[2048];
+  va_list ap;
+  va_start(ap, fmt);
+  std::vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  SYSTEMTIME st;
+  ::GetLocalTime(&st);
+  char line[2300];
+  const int n = std::snprintf(line, sizeof(line), "%02d:%02d:%02d.%03d [%s %lu] %s\n", st.wHour, st.wMinute,
+                              st.wSecond, st.wMilliseconds, g_role, ::GetCurrentProcessId(), msg);
+  if (!g_logPath.empty()) {
+    HANDLE f = ::CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+      DWORD w;
+      ::WriteFile(f, line, (DWORD)n, &w, nullptr);
+      ::CloseHandle(f);
+    }
+  }
+  std::fputs(line, stdout);
+  std::fflush(stdout);
+}
+
+// ---------------------------------------------------------------------------
+// trace file access: mapped when possible (page faults, not hooked reads), else
+// read in blocks
+
+class TraceFile
+{
+public:
+  ~TraceFile()
+  {
+    if (m_view) ::UnmapViewOfFile(m_view);
+    if (m_map) ::CloseHandle(m_map);
+    if (m_file != INVALID_HANDLE_VALUE) ::CloseHandle(m_file);
+  }
+
+  bool open(const std::wstring& path)
+  {
+    m_file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (m_file == INVALID_HANDLE_VALUE) {
+      logf("cannot open trace: %s", lastErrorText(::GetLastError()).c_str());
+      return false;
+    }
+    LARGE_INTEGER sz;
+    ::GetFileSizeEx(m_file, &sz);
+    m_size = (uint64_t)sz.QuadPart;
+    m_map = ::CreateFileMappingW(m_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (m_map) m_view = (const uint8_t*)::MapViewOfFile(m_map, FILE_MAP_READ, 0, 0, 0);
+    if (!m_view) logf("mapping the trace failed (%s), using block reads", lastErrorText(::GetLastError()).c_str());
+    return true;
+  }
+
+  uint64_t size() const { return m_size; }
+
+  // pointer to n bytes at off (valid until the next call with the same scratch)
+  const uint8_t* get(uint64_t off, size_t n, std::vector<uint8_t>& scratch)
+  {
+    if (off + n > m_size) return nullptr;
+    if (m_view) return m_view + off;
+    scratch.resize(n);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    LARGE_INTEGER p;
+    p.QuadPart = (LONGLONG)off;
+    if (!::SetFilePointerEx(m_file, p, nullptr, FILE_BEGIN)) return nullptr;
+    size_t done = 0;
+    while (done < n) {
+      DWORD got = 0;
+      if (!::ReadFile(m_file, scratch.data() + done, (DWORD)std::min<size_t>(n - done, 1u << 26), &got, nullptr) || !got)
+        return nullptr;
+      done += got;
+    }
+    return scratch.data();
+  }
+
+private:
+  HANDLE m_file = INVALID_HANDLE_VALUE;
+  HANDLE m_map = nullptr;
+  const uint8_t* m_view = nullptr;
+  uint64_t m_size = 0;
+  std::mutex m_mutex;
+};
+
+// ---------------------------------------------------------------------------
+// index of the trace (built by one streaming pass; records are NOT kept)
+
+struct StrTable {
+  std::vector<wchar_t> arena;
+  std::vector<uint32_t> off;
+  void set(uint32_t id, const std::wstring& s)
+  {
+    if (off.size() <= id) off.resize((size_t)id + 1, 0xffffffffu);
+    off[id] = (uint32_t)arena.size();
+    arena.insert(arena.end(), s.begin(), s.end());
+    arena.push_back(0);
+  }
+  const wchar_t* get(uint32_t id) const
+  {
+    return id && id < off.size() && off[id] != 0xffffffffu ? &arena[off[id]] : nullptr;
+  }
+  USHORT bytes(uint32_t id) const
+  {
+    const wchar_t* p = get(id);
+    return p ? (USHORT)(wcslen(p) * sizeof(wchar_t)) : 0;
+  }
+};
+
+struct Block {
+  uint64_t offset = 0;  // of the payload
+  uint32_t size = 0;
+  uint32_t tid = 0;
+  uint64_t firstTs = 0, lastTs = 0;
+  uint32_t count = 0;
+};
+
+struct CreateInfo {
+  uint64_t exit = 0, ts = 0, h = 0, h2 = 0;
+  uint32_t a = 0, b = 0, c = 0, d = 0, e = 0, str = 0;
+  Op op = Op::Create;
+};
+
+struct Index {
+  FileHeader hdr{};
+  StrTable strings;
+  std::vector<Block> blocks;
+  std::vector<CreateInfo> creates;  // sorted by return time; position = instance id
   std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, int>>> byValue;
-  t.ownInst.assign(t.recs.size(), -1);
-  for (size_t k = 0; k < creates.size(); ++k) {
-    const Record& r = t.recs[creates[k].rec];
-    byValue[r.h].push_back({creates[k].exitTs, (int)k});
-    t.ownInst[creates[k].rec] = (int)k;
-  }
-  t.instances = (int)creates.size();
+  std::vector<std::pair<uint64_t, uint64_t>> closes;  // (handle, ts), only for windows
+  uint64_t minTs = ~0ull, maxTs = 0, records = 0;
 
-  auto lookup = [&](uint64_t h, uint64_t at) -> int {
+  // A handle value is reused over the trace's lifetime: the instance of a use is
+  // the latest create of that value which had returned by then.
+  int lookup(uint64_t h, uint64_t at) const
+  {
+    if (!h) return -1;
     auto it = byValue.find(h);
     if (it == byValue.end()) return -1;
-    auto& v = it->second;
+    const auto& v = it->second;
     auto pos = std::upper_bound(v.begin(), v.end(), at,
                                 [](uint64_t a, const std::pair<uint64_t, int>& e) { return a < e.first; });
     return pos == v.begin() ? -1 : std::prev(pos)->second;
-  };
-
-  t.instOf.assign(t.recs.size(), -1);
-  t.rootOf.assign(t.recs.size(), -1);
-  for (size_t i = 0; i < t.recs.size(); ++i) {
-    const Record& r = t.recs[i];
-    if (r.op != Op::Create && r.op != Op::Open && r.h) t.instOf[i] = lookup(r.h, r.ts);
-    if (r.h2) t.rootOf[i] = lookup(r.h2, r.ts);
   }
-}
+};
 
-bool loadTrace(const std::wstring& path, Trace& t, std::string& err)
+bool buildIndex(TraceFile& tf, bool needCloses, Index& ix)
 {
-  std::vector<uint8_t> data;
-  if (!readFile(path, data)) { err = "cannot read trace"; return false; }
-  if (data.size() < sizeof(FileHeader)) { err = "trace too short"; return false; }
-  std::memcpy(&t.hdr, data.data(), sizeof(FileHeader));
-  if (std::memcmp(t.hdr.magic, kMagic, sizeof(kMagic)) != 0 || t.hdr.version != kVersion) {
-    err = "not a usvfs trace (bad magic/version)";
+  std::vector<uint8_t> scratch;
+  const uint8_t* hdr = tf.get(0, sizeof(FileHeader), scratch);
+  if (!hdr) { logf("trace too short"); return false; }
+  std::memcpy(&ix.hdr, hdr, sizeof(FileHeader));
+  if (std::memcmp(ix.hdr.magic, kMagic, sizeof(kMagic)) != 0 || ix.hdr.version != kVersion) {
+    logf("not a usvfs trace (bad magic/version)");
     return false;
   }
 
-  size_t pos = sizeof(FileHeader);
-  while (pos + 4 <= data.size()) {
+  uint64_t pos = sizeof(FileHeader);
+  uint64_t lastLog = qpcNow();
+  while (pos + 4 <= tf.size()) {
+    std::vector<uint8_t> s1, s2;
+    const uint8_t* p4 = tf.get(pos, 4, s1);
+    if (!p4) break;
     uint32_t size;
-    std::memcpy(&size, &data[pos], 4);
-    pos += 4;
-    if (size > data.size() - pos) break;  // truncated tail (process was killed)
+    std::memcpy(&size, p4, 4);
+    if (size > tf.size() - pos - 4) break;  // truncated tail (process was killed)
+    const uint8_t* data = tf.get(pos + 4, size, s2);
+    if (!data) break;
+
+    Block b;
+    b.offset = pos + 4;
+    b.size = size;
     size_t off = 0;
+    bool first = true;
     while (off < size) {
       Record r;
-      size_t n = decodeRecord(&data[pos + off], size - off, r);
+      const size_t n = decodeRecord(data + off, size - off, r);
       if (n == 0) break;
       off += n;
       if (r.op == Op::StringDef) {
-        if (t.strings.size() <= r.str) t.strings.resize(r.str + 1);
-        t.strings[r.str] = std::move(r.text);
-      } else {
-        t.recs.push_back(std::move(r));
+        ix.strings.set(r.str, r.text);
+        continue;
+      }
+      if (first) { b.tid = r.tid; b.firstTs = r.ts; first = false; }
+      b.lastTs = r.ts;
+      ++b.count;
+      ix.minTs = std::min(ix.minTs, r.ts);
+      ix.maxTs = std::max(ix.maxTs, r.ts);
+      if ((r.op == Op::Create || r.op == Op::Open) && (int32_t)r.status >= 0 && r.h) {
+        CreateInfo c;
+        c.exit = r.ts + r.dur; c.ts = r.ts; c.h = r.h; c.h2 = r.h2;
+        c.a = (uint32_t)r.a; c.b = (uint32_t)r.b; c.c = (uint32_t)r.c; c.d = (uint32_t)r.d;
+        c.e = (uint32_t)r.e; c.str = r.str; c.op = r.op;
+        ix.creates.push_back(c);
+      } else if (needCloses && r.op == Op::Close) {
+        ix.closes.push_back({r.h, r.ts});
       }
     }
-    pos += size;
+    ix.records += b.count;
+    if (b.count) ix.blocks.push_back(b);
+    pos += 4 + size;
+
+    if (ticksToUs(qpcNow() - lastLog) > 5e6) {
+      lastLog = qpcNow();
+      logf("indexing: %.0f%% of the trace, %llu records, %.0f MB peak working set",
+           100.0 * (double)pos / (double)tf.size(), (unsigned long long)ix.records, peakWorkingSetMb());
+    }
   }
 
-  // a thread's blocks may reach the file out of order
-  std::stable_sort(t.recs.begin(), t.recs.end(),
-                   [](const Record& a, const Record& b) { return a.ts < b.ts; });
-  t.minTs = t.recs.empty() ? 0 : t.recs.front().ts;
-  for (size_t i = 0; i < t.recs.size(); ++i) t.perThread[t.recs[i].tid].push_back(i);
-  resolveHandles(t);
+  std::stable_sort(ix.creates.begin(), ix.creates.end(),
+                   [](const CreateInfo& a, const CreateInfo& b) { return a.exit < b.exit; });
+  for (size_t k = 0; k < ix.creates.size(); ++k)
+    ix.byValue[ix.creates[k].h].push_back({ix.creates[k].exit, (int)k});
+  std::sort(ix.closes.begin(), ix.closes.end());
+  if (ix.minTs == ~0ull) ix.minTs = 0;
   return true;
 }
 
@@ -213,7 +343,7 @@ bool loadTrace(const std::wstring& path, Trace& t, std::string& err)
 // replay pass
 
 struct OpStat {
-  uint64_t count = 0, ticks = 0, diffs = 0;
+  uint64_t count = 0, ticks = 0, diffs = 0, recCount = 0, recTicks = 0;
 };
 
 struct ThreadStats {
@@ -237,48 +367,133 @@ bool isWriteIntent(const Record& r)
                                  0x40000 /*WRITE_DAC*/ | 0x80000 /*WRITE_OWNER*/ |
                                  0x40000000 /*GENERIC_WRITE*/ | 0x10000000 /*GENERIC_ALL*/;
   if (r.a & writeBits) return true;
-  if (r.op == Op::Create && r.c != kFileOpen) return true;
+  if (r.op == Op::Create && r.c != kFileOpen) return true;  // as the DLL: only FILE_OPEN is a read
   if (r.d & 0x1000 /*FILE_DELETE_ON_CLOSE*/) return true;
   return false;
 }
 
+// the records of one recorded thread, decoded block by block, restricted to the window
+class Cursor
+{
+public:
+  Cursor(TraceFile& tf, const Index& ix, std::vector<size_t> blocks, uint64_t fromTs, uint64_t toTs)
+      : m_tf(tf), m_ix(ix), m_blocks(std::move(blocks)), m_from(fromTs), m_to(toTs)
+  {
+  }
+
+  const Record* peek()
+  {
+    while (m_ci >= m_cur.size()) {
+      if (!loadNext()) return nullptr;
+    }
+    return &m_cur[m_ci];
+  }
+  void advance() { ++m_ci; }
+
+private:
+  bool loadNext()
+  {
+    m_cur.clear();
+    m_ci = 0;
+    while (m_cur.empty()) {
+      if (m_bi >= m_blocks.size()) return false;
+      const Block& b = m_ix.blocks[m_blocks[m_bi++]];
+      if (b.lastTs < m_from) continue;
+      if (b.firstTs >= m_to) { m_bi = m_blocks.size(); return false; }
+      const uint8_t* data = m_tf.get(b.offset, b.size, m_scratch);
+      if (!data) { m_bi = m_blocks.size(); return false; }
+      size_t off = 0;
+      while (off < b.size) {
+        Record r;
+        const size_t n = decodeRecord(data + off, b.size - off, r);
+        if (n == 0) break;
+        off += n;
+        if (r.op == Op::StringDef || r.ts < m_from) continue;
+        if (r.ts >= m_to) { m_bi = m_blocks.size(); break; }
+        m_cur.push_back(std::move(r));
+      }
+    }
+    return true;
+  }
+
+  TraceFile& m_tf;
+  const Index& m_ix;
+  std::vector<size_t> m_blocks;
+  uint64_t m_from, m_to;
+  size_t m_bi = 0;
+  std::vector<Record> m_cur;
+  size_t m_ci = 0;
+  std::vector<uint8_t> m_scratch;
+};
+
 class Pass
 {
 public:
-  Pass(const Trace& t, const Options& o) : m_t(t), m_o(o), m_insts(new Inst[std::max(t.instances, 1)]) {}
+  Pass(TraceFile& tf, const Index& ix, const Options& o)
+      : m_tf(tf), m_ix(ix), m_o(o), m_insts(new Inst[std::max<size_t>(ix.creates.size(), 1)])
+  {
+    const double f = (double)ix.hdr.qpcFreq;
+    m_fromTs = ix.minTs + (uint64_t)(o.fromSec * f);
+    m_toTs = ~0ull;
+    double to = o.toSec;
+    if (o.limitSec >= 0) to = (to < 0) ? o.fromSec + o.limitSec : std::min(to, o.fromSec + o.limitSec);
+    if (to >= 0) m_toTs = ix.minTs + (uint64_t)(to * f);
+  }
+
+  uint64_t fromTs() const { return m_fromTs; }
+  uint64_t toTs() const { return m_toTs; }
+
+  // planned number of ops (blocks overlapping the window; an upper bound)
+  uint64_t planned() const { return m_planned; }
+  uint64_t done() const
+  {
+    uint64_t d = 0;
+    for (size_t i = 0; i < m_nProgress; ++i) d += m_progress[i].load(std::memory_order_relaxed);
+    return d;
+  }
 
   std::vector<ThreadStats> run(uint64_t& wallTicks)
   {
-    std::vector<std::vector<size_t>> lists;
-    if (m_o.singleThread) {
-      std::vector<size_t> all(m_t.recs.size());
-      for (size_t i = 0; i < all.size(); ++i) all[i] = i;
-      lists.push_back(std::move(all));
-    } else {
-      for (auto& [tid, idx] : m_t.perThread) lists.push_back(idx);
+    std::map<uint32_t, std::vector<size_t>> perThread;
+    for (size_t i = 0; i < m_ix.blocks.size(); ++i) {
+      const Block& b = m_ix.blocks[i];
+      if (b.lastTs < m_fromTs || b.firstTs >= m_toTs) continue;
+      perThread[b.tid].push_back(i);
+      m_planned += b.count;
+    }
+    for (auto& [tid, v] : perThread)
+      std::stable_sort(v.begin(), v.end(), [&](size_t a, size_t b) { return m_ix.blocks[a].firstTs < m_ix.blocks[b].firstTs; });
+
+    preOpen();
+
+    std::vector<std::unique_ptr<Cursor>> cursors;
+    std::vector<uint32_t> tids;
+    for (auto& [tid, v] : perThread) {
+      cursors.push_back(std::make_unique<Cursor>(m_tf, m_ix, v, m_fromTs, m_toTs));
+      tids.push_back(tid);
     }
 
-    std::vector<ThreadStats> stats(lists.size());
-    std::vector<size_t> maxBuf(lists.size(), 0);
-    for (size_t i = 0; i < lists.size(); ++i) {
-      for (size_t idx : lists[i]) {
-        const Record& r = m_t.recs[idx];
-        maxBuf[i] = std::max<size_t>(maxBuf[i], std::max(r.a, r.b));
-        if (r.op == Op::ProfString || r.op == Op::ProfSection)
-          maxBuf[i] = std::max<size_t>(maxBuf[i], r.c * sizeof(wchar_t) + 16);
-      }
-      stats[i].tid = m_o.singleThread ? 0 : m_t.recs[lists[i].front()].tid;
-    }
+    const size_t nThreads = m_o.singleThread ? 1 : cursors.size();
+    std::vector<ThreadStats> stats(nThreads);
+    m_progress.reset(new std::atomic<uint64_t>[std::max<size_t>(nThreads, 1)]);
+    m_nProgress = nThreads;
+    for (size_t i = 0; i < nThreads; ++i) m_progress[i] = 0;
 
-    std::latch ready((ptrdiff_t)lists.size());
+    std::latch ready((ptrdiff_t)nThreads);
     std::atomic<bool> go{false};
     std::vector<std::thread> threads;
-    for (size_t i = 0; i < lists.size(); ++i) {
+    for (size_t i = 0; i < nThreads; ++i) {
+      stats[i].tid = m_o.singleThread ? 0 : tids[i];
       threads.emplace_back([&, i] {
-        std::vector<uint8_t> buf(maxBuf[i] + 64);  // pre-sized: not part of the timing
+        if (m_o.singleThread) {
+          for (auto& c : cursors) c->peek();
+        } else {
+          cursors[i]->peek();  // first block decoded before the clock starts
+        }
         ready.count_down();
         while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
-        runThread(lists[i], buf, stats[i]);
+        if (m_o.singleThread) runMerged(cursors, stats[i], i);
+        else runThread(*cursors[i], stats[i], i);
       });
     }
     ready.wait();
@@ -290,10 +505,78 @@ public:
   }
 
 private:
+  // handles that were already open when the window starts are opened up front
+  void preOpen()
+  {
+    if (m_fromTs <= m_ix.minTs) return;
+    ThreadStats ts;
+    std::vector<uint8_t> buf(4096);
+    uint64_t opened = 0, total = 0;
+    for (size_t k = 0; k < m_ix.creates.size(); ++k) {
+      const CreateInfo& c = m_ix.creates[k];
+      if (c.ts >= m_fromTs) continue;  // replayed by its thread
+      auto it = std::lower_bound(m_ix.closes.begin(), m_ix.closes.end(), std::make_pair(c.h, c.exit));
+      if (it != m_ix.closes.end() && it->first == c.h && it->second < m_fromTs) continue;  // closed before
+      ++total;
+      Record r;
+      r.op = c.op; r.ts = c.ts; r.dur = c.exit - c.ts; r.h = c.h; r.h2 = c.h2;
+      r.a = c.a; r.b = c.b; r.c = c.c; r.d = c.d; r.e = c.e; r.str = c.str;
+      r.status = 0;
+      exec(r, buf, nullptr, ts, true);
+      if (m_insts[k].live.load()) ++opened;
+    }
+    logf("window starts at +%.1fs: re-opened %llu of %llu handles that were open at that point",
+         (double)(m_fromTs - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, (unsigned long long)opened,
+         (unsigned long long)total);
+  }
+
+  void runThread(Cursor& cur, ThreadStats& ts, size_t slot)
+  {
+    HANDLE event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::vector<uint8_t> buf(4096);
+    ts.startTicks = qpcNow();
+    while (const Record* r = cur.peek()) {
+      step(*r, buf, event, ts, slot);
+      cur.advance();
+    }
+    ts.endTicks = qpcNow();
+    ::CloseHandle(event);
+  }
+
+  // all recorded threads serially, in timestamp order
+  void runMerged(std::vector<std::unique_ptr<Cursor>>& cursors, ThreadStats& ts, size_t slot)
+  {
+    HANDLE event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::vector<uint8_t> buf(4096);
+    auto cmp = [&](size_t a, size_t b) { return cursors[a]->peek()->ts > cursors[b]->peek()->ts; };
+    std::priority_queue<size_t, std::vector<size_t>, decltype(cmp)> heap(cmp);
+    for (size_t i = 0; i < cursors.size(); ++i) if (cursors[i]->peek()) heap.push(i);
+    ts.startTicks = qpcNow();
+    while (!heap.empty()) {
+      const size_t i = heap.top();
+      heap.pop();
+      step(*cursors[i]->peek(), buf, event, ts, slot);
+      cursors[i]->advance();
+      if (cursors[i]->peek()) heap.push(i);
+    }
+    ts.endTicks = qpcNow();
+    ::CloseHandle(event);
+  }
+
+  void step(const Record& r, std::vector<uint8_t>& buf, HANDLE event, ThreadStats& ts, size_t slot)
+  {
+    if (m_o.timingOriginal) waitUntil(r.ts);
+    OpStat& os = ts.op[(int)r.op];
+    ++os.recCount;
+    os.recTicks += r.dur;
+    exec(r, buf, event, ts, false);
+    m_progress[slot].store(ts.ops + ts.skipped + ts.unmapped, std::memory_order_relaxed);
+  }
+
   void waitUntil(uint64_t recTs)
   {
-    const double scale = (double)qpcFreq() / (double)m_t.hdr.qpcFreq;
-    const uint64_t due = m_start + (uint64_t)((double)(recTs - m_t.minTs) * scale);
+    const double scale = (double)qpcFreq() / (double)m_ix.hdr.qpcFreq;
+    const uint64_t due = m_start + (uint64_t)((double)(recTs - std::max(m_fromTs, m_ix.minTs)) * scale);
     for (;;) {
       const uint64_t now = qpcNow();
       if (now >= due) return;
@@ -310,7 +593,10 @@ private:
     Inst& in = m_insts[id];
     const uint64_t t0 = qpcNow();
     while (!in.resolved.load(std::memory_order_acquire)) {
-      if (ticksToUs(qpcNow() - t0) > 30e6) break;  // never opened (30 s)
+      if (ticksToUs(qpcNow() - t0) > 30e6) {  // never opened: don't wait again
+        in.resolved.store(true, std::memory_order_release);
+        break;
+      }
       std::this_thread::yield();
     }
     HANDLE h = in.live.load(std::memory_order_acquire);
@@ -318,24 +604,21 @@ private:
     return h;
   }
 
-  void note(ThreadStats& ts, const Record& r, size_t idx, NTSTATUS got, const char* what)
+  void note(ThreadStats& ts, const Record& r, NTSTATUS got, const char* what)
   {
     OpStat& s = ts.op[(int)r.op];
     if ((uint32_t)got != r.status) {
       ++s.diffs;
       if (ts.samples.size() < 20) {
         char b[160];
-        std::snprintf(b, sizeof(b), "%s rec#%zu tid %u: %s recorded 0x%08x got 0x%08x", opName(r.op),
-                      idx, r.tid, what, r.status, (uint32_t)got);
+        std::snprintf(b, sizeof(b), "%s tid %u ts +%.2fs: %s recorded 0x%08x got 0x%08x", opName(r.op), r.tid,
+                      (double)(r.ts - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, what, r.status, (uint32_t)got);
         ts.samples.push_back(b);
       }
     }
   }
 
-  const wchar_t* str(uint32_t id) const
-  {
-    return id && id < m_t.strings.size() ? m_t.strings[id].c_str() : nullptr;
-  }
+  const wchar_t* str(uint32_t id) const { return m_ix.strings.get(id); }
 
   static std::string toAnsi(const wchar_t* w)
   {
@@ -350,56 +633,47 @@ private:
     OBJECT_ATTRIBUTES oa{};
   };
 
-  bool makeName(const Record& r, size_t idx, ThreadStats& ts, Name& n, int rootId)
+  bool makeName(const Record& r, ThreadStats& ts, Name& n)
   {
     HANDLE root = nullptr;
     if (r.h2) {
-      root = resolve(rootId, ts);
+      root = resolve(m_ix.lookup(r.h2, r.ts), ts);
       if (!root) return false;
     }
-    const std::wstring* s = nullptr;
-    if (r.str && r.str < m_t.strings.size()) s = &m_t.strings[r.str];
+    const wchar_t* s = str(r.str);
     if (s) {
-      n.us.Buffer = const_cast<PWSTR>(s->c_str());
-      n.us.Length = (USHORT)(s->size() * sizeof(WCHAR));
+      n.us.Buffer = const_cast<PWSTR>(s);
+      n.us.Length = m_ix.strings.bytes(r.str);
       n.us.MaximumLength = n.us.Length + sizeof(WCHAR);
     }
     n.oa.Length = sizeof(n.oa);
     n.oa.RootDirectory = root;
     n.oa.ObjectName = s ? &n.us : nullptr;
     n.oa.Attributes = kObjCaseInsensitive;
-    (void)idx;
     return true;
   }
 
-  void runThread(const std::vector<size_t>& list, std::vector<uint8_t>& buf, ThreadStats& ts)
+  static void need(std::vector<uint8_t>& buf, size_t n)
   {
-    HANDLE event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    ts.startTicks = qpcNow();
-    for (size_t idx : list) {
-      const Record& r = m_t.recs[idx];
-      if (m_o.timingOriginal) waitUntil(r.ts);
-      exec(r, idx, buf, event, ts);
-    }
-    ts.endTicks = qpcNow();
-    ::CloseHandle(event);
+    if (buf.size() < n + 64) buf.resize(n + 64);
   }
 
-  void exec(const Record& r, size_t idx, std::vector<uint8_t>& buf, HANDLE event, ThreadStats& ts)
+  void exec(const Record& r, std::vector<uint8_t>& buf, HANDLE event, ThreadStats& ts, bool preopen)
   {
     IO_STATUS_BLOCK iosb{};
     NTSTATUS st = 0;
     uint64_t t0 = 0, t1 = 0;
     OpStat& os = ts.op[(int)r.op];
+    int self = -1;  // instance of r.h (creates: the one this call produced)
+    if (r.op != Op::FindFirst && r.h) self = m_ix.lookup(r.h, (r.op == Op::Create || r.op == Op::Open) ? r.ts + r.dur : r.ts);
 
     switch (r.op) {
     case Op::Create:
     case Op::Open: {
-      const int own = m_t.ownInst[idx];
       Name n;
-      if (!makeName(r, idx, ts, n, m_t.rootOf[idx]) || (!m_o.allowWrites && isWriteIntent(r))) {
+      if (!makeName(r, ts, n) || (!m_o.allowWrites && isWriteIntent(r))) {
         ++ts.skipped;
-        if (own >= 0) m_insts[own].resolved.store(true, std::memory_order_release);
+        if (self >= 0) m_insts[self].resolved.store(true, std::memory_order_release);
         return;
       }
       HANDLE h = nullptr;
@@ -410,8 +684,8 @@ private:
       else
         st = NtOpenFile(&h, (ACCESS_MASK)r.a, &n.oa, &iosb, (ULONG)r.b, (ULONG)r.d);
       t1 = qpcNow();
-      if (own >= 0) {
-        Inst& in = m_insts[own];
+      if (self >= 0) {
+        Inst& in = m_insts[self];
         if (st >= 0) {
           in.sync = (r.d & 0x30) != 0;
           in.live.store(h, std::memory_order_release);
@@ -420,15 +694,16 @@ private:
       } else if (st >= 0 && h) {
         NtClose(h);  // succeeded now, failed when recorded
       }
-      note(ts, r, idx, st, "path");
+      if (!preopen) note(ts, r, st, "path");
       break;
     }
     case Op::Read: {
-      HANDLE h = resolve(m_t.instOf[idx], ts);
+      HANDLE h = resolve(self, ts);
       if (!h) return;
+      need(buf, r.a);
       LARGE_INTEGER off;
       off.QuadPart = r.off;
-      const bool sync = m_insts[m_t.instOf[idx]].sync;
+      const bool sync = m_insts[self].sync;
       if (!sync) ::ResetEvent(event);
       t0 = qpcNow();
       st = NtReadFile(h, sync ? nullptr : event, nullptr, nullptr, &iosb, buf.data(), (ULONG)r.a,
@@ -438,7 +713,7 @@ private:
         st = iosb.Status;
       }
       t1 = qpcNow();
-      note(ts, r, idx, st, "read");
+      note(ts, r, st, "read");
       if (m_o.verify && r.hasCrc && st >= 0) {
         ++ts.verifyChecked;
         const uint32_t crc = crc32Update(0, buf.data(), iosb.Information);
@@ -446,9 +721,9 @@ private:
           ++ts.verifyMismatch;
           if (ts.samples.size() < 20) {
             char b[200];
-            std::snprintf(b, sizeof(b), "verify rec#%zu tid %u: len %llu off %lld recorded crc %08x/%llu got %08x/%llu",
-                          idx, r.tid, (unsigned long long)r.a, (long long)r.off, r.crc,
-                          (unsigned long long)r.info, crc, (unsigned long long)iosb.Information);
+            std::snprintf(b, sizeof(b), "verify tid %u ts +%.2fs: len %llu off %lld recorded crc %08x/%llu got %08x/%llu",
+                          r.tid, (double)(r.ts - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, (unsigned long long)r.a,
+                          (long long)r.off, r.crc, (unsigned long long)r.info, crc, (unsigned long long)iosb.Information);
             ts.samples.push_back(b);
           }
         }
@@ -456,36 +731,38 @@ private:
       break;
     }
     case Op::QueryInfo: {
-      HANDLE h = resolve(m_t.instOf[idx], ts);
+      HANDLE h = resolve(self, ts);
       if (!h) return;
+      need(buf, r.b);
       t0 = qpcNow();
       st = NtQueryInformationFile(h, &iosb, buf.data(), (ULONG)r.b, (FILE_INFORMATION_CLASS)r.a);
       t1 = qpcNow();
-      note(ts, r, idx, st, "queryinfo");
+      note(ts, r, st, "queryinfo");
       break;
     }
     case Op::SetInfo: {
       // only the file position; renames/deletes/etc. must not touch the data
       if ((FILE_INFORMATION_CLASS)r.a != FilePositionInformation) { ++ts.skipped; return; }
-      HANDLE h = resolve(m_t.instOf[idx], ts);
+      HANDLE h = resolve(self, ts);
       if (!h) return;
       FILE_POSITION_INFORMATION pi;
       pi.CurrentByteOffset.QuadPart = r.off;
       t0 = qpcNow();
       st = NtSetInformationFile(h, &iosb, &pi, sizeof(pi), FilePositionInformation);
       t1 = qpcNow();
-      note(ts, r, idx, st, "setpos");
+      note(ts, r, st, "setpos");
       break;
     }
     case Op::QueryDir:
     case Op::QueryDirEx: {
-      HANDLE h = resolve(m_t.instOf[idx], ts);
+      HANDLE h = resolve(self, ts);
       if (!h) return;
+      need(buf, r.b);
       UNICODE_STRING mask{};
       PUNICODE_STRING pm = nullptr;
-      if (r.str && r.str < m_t.strings.size()) {
-        mask.Buffer = const_cast<PWSTR>(m_t.strings[r.str].c_str());
-        mask.Length = (USHORT)(m_t.strings[r.str].size() * sizeof(WCHAR));
+      if (const wchar_t* m = str(r.str)) {
+        mask.Buffer = const_cast<PWSTR>(m);
+        mask.Length = m_ix.strings.bytes(r.str);
         mask.MaximumLength = mask.Length + sizeof(WCHAR);
         pm = &mask;
       }
@@ -497,30 +774,29 @@ private:
         st = NtQueryDirectoryFileEx(h, nullptr, nullptr, nullptr, &iosb, buf.data(), (ULONG)r.b,
                                     (FILE_INFORMATION_CLASS)r.a, (ULONG)r.c, pm);
       t1 = qpcNow();
-      note(ts, r, idx, st, "querydir");
+      note(ts, r, st, "querydir");
       break;
     }
     case Op::QueryAttr:
     case Op::QueryFullAttr: {
       Name n;
-      if (!makeName(r, idx, ts, n, m_t.rootOf[idx])) { ++ts.skipped; return; }
+      if (!makeName(r, ts, n)) { ++ts.skipped; return; }
       FILE_BASIC_INFORMATION bi;
       FILE_NETWORK_OPEN_INFORMATION ni;
       t0 = qpcNow();
       st = r.op == Op::QueryAttr ? NtQueryAttributesFile(&n.oa, &bi) : NtQueryFullAttributesFile(&n.oa, &ni);
       t1 = qpcNow();
-      note(ts, r, idx, st, "attr");
+      note(ts, r, st, "attr");
       break;
     }
     case Op::Close: {
-      const int id = m_t.instOf[idx];
-      HANDLE h = resolve(id, ts);
+      HANDLE h = resolve(self, ts);
       if (!h) return;
       t0 = qpcNow();
       st = NtClose(h);
       t1 = qpcNow();
-      m_insts[id].live.store(nullptr, std::memory_order_release);
-      note(ts, r, idx, st, "close");
+      m_insts[self].live.store(nullptr, std::memory_order_release);
+      note(ts, r, st, "close");
       break;
     }
     case Op::GetAttr:
@@ -532,13 +808,13 @@ private:
         t0 = qpcNow();
         st = (NTSTATUS)::GetFileAttributesW(path);
         t1 = qpcNow();
-        note(ts, r, idx, st, "getattr");
+        note(ts, r, st, "getattr");
       } else if (r.op == Op::GetAttrEx) {
         WIN32_FILE_ATTRIBUTE_DATA d;
         t0 = qpcNow();
         const BOOL ok = ::GetFileAttributesExW(path, (GET_FILEEX_INFO_LEVELS)r.a, &d);
         t1 = qpcNow();
-        note(ts, r, idx, ok ? 1 : 0, "getattrex");
+        note(ts, r, ok ? 1 : 0, "getattrex");
       } else {
         // the app's enumeration is replayed to its end (FindNext/FindClose are not hooked)
         WIN32_FIND_DATAW fd;
@@ -550,7 +826,7 @@ private:
           ::FindClose(fh);
         }
         t1 = qpcNow();
-        note(ts, r, idx, fh != INVALID_HANDLE_VALUE ? 1 : 0, "findfirst");
+        note(ts, r, fh != INVALID_HANDLE_VALUE ? 1 : 0, "findfirst");
       }
       break;
     }
@@ -561,6 +837,7 @@ private:
       const wchar_t* key = str((uint32_t)r.b);
       if (!file) { ++ts.skipped; return; }
       const DWORD n = (DWORD)r.c;
+      need(buf, (size_t)n * sizeof(wchar_t) + 16);
       DWORD got;
       if (r.d) {  // the app called the ANSI function
         const std::string f = toAnsi(file), a = app ? toAnsi(app) : std::string(), k = key ? toAnsi(key) : std::string();
@@ -576,7 +853,7 @@ private:
                   : ::GetPrivateProfileSectionW(app, (wchar_t*)buf.data(), n, file);
       }
       t1 = qpcNow();
-      note(ts, r, idx, (NTSTATUS)got, "profile");
+      note(ts, r, (NTSTATUS)got, "profile");
       break;
     }
     case Op::WriteMarker:
@@ -585,40 +862,66 @@ private:
     default:
       return;
     }
+    if (preopen) return;
     ++ts.ops;
     ++os.count;
     os.ticks += t1 - t0;
     ts.busyTicks += t1 - t0;
   }
 
-  const Trace& m_t;
+  TraceFile& m_tf;
+  const Index& m_ix;
   const Options& m_o;
   std::unique_ptr<Inst[]> m_insts;
-  uint64_t m_start = 0;
+  std::unique_ptr<std::atomic<uint64_t>[]> m_progress;
+  size_t m_nProgress = 0;
+  uint64_t m_fromTs = 0, m_toTs = ~0ull, m_start = 0, m_planned = 0;
 };
 
 // child: one pass, results as simple "key value" lines for the parent
 int runChild(const Options& o)
 {
-  Trace t;
-  std::string err;
-  if (!loadTrace(o.tracePath, t, err)) {
-    std::fprintf(stderr, "replay: %s\n", err.c_str());
-    return 2;
+  g_role = "child";
+  g_logPath = o.logPath;
+  logf("child start: trace %s, timing %s%s%s", toUtf8(o.tracePath).c_str(), o.timingOriginal ? "original" : "asap",
+       o.verify ? ", verify" : "", o.singleThread ? ", single-thread" : "");
+  for (const char* v : {"USVFS_READCACHE", "USVFS_READCACHE_ASYNC", "USVFS_READCACHE_SPLIT", "USVFS_READCACHE_RA", "USVFS_METACACHE"}) {
+    char b[64];
+    const DWORD n = ::GetEnvironmentVariableA(v, b, sizeof(b));
+    logf("  env %s=%s", v, n && n < sizeof(b) ? b : "(unset)");
   }
 
-  if (t.recs.empty()) {
-    std::fprintf(stderr, "replay: trace holds no records\n");
-    return 2;
-  }
+  TraceFile tf;
+  if (!tf.open(o.tracePath)) return 2;
+  const bool windowed = o.fromSec > 0;
+  Index ix;
+  logf("indexing %.0f MB trace ...", (double)tf.size() / 1048576.0);
+  if (!buildIndex(tf, windowed, ix)) return 2;
+  if (ix.records == 0) { logf("trace holds no records"); return 2; }
+  logf("indexed: %llu records in %zu blocks, %zu successful opens, %.1f s of trace, %.0f MB peak working set",
+       (unsigned long long)ix.records, ix.blocks.size(), ix.creates.size(),
+       (double)(ix.maxTs - ix.minTs) / (double)ix.hdr.qpcFreq, peakWorkingSetMb());
 
-  Pass pass(t, o);
+  Pass pass(tf, ix, o);
+  std::atomic<bool> stopMonitor{false};
   uint64_t wall = 0;
+  const uint64_t t0 = qpcNow();
+  std::thread monitor([&] {
+    uint64_t last = qpcNow();
+    while (!stopMonitor.load()) {
+      ::Sleep(200);
+      if (ticksToUs(qpcNow() - last) < 5e6) continue;
+      last = qpcNow();
+      logf("progress: %llu of ~%llu ops, %.0f s elapsed, %.0f MB peak working set",
+           (unsigned long long)pass.done(), (unsigned long long)pass.planned(), ticksToUs(qpcNow() - t0) / 1e6,
+           peakWorkingSetMb());
+    }
+  });
   std::vector<ThreadStats> stats = pass.run(wall);
+  stopMonitor = true;
+  monitor.join();
 
   OpStat total[kOpCount];
-  uint64_t recordedTicks[kOpCount] = {};
-  uint64_t recordedCount[kOpCount] = {};
   uint64_t skipped = 0, unmapped = 0, vc = 0, vm = 0;
   for (auto& s : stats) {
     skipped += s.skipped;
@@ -629,27 +932,26 @@ int runChild(const Options& o)
       total[i].count += s.op[i].count;
       total[i].ticks += s.op[i].ticks;
       total[i].diffs += s.op[i].diffs;
+      total[i].recCount += s.op[i].recCount;
+      total[i].recTicks += s.op[i].recTicks;
     }
   }
-  const double recScale = 1e6 / (double)t.hdr.qpcFreq;
-  for (auto& r : t.recs) {
-    recordedTicks[(int)r.op] += r.dur;
-    ++recordedCount[(int)r.op];
-  }
+  const double recScale = 1e6 / (double)ix.hdr.qpcFreq;
 
   std::ofstream f(o.childResult, std::ios::binary | std::ios::trunc);
-  if (!f) { std::fprintf(stderr, "replay: cannot write result file\n"); return 3; }
+  if (!f) { logf("cannot write result file %s", toUtf8(o.childResult).c_str()); return 3; }
   f << "wall_us " << (uint64_t)ticksToUs(wall) << "\n";
-  f << "recorded_ops " << t.recs.size() << "\n";
+  f << "recorded_ops " << pass.planned() << "\n";
   f << "skipped " << skipped << "\n";
   f << "unmapped " << unmapped << "\n";
   f << "verify_checked " << vc << "\n";
   f << "verify_mismatches " << vm << "\n";
+  f << "peak_ws_mb " << (uint64_t)peakWorkingSetMb() << "\n";
   uint64_t diffs = 0;
   for (int i = 2; i < kOpCount; ++i) {
     diffs += total[i].diffs;
     f << "op " << opName((Op)i) << " " << total[i].count << " " << (uint64_t)ticksToUs(total[i].ticks)
-      << " " << total[i].diffs << " " << recordedCount[i] << " " << (uint64_t)((double)recordedTicks[i] * recScale)
+      << " " << total[i].diffs << " " << total[i].recCount << " " << (uint64_t)((double)total[i].recTicks * recScale)
       << "\n";
   }
   f << "status_diffs " << diffs << "\n";
@@ -658,11 +960,14 @@ int runChild(const Options& o)
       << (uint64_t)ticksToUs(s.endTicks - s.startTicks) << "\n";
   for (auto& s : stats)
     for (auto& x : s.samples) f << "sample " << x << "\n";
+  logf("child done: wall %.1f ms, skipped %llu, unmapped %llu, status diffs %llu, verify mismatches %llu, %.0f MB peak working set",
+       ticksToUs(wall) / 1000.0, (unsigned long long)skipped, (unsigned long long)unmapped, (unsigned long long)diffs,
+       (unsigned long long)vm, peakWorkingSetMb());
   return 0;
 }
 
 // ---------------------------------------------------------------------------
-// parent
+// parent (never touches the trace)
 
 struct OpResult { std::string name; uint64_t count = 0, us = 0, diffs = 0, recCount = 0, recUs = 0; };
 struct ThreadResult { uint64_t tid = 0, ops = 0, busyUs = 0, spanUs = 0; };
@@ -675,6 +980,7 @@ struct Result {
   std::vector<OpResult> ops;
   std::vector<ThreadResult> threads;
   std::vector<std::string> samples;
+  uint64_t sc(const char* k) const { auto it = scalars.find(k); return it == scalars.end() ? 0 : it->second; }
 };
 
 void parseResult(const std::wstring& path, Result& r)
@@ -717,6 +1023,7 @@ bool startsWithNoCase(const std::wstring& s, const wchar_t* prefix)
   return _wcsnicmp(s.c_str(), prefix, wcslen(prefix)) == 0;
 }
 
+// UTF-16 environment block: "NAME=VALUE\0...\0\0", sorted by name
 std::vector<wchar_t> buildEnv(const Config& c, bool inherit)
 {
   std::vector<std::wstring> entries;
@@ -748,28 +1055,47 @@ bool runConfig(const Options& o, const Config& c, size_t index, Result& res)
 {
   res.cfg = c;
   const std::wstring resultFile = o.outPath + L".cfg" + std::to_wstring(index) + L".tmp";
+  ::DeleteFileW(resultFile.c_str());
+  wchar_t num[32];
+  std::swprintf(num, 32, L"%g", o.fromSec);
   std::wstring cmd = quote(selfPath()) + L" " + quote(o.tracePath) + L" --child " + quote(resultFile) +
-                     L" --timing " + (o.timingOriginal ? L"original" : L"asap");
+                     L" --log " + quote(o.logPath) + L" --timing " + (o.timingOriginal ? L"original" : L"asap") +
+                     L" --from " + num;
+  if (o.toSec >= 0) { std::swprintf(num, 32, L"%g", o.toSec); cmd += std::wstring(L" --to ") + num; }
+  if (o.limitSec >= 0) { std::swprintf(num, 32, L"%g", o.limitSec); cmd += std::wstring(L" --limit-seconds ") + num; }
   if (o.verify) cmd += L" --verify";
   if (o.singleThread) cmd += L" --single-thread";
   if (o.allowWrites) cmd += L" --allow-writes";
 
   std::vector<wchar_t> env = buildEnv(c, o.inheritEnv);
+  logf("config '%s': spawning child, command line %zu chars, environment %zu chars (%zu overrides)",
+       c.name.c_str(), cmd.size(), env.size(), c.env.size());
+  for (auto& kv : c.env) logf("  %s=%s", toUtf8(kv.first).c_str(), toUtf8(kv.second).c_str());
+
   STARTUPINFOW si{};
   si.cb = sizeof(si);
   PROCESS_INFORMATION pi{};
   const uint64_t t0 = qpcNow();
-  if (!::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_UNICODE_ENVIRONMENT,
-                        env.data(), nullptr, &si, &pi)) {
-    std::fprintf(stderr, "replay: CreateProcess failed (%lu)\n", ::GetLastError());
-    return false;
+  bool started = false;
+  for (int attempt = 1; attempt <= 3 && !started; ++attempt) {
+    // normal CreateProcessW: the usvfs hooks inject the child
+    started = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT,
+                               env.data(), nullptr, &si, &pi) != 0;
+    if (!started) {
+      logf("CreateProcessW failed (attempt %d): %s; working set peak %.0f MB", attempt,
+           lastErrorText(::GetLastError()).c_str(), peakWorkingSetMb());
+      if (attempt < 3) ::Sleep(3000);
+    }
   }
+  if (!started) { res.exitCode = 0xFFFFFFFF; return false; }
   ::WaitForSingleObject(pi.hProcess, INFINITE);
   ::GetExitCodeProcess(pi.hProcess, &res.exitCode);
   ::CloseHandle(pi.hThread);
   ::CloseHandle(pi.hProcess);
   res.processMs = ticksToUs(qpcNow() - t0) / 1000.0;
+  logf("config '%s': child exited with code 0x%08lx after %.1f s", c.name.c_str(), res.exitCode, res.processMs / 1000.0);
   if (res.exitCode == 0) parseResult(resultFile, res);
+  else logf("config '%s': no results (child crashed or failed; see the child lines above)", c.name.c_str());
   ::DeleteFileW(resultFile.c_str());
   return res.exitCode == 0;
 }
@@ -790,20 +1116,22 @@ std::string writeJson(const Options& o, const std::vector<Result>& results)
   std::ostringstream j;
   j << "{\n  \"trace\": \"" << jsonEscape(toUtf8(o.tracePath)) << "\",\n  \"timing\": \""
     << (o.timingOriginal ? "original" : "asap") << "\",\n  \"verify\": " << (o.verify ? "true" : "false")
+    << ",\n  \"from_s\": " << o.fromSec << ",\n  \"to_s\": " << o.toSec << ",\n  \"limit_s\": " << o.limitSec
     << ",\n  \"configs\": [\n";
   for (size_t i = 0; i < results.size(); ++i) {
     const Result& r = results[i];
-    auto sc = [&](const char* k) { auto it = r.scalars.find(k); return it == r.scalars.end() ? 0ull : (unsigned long long)it->second; };
+    auto sc = [&](const char* k) { return (unsigned long long)r.sc(k); };
     j << "    {\n      \"name\": \"" << jsonEscape(r.cfg.name) << "\",\n      \"env\": {";
     for (size_t k = 0; k < r.cfg.env.size(); ++k)
       j << (k ? ", " : "") << "\"" << jsonEscape(toUtf8(r.cfg.env[k].first)) << "\": \""
         << jsonEscape(toUtf8(r.cfg.env[k].second)) << "\"";
     j << "},\n      \"exit_code\": " << r.exitCode << ",\n      \"process_ms\": " << r.processMs
-      << ",\n      \"wall_us\": " << sc("wall_us") << ",\n      \"recorded_ops\": " << sc("recorded_ops")
+      << ",\n      \"wall_us\": " << sc("wall_us") << ",\n      \"planned_ops\": " << sc("recorded_ops")
       << ",\n      \"skipped\": " << sc("skipped") << ",\n      \"unmapped\": " << sc("unmapped")
       << ",\n      \"verify_checked\": " << sc("verify_checked")
       << ",\n      \"verify_mismatches\": " << sc("verify_mismatches")
-      << ",\n      \"status_diffs\": " << sc("status_diffs") << ",\n      \"ops\": {";
+      << ",\n      \"status_diffs\": " << sc("status_diffs") << ",\n      \"peak_ws_mb\": " << sc("peak_ws_mb")
+      << ",\n      \"ops\": {";
     for (size_t k = 0; k < r.ops.size(); ++k) {
       const OpResult& x = r.ops[k];
       j << (k ? ",\n        " : "\n        ") << "\"" << x.name << "\": {\"count\": " << x.count
@@ -828,19 +1156,19 @@ std::string table(const std::vector<Result>& results)
 {
   std::string out;
   char b[256];
-  std::snprintf(b, sizeof(b), "%-18s %10s %9s %9s %9s %9s %5s\n", "config", "wall_ms", "ops", "skipped",
-                "mismatch", "stat_diff", "exit");
+  std::snprintf(b, sizeof(b), "%-18s %10s %9s %9s %9s %9s %9s %7s %5s\n", "config", "wall_ms", "ops", "skipped",
+                "unmapped", "mismatch", "stat_diff", "peakMB", "exit");
   out += b;
   for (const Result& r : results) {
-    auto sc = [&](const char* k) { auto it = r.scalars.find(k); return it == r.scalars.end() ? 0ull : (unsigned long long)it->second; };
     uint64_t ops = 0;
     for (auto& x : r.ops) ops += x.count;
-    std::snprintf(b, sizeof(b), "%-18.18s %10.1f %9llu %9llu %9llu %9llu %5lu\n", r.cfg.name.c_str(),
-                  sc("wall_us") / 1000.0, (unsigned long long)ops, sc("skipped"), sc("verify_mismatches"),
-                  sc("status_diffs"), (unsigned long)r.exitCode);
+    std::snprintf(b, sizeof(b), "%-18.18s %10.1f %9llu %9llu %9llu %9llu %9llu %7llu %5lx\n", r.cfg.name.c_str(),
+                  r.sc("wall_us") / 1000.0, (unsigned long long)ops, (unsigned long long)r.sc("skipped"),
+                  (unsigned long long)r.sc("unmapped"), (unsigned long long)r.sc("verify_mismatches"),
+                  (unsigned long long)r.sc("status_diffs"), (unsigned long long)r.sc("peak_ws_mb"),
+                  (unsigned long)r.exitCode);
     out += b;
   }
-  // per op type: count and total time (ms) per config, plus what the game saw
   out += "\nper op type: count / total ms   (recorded = in the original run, with its caches)\n";
   std::snprintf(b, sizeof(b), "%-27s %20s", "op", "recorded");
   out += b;
@@ -882,7 +1210,11 @@ std::string table(const std::vector<Result>& results)
     out += "\n";
   }
   for (const Result& r : results) {
-    if (r.exitCode != 0) out += "config " + r.cfg.name + ": child failed, exit code " + std::to_string(r.exitCode) + "\n";
+    if (r.exitCode != 0) {
+      std::snprintf(b, sizeof(b), "config %s: child failed, exit code 0x%lx (see the .log)\n", r.cfg.name.c_str(),
+                    (unsigned long)r.exitCode);
+      out += b;
+    }
     for (auto& s : r.samples) out += "  [" + r.cfg.name + "] " + s + "\n";
   }
   return out;
@@ -893,6 +1225,7 @@ void usage()
   std::fputs(
       "usage: replay.exe <trace> [--timing asap|original] [--verify] [--threads-as-recorded]\n"
       "                  [--single-thread] [--allow-writes] [--inherit-env] [--out results.json]\n"
+      "                  [--from S] [--to S] [--limit-seconds N]\n"
       "                  [--config NAME KEY=VAL ...]...\n",
       stderr);
 }
@@ -913,7 +1246,11 @@ int wmain(int argc, wchar_t** argv)
     else if (a == L"--allow-writes") o.allowWrites = true;
     else if (a == L"--inherit-env") o.inheritEnv = true;
     else if (a == L"--out") o.outPath = next();
+    else if (a == L"--log") o.logPath = next();
     else if (a == L"--child") o.childResult = next();
+    else if (a == L"--from") o.fromSec = _wtof(next().c_str());
+    else if (a == L"--to") o.toSec = _wtof(next().c_str());
+    else if (a == L"--limit-seconds") o.limitSec = _wtof(next().c_str());
     else if (a == L"--config") {
       Config c;
       c.name = toUtf8(next());
@@ -932,12 +1269,19 @@ int wmain(int argc, wchar_t** argv)
   if (!o.childResult.empty()) return runChild(o);
 
   if (o.outPath.empty()) o.outPath = o.tracePath + L".results.json";
+  o.logPath = o.outPath + L".log";
+  g_logPath = o.logPath;
+  logf("replay start: trace %s, %zu config(s), window %g..%g s (limit %g), timing %s", toUtf8(o.tracePath).c_str(),
+       configs.size(), o.fromSec, o.toSec, o.limitSec, o.timingOriginal ? "original" : "asap");
+  if (::GetFileAttributesW(o.tracePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    logf("trace file not found: %s", lastErrorText(::GetLastError()).c_str());
+    return 1;
+  }
   if (configs.empty()) configs.push_back(Config{"default", {}});
 
   std::vector<Result> results(configs.size());
   for (size_t i = 0; i < configs.size(); ++i) {
-    std::printf("running config %s ...\n", configs[i].name.c_str());
-    std::fflush(stdout);
+    logf("running config %zu/%zu: %s", i + 1, configs.size(), configs[i].name.c_str());
     runConfig(o, configs[i], i, results[i]);
   }
 
@@ -946,7 +1290,7 @@ int wmain(int argc, wchar_t** argv)
   { std::ofstream f(o.outPath, std::ios::binary | std::ios::trunc); f << json; }
   { std::ofstream f(o.outPath + L".txt", std::ios::binary | std::ios::trunc); f << tab; }
   std::fputs(tab.c_str(), stdout);
-  std::printf("\nresults: %s\n", toUtf8(o.outPath).c_str());
+  logf("results: %s (table in .txt, log in .log)", toUtf8(o.outPath).c_str());
   for (auto& r : results) if (r.exitCode != 0) return 4;
   return 0;
 }
