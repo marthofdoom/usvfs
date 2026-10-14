@@ -57,6 +57,14 @@ jobs:
             "-property:GTEST_LIBDIR=..\googletest\build_${{ matrix.arch }}\lib\${{ matrix.config }}" `
             "-property:RunCodeAnalysis=false" `
             .\vsbuild\usvfs.sln
+      # fork: the Release DLL is what gets installed for testing
+      - if: matrix.tests == '' && matrix.config == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: usvfs-release_${{ matrix.arch }}
+          path: |
+            ./lib
+            ./bin
 
       - if: matrix.tests == 'Test' && matrix.config == 'Debug'
         uses: actions/upload-artifact@master
