@@ -2219,7 +2219,7 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
   } catch (...) {
     if (!t_ioStarted)
       throw;
-    return STATUS_UNSUCCESSFUL;  // unreachable in practice: see bigRead
+    return static_cast<NTSTATUS>(0xC0000001L);  // STATUS_UNSUCCESSFUL; unreachable in practice: see bigRead
   }
 }
 
