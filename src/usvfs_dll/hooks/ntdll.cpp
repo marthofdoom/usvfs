@@ -1056,7 +1056,12 @@ DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryObject(
 // FileNormalizedNameInformation and FileAllInformation). Fork: called by
 // impl_NtQueryInformationFile; viaReadcache routes the real call through the
 // read cache (shadow position of FileAllInformation) instead of ntdll directly.
-static NTSTATUS queryInformationFileRewrite(
+namespace usvfs {
+static NTSTATUS queryInformationFileRewrite(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
+                                            FILE_INFORMATION_CLASS, bool);
+}
+
+NTSTATUS usvfs::queryInformationFileRewrite(
     HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
     ULONG Length, FILE_INFORMATION_CLASS FileInformationClass, bool viaReadcache)
 {
