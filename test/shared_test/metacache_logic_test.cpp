@@ -319,3 +319,17 @@ TEST(MetaCacheStore, StaleResultFromBeforeAnInvalidationIsDropped)
   s.putListing(L"\\X", 37, L"*", l, false, gen2);
   EXPECT_EQ(nullptr, s.lookupListing(L"\\X", 37, L"*"));
 }
+
+TEST(MetaCacheListing, LiteralLookupByFoldedName)
+{
+  Listing l;
+  l.add(std::string(8, 'a'), L"Foo.ESP");
+  l.add(std::string(8, 'b'), L"bar.esm");
+  l.add(std::string(8, 'c'), L"foo.esp");  // same name, different case
+
+  const std::vector<uint32_t>* hit = l.findLiteral(normalizeMask(L"FOO.esp"));
+  ASSERT_NE(nullptr, hit);
+  EXPECT_EQ(2u, hit->size());
+  EXPECT_EQ(nullptr, l.findLiteral(normalizeMask(L"nothing")));
+  ASSERT_NE(nullptr, l.findLiteral(normalizeMask(L"BAR.ESM")));
+}

@@ -401,6 +401,14 @@ TEST(ReadCacheReadahead, WindowPlanning)
   EXPECT_EQ(0u, planWindow(0, 1 * M, 100 * M, 0).length);
 }
 
+TEST(ReadCacheReadahead, SmallReadsGetAtMostOneMegabyte)
+{
+  const uint64_t M = 1u << 20;
+  EXPECT_EQ(1 * M, planWindow(0, 600 * 1024, 100 * M, 64 * M).length);
+  EXPECT_EQ(512u * 1024, planWindow(0, 256 * 1024, 100 * M, 64 * M).length);
+  EXPECT_EQ(2 * M, planWindow(0, 1 * M, 100 * M, 64 * M).length);
+}
+
 TEST(ReadCacheReadahead, CoverageAndRenewal)
 {
   EXPECT_TRUE(windowCovers(100, 100, 100, 100));

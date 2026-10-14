@@ -206,6 +206,7 @@ struct HandleState
   std::mutex m;
   std::atomic<int> mode{kHandleNone};
   uint64_t shadowPos = 0;  // guarded by m
+  FileSnapshot snap;       // set during classification, immutable afterwards
   std::shared_ptr<CacheEntry> entry;
 
   // layer 3 (big reads); splitOk/key are set during classification, the rest is
@@ -233,6 +234,16 @@ struct BucketStats
   std::atomic<uint64_t> probationEnd{0};  // handles closed/left on probation
 };
 
+// what the system told us about a file at classification; valid for the whole
+// life of an eligible handle (read-only, and the cache key holds size and times)
+struct FileSnapshot
+{
+  int64_t fileId = 0, creation = 0, lastAccess = 0, written = 0, changed = 0;
+  int64_t allocation = 0, endOfFile = 0;
+  ULONG attributes = 0, reparseTag = 0, links = 1;
+  ACCESS_MASK effectiveAccess = 0;
+};
+
 struct BigStats
 {
   std::atomic<uint64_t> seen[logic::kBigBuckets]{};
@@ -247,6 +258,9 @@ struct BigStats
   std::atomic<uint64_t> raWaits{0};
   std::atomic<uint64_t> raWaitUs{0};
   std::atomic<uint64_t> fallbacks{0};
+  std::atomic<uint64_t> raWasted{0};   // bytes read ahead and never used
+  std::atomic<uint64_t> raDropped{0};  // windows dropped (any reason)
+  std::atomic<uint64_t> raSpinHits{0}; // waits that ended during the spin
 };
 
 struct Stats
@@ -264,6 +278,9 @@ struct Stats
   std::atomic<uint64_t> fallbackNameQuery{0};
   std::atomic<uint64_t> fallbackPoolStart{0};
   std::atomic<uint64_t> fallbackOther{0};
+  // NtQueryInformationFile on eligible handles, per information class
+  std::atomic<uint64_t> infoServed[80]{};
+  std::atomic<uint64_t> infoPassed[80]{};
   std::atomic<uint64_t> fills{0};
   std::atomic<uint64_t> fillBytes{0};
   std::atomic<uint64_t> evictions{0};      // entries dropped
@@ -480,10 +497,18 @@ struct RaWindow
   std::atomic<bool> cancel{false};
   std::atomic<bool> started{false};  // a worker has picked the window up
   std::atomic<uint64_t> lastUse{0};  // tick of creation / last read served from it
+  std::atomic<uint64_t> usedBytes{0};  // bytes served from this window
   std::mutex m;
   std::condition_variable cv;
 
-  ~RaWindow() { g->raBytesInUse.fetch_sub(length, std::memory_order_relaxed); }
+  ~RaWindow()
+  {
+    g->raBytesInUse.fetch_sub(length, std::memory_order_relaxed);
+    const uint64_t read = loaded.load(std::memory_order_relaxed);
+    const uint64_t used = usedBytes.load(std::memory_order_relaxed);
+    if (read > used)
+      g->stats.big.raWasted.fetch_add(read - used, std::memory_order_relaxed);
+  }
 };
 
 HandleState::~HandleState()
@@ -582,6 +607,14 @@ void logSummary(const char* prefix)
         logic::sizeBucketName(i), ld(b.admitted), ld(b.fills), ld(b.fillBytes),
         ld(b.served), ld(b.bytesServed), ld(b.probationEnd));
   }
+  std::string infos;
+  for (int i = 0; i < 80; ++i) {
+    const uint64_t sv = ld(s.infoServed[i]), pa = ld(s.infoPassed[i]);
+    if (sv || pa)
+      infos += std::format(" {}={}/{}", i, sv, pa);
+  }
+  logger->info("{} NtQueryInformationFile on eligible handles (class=served/passed):{}",
+               prefix, infos);
   logger->info("{} by file size:{}", prefix, buckets);
   logger->info(
       "{} layer 2: asyncFills={} asyncFillFailures={} syncFallbacks={} "
@@ -597,10 +630,12 @@ void logSummary(const char* prefix)
   }
   logger->info(
       "{} big reads:{} splits done={} failed={} chunks={} | readahead windows={} "
-      "bytes={} served={} servedBytes={} waits={} waitUs={} | fallbacks={}",
+      "bytes={} served={} servedBytes={} waits={} waitUs={} spinHits={} wastedBytes={} "
+      "droppedWindows={} | fallbacks={}",
       prefix, bigs, ld(b.splitsDone), ld(b.splitsFailed), ld(b.chunks),
       ld(b.raWindows), ld(b.raBytes), ld(b.raServed), ld(b.raServedBytes),
-      ld(b.raWaits), ld(b.raWaitUs), ld(b.fallbacks));
+      ld(b.raWaits), ld(b.raWaitUs), ld(b.raSpinHits), ld(b.raWasted), ld(b.raDropped),
+      ld(b.fallbacks));
 }
 
 void sweepIdleWindows();
@@ -675,6 +710,12 @@ bool getRealPos(HANDLE h, uint64_t& pos)
 struct FileAttrs
 {
   int64_t fileId       = 0;
+  int64_t creation     = 0;
+  int64_t lastAccess   = 0;
+  int64_t allocation   = 0;
+  ULONG reparseTag     = 0;
+  ULONG numberOfLinks  = 1;
+  ACCESS_MASK effectiveAccess = 0;
   int64_t written      = 0;
   int64_t changed      = 0;
   int64_t endOfFile    = 0;
@@ -707,6 +748,11 @@ NTSTATUS queryAllFallback(HANDLE h, FileAttrs& out)
 {
   auto extract = [&out](const FILE_ALL_INFORMATION& all) {
     out.fileId         = all.InternalInformation.IndexNumber.QuadPart;
+    out.creation       = all.BasicInformation.CreationTime.QuadPart;
+    out.lastAccess     = all.BasicInformation.LastAccessTime.QuadPart;
+    out.allocation     = all.StandardInformation.AllocationSize.QuadPart;
+    out.numberOfLinks  = all.StandardInformation.NumberOfLinks;
+    out.effectiveAccess = all.AccessInformation.AccessFlags;
     out.written        = all.BasicInformation.LastWriteTime.QuadPart;
     out.changed        = all.BasicInformation.ChangeTime.QuadPart;
     out.endOfFile      = all.StandardInformation.EndOfFile.QuadPart;
@@ -804,6 +850,12 @@ NTSTATUS queryAttrs(HANDLE h, FileAttrs& out)
         return st2;
 
       out.fileId         = stat.FileId.QuadPart;
+      out.creation       = stat.CreationTime.QuadPart;
+      out.lastAccess     = stat.LastAccessTime.QuadPart;
+      out.allocation     = stat.AllocationSize.QuadPart;
+      out.reparseTag     = stat.ReparseTag;
+      out.numberOfLinks  = stat.NumberOfLinks;
+      out.effectiveAccess = stat.EffectiveAccess;
       out.written        = stat.LastWriteTime.QuadPart;
       out.changed        = stat.ChangeTime.QuadPart;
       out.endOfFile      = stat.EndOfFile.QuadPart;
@@ -1351,6 +1403,7 @@ bool ensureWFile(HandleState& hs, HANDLE h)
 void dropWindow(std::shared_ptr<RaWindow>& w)
 {
   if (w) {
+    g->stats.big.raDropped.fetch_add(1, std::memory_order_relaxed);
     w->cancel.store(true, std::memory_order_relaxed);
     w.reset();
   }
@@ -1465,6 +1518,15 @@ bool serveFromWindow(HandleState& hs, std::shared_ptr<RaWindow>& slot, HANDLE h,
       return false;
     }
     BigStats& bs = g->stats.big;
+    // the data is usually just about to arrive: spin briefly before sleeping
+    for (int i = 0; i < 4000 && w->loaded.load(std::memory_order_acquire) < need; ++i)
+      YieldProcessor();
+    if (w->loaded.load(std::memory_order_acquire) >= need) {
+      bs.raSpinHits.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  if (w->loaded.load(std::memory_order_acquire) < need) {
+    BigStats& bs = g->stats.big;
     bs.raWaits.fetch_add(1, std::memory_order_relaxed);
     const uint64_t t0 = nowUs();
     {
@@ -1498,6 +1560,7 @@ bool serveFromWindow(HandleState& hs, std::shared_ptr<RaWindow>& slot, HANDLE h,
   }
 
   w->lastUse.store(GetTickCount64(), std::memory_order_relaxed);
+  w->usedBytes.fetch_add(total, std::memory_order_relaxed);
   g->stats.big.raServed.fetch_add(1, std::memory_order_relaxed);
   g->stats.big.raServedBytes.fetch_add(total, std::memory_order_relaxed);
   status = STATUS_SUCCESS;
@@ -1659,6 +1722,17 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
 
   // big reads of any regular file may be split/read ahead, cacheable or not
   hs.key     = key;
+  hs.snap.fileId = info.fileId;
+  hs.snap.creation = info.creation;
+  hs.snap.lastAccess = info.lastAccess;
+  hs.snap.written = info.written;
+  hs.snap.changed = info.changed;
+  hs.snap.allocation = info.allocation;
+  hs.snap.endOfFile = info.endOfFile;
+  hs.snap.attributes = info.fileAttributes;
+  hs.snap.reparseTag = info.reparseTag;
+  hs.snap.links = info.numberOfLinks;
+  hs.snap.effectiveAccess = info.effectiveAccess;
   hs.splitOk.store(logic::splitCapable(a) && a.endOfFile > 0 && a.endOfFile != UINT64_MAX,
                    std::memory_order_release);
 
@@ -2260,6 +2334,117 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
     }
     return static_cast<NTSTATUS>(0xC0000001L);  // STATUS_UNSUCCESSFUL; unreachable in practice: see bigRead
   }
+}
+
+bool tryServeInfo(HANDLE h, PIO_STATUS_BLOCK iosb, PVOID info, ULONG length,
+                  FILE_INFORMATION_CLASS cls, NTSTATUS& status)
+{
+  if (!g || !enabled() || h == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(g->handlesLock);
+  auto it = g->handles.find(h);
+  if (it == g->handles.end())
+    return false;
+  const HandleState& hs = *it->second;
+  const int mode = hs.mode.load(std::memory_order_acquire);
+  if (mode != kHandleProbation && mode != kHandleServed)
+    return false;
+
+  const int c = static_cast<int>(cls);
+  const bool counted = c >= 0 && c < 80;
+  auto passed = [&]() {
+    if (counted)
+      g->stats.infoPassed[c].fetch_add(1, std::memory_order_relaxed);
+    return false;
+  };
+
+  const FileSnapshot& f = hs.snap;
+  union
+  {
+    FILE_BASIC_INFORMATION basic;
+    FILE_STANDARD_INFORMATION standard;
+    FILE_INTERNAL_INFORMATION internal;
+    FILE_NETWORK_OPEN_INFORMATION netOpen;
+    USVFS_FILE_ATTRIBUTE_TAG_INFORMATION tag;
+    USVFS_FILE_STAT_INFORMATION stat;
+  } out;
+  size_t size = 0;
+  std::memset(&out, 0, sizeof(out));
+
+  switch (cls) {
+  case FileBasicInformation:
+    out.basic.CreationTime.QuadPart   = f.creation;
+    out.basic.LastAccessTime.QuadPart = f.lastAccess;
+    out.basic.LastWriteTime.QuadPart  = f.written;
+    out.basic.ChangeTime.QuadPart     = f.changed;
+    out.basic.FileAttributes          = f.attributes;
+    size = sizeof(out.basic);
+    break;
+  case FileStandardInformation:
+    out.standard.AllocationSize.QuadPart = f.allocation;
+    out.standard.EndOfFile.QuadPart      = f.endOfFile;
+    out.standard.NumberOfLinks           = f.links;
+    out.standard.DeletePending           = FALSE;
+    out.standard.Directory               = FALSE;
+    size = sizeof(out.standard);
+    break;
+  case FileInternalInformation:
+    out.internal.IndexNumber.QuadPart = f.fileId;
+    size = sizeof(out.internal);
+    break;
+  case FileNetworkOpenInformation:
+    out.netOpen.CreationTime.QuadPart   = f.creation;
+    out.netOpen.LastAccessTime.QuadPart = f.lastAccess;
+    out.netOpen.LastWriteTime.QuadPart  = f.written;
+    out.netOpen.ChangeTime.QuadPart     = f.changed;
+    out.netOpen.AllocationSize.QuadPart = f.allocation;
+    out.netOpen.EndOfFile.QuadPart      = f.endOfFile;
+    out.netOpen.FileAttributes          = f.attributes;
+    size = sizeof(out.netOpen);
+    break;
+  case FileAttributeTagInformation:
+    out.tag.FileAttributes = f.attributes;
+    out.tag.ReparseTag     = f.reparseTag;
+    size = sizeof(out.tag);
+    break;
+  case FileStatInformation:
+    out.stat.FileId.QuadPart         = f.fileId;
+    out.stat.CreationTime.QuadPart   = f.creation;
+    out.stat.LastAccessTime.QuadPart = f.lastAccess;
+    out.stat.LastWriteTime.QuadPart  = f.written;
+    out.stat.ChangeTime.QuadPart     = f.changed;
+    out.stat.AllocationSize.QuadPart = f.allocation;
+    out.stat.EndOfFile.QuadPart      = f.endOfFile;
+    out.stat.FileAttributes          = f.attributes;
+    out.stat.ReparseTag              = f.reparseTag;
+    out.stat.NumberOfLinks           = f.links;
+    out.stat.EffectiveAccess         = f.effectiveAccess;
+    size = sizeof(out.stat);
+    break;
+  case FilePositionInformation:
+    // answered from the shadow position by queryInformation() on served handles
+    if (mode == kHandleServed && counted)
+      g->stats.infoServed[c].fetch_add(1, std::memory_order_relaxed);
+    else
+      passed();
+    return false;
+  default:
+    return passed();
+  }
+
+  // too small a buffer (or no buffer): let the system report it its own way
+  if (!info || !iosb || length < size)
+    return passed();
+
+  if (!sehCopy(info, &out, size) || !sehStoreStatus(iosb, STATUS_SUCCESS, size)) {
+    status = STATUS_ACCESS_VIOLATION;
+  } else {
+    status = STATUS_SUCCESS;
+  }
+  if (counted)
+    g->stats.infoServed[c].fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 NTSTATUS queryInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,

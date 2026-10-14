@@ -164,6 +164,7 @@ typedef enum _FILE_INFORMATION_CLASS {
   FileDirectoryInformation       = 1,
   FileFullDirectoryInformation   = 2,
   FileBothDirectoryInformation   = 3,
+  FileBasicInformation           = 4,
   FileStandardInformation        = 5,
   FileInternalInformation        = 6,
   FileAccessInformation          = 8,
@@ -172,6 +173,8 @@ typedef enum _FILE_INFORMATION_CLASS {
   FilePositionInformation        = 14,
   FileModeInformation            = 16,
   FileAllInformation             = 18,
+  FileNetworkOpenInformation     = 34,
+  FileAttributeTagInformation    = 35,
   FileStatInformation            = 68,
   FileObjectIdInformation        = 29,
   FileReparsePointInformation    = 33,
@@ -327,6 +330,11 @@ typedef struct _FILE_NAME_INFORMATION {
   ULONG FileNameLength;
   WCHAR FileName[1];
 } FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
+
+typedef struct _USVFS_FILE_ATTRIBUTE_TAG_INFORMATION {
+  ULONG FileAttributes;
+  ULONG ReparseTag;
+} USVFS_FILE_ATTRIBUTE_TAG_INFORMATION;
 
 // own name: newer SDKs define FILE_STAT_INFORMATION themselves
 // FileStatInformation (Windows 10 1709+, Wine): everything an fstat provides

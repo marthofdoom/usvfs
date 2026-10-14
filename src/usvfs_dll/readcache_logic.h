@@ -330,7 +330,7 @@ struct WindowPlan
 
 constexpr uint64_t kMaxWindow = 4ull << 20;
 
-// next readahead window: 2x the last read, capped at kMaxWindow, the end of the
+// next readahead window: 2x the last read (at most 1 MiB for reads below 1 MiB), capped at kMaxWindow, the end of the
 // file and what is left of the readahead memory budget
 inline WindowPlan planWindow(uint64_t lastEnd, uint64_t lastReadSize,
                              uint64_t fileSize, uint64_t budgetLeft)
@@ -339,6 +339,8 @@ inline WindowPlan planWindow(uint64_t lastEnd, uint64_t lastReadSize,
   if (lastEnd >= fileSize)
     return w;
   uint64_t len = std::min<uint64_t>(lastReadSize * 2, kMaxWindow);
+  if (lastReadSize < (1ull << 20))
+    len = std::min<uint64_t>(len, 1ull << 20);  // small reads: no more than 1 MiB ahead
   len          = std::min<uint64_t>(len, fileSize - lastEnd);
   len          = std::min<uint64_t>(len, budgetLeft);
   if (len == 0)

@@ -82,6 +82,14 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
               PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
               ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key);
 
+// Answers a query of a file information class from the snapshot taken when the
+// handle was classified (eligible handles only: read-only, synchronous regular
+// files). True if `status` is the result; false means "ask the system". Takes
+// no hook context and no reference counts.
+bool tryServeInfo(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
+                  PVOID FileInformation, ULONG Length,
+                  FILE_INFORMATION_CLASS FileInformationClass, NTSTATUS& status);
+
 NTSTATUS queryInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
                           PVOID FileInformation, ULONG Length,
                           FILE_INFORMATION_CLASS FileInformationClass);

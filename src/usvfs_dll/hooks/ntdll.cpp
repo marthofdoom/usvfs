@@ -1586,10 +1586,23 @@ NTSTATUS WINAPI usvfs::hook_NtQueryInformationFile(
   HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
   ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
-  // only the position is of interest
-  if (!usvfs::readcache::enabled() ||
-      (FileInformationClass != FilePositionInformation &&
-       FileInformationClass != FileAllInformation)) {
+  if (!usvfs::readcache::enabled()) {
+    return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                    Length, FileInformationClass);
+  }
+
+  // eligible handles: basic/standard/stat/... come from the snapshot taken at
+  // classification, which saves the system an fstat+xattr per call
+  {
+    NTSTATUS served = STATUS_SUCCESS;
+    if (usvfs::readcache::tryServeInfo(FileHandle, IoStatusBlock, FileInformation,
+                                       Length, FileInformationClass, served))
+      return served;
+  }
+
+  // otherwise only the position is of interest
+  if (FileInformationClass != FilePositionInformation &&
+      FileInformationClass != FileAllInformation) {
     return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
                                     Length, FileInformationClass);
   }

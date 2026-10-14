@@ -299,6 +299,8 @@ struct State
   std::atomic<int> prewarmLimit{4};            // concurrently working pre-warm jobs
   std::atomic<int> prewarmRunning{0};
   std::mutex gateMutex;
+  std::mutex realDirsMutex;
+  std::unordered_set<std::string> realDirs;  // real directories queued for pre-listing
   std::condition_variable gateCv;
   std::atomic<uint64_t> prewarmStart{0};
   std::atomic<bool> prewarmDone{false};
@@ -439,6 +441,17 @@ std::shared_ptr<const Listing> deriveListing(const std::wstring& dir, int cls,
     return nullptr;
 
   auto derived = std::make_shared<Listing>();
+  if (logic::isLiteralMask(mask)) {
+    // a single file: by far the most common query. Not stored (there is one per
+    // file); the name index makes it cheap to derive again.
+    if (const std::vector<uint32_t>* idx = all->findLiteral(mask)) {
+      for (uint32_t i : *idx)
+        derived->add(all->records[i], all->names[i]);
+    }
+    g->store.noteDerived();
+    return derived;
+  }
+
   for (size_t i = 0; i < all->records.size(); ++i) {
     if (logic::maskMatches(mask, all->names[i]))
       derived->add(all->records[i], all->names[i]);
@@ -615,32 +628,37 @@ bool listChildren(const std::string& vpath, std::vector<Child>& out)
   }
   const RedirectionTreeContainer& table = context->redirectionTable();
 
-  std::vector<NodePtr> nodes;
+  // NOTE: DirectoryTree::find("*") returns all descendants, not just the
+  // children, so the child map is walked directly.
+  auto collect = [&](const RedirectionTree& tree) {
+    for (auto it = tree.filesBegin(); it != tree.filesEnd(); ++it) {
+      const NodePtr& n = it->second;
+      Child c;
+      c.name  = n->name();
+      c.dir   = n->isDirectory();
+      c.dummy = n->hasFlag(shared::FLAG_DUMMY);
+      c.link  = n->data().linkTarget.c_str();
+      if (n->hasFlag(shared::FLAG_CREATETARGET) && !c.link.empty()) {
+        // the overwrite folder: never cache anything in it
+        g->store.addNoCachePrefix(makeKey(toNtPath(c.link)));
+      }
+      out.push_back(std::move(c));
+    }
+  };
+
   if (vpath.empty()) {
-    nodes = table->find("*");
+    collect(*table.get());
   } else {
     NodePtr node = table->findNode(boost::filesystem::path(vpath));
     if (node.get() == nullptr)
       return false;
-    nodes = node->find("*");
-  }
-
-  for (const NodePtr& n : nodes) {
-    Child c;
-    c.name  = n->name();
-    c.dir   = n->isDirectory();
-    c.dummy = n->hasFlag(shared::FLAG_DUMMY);
-    c.link  = n->data().linkTarget.c_str();
-    if (n->hasFlag(shared::FLAG_CREATETARGET) && !c.link.empty()) {
-      // the overwrite folder: never cache anything in it
-      g->store.addNoCachePrefix(makeKey(toNtPath(c.link)));
-    }
-    out.push_back(std::move(c));
+    collect(*node);
   }
   return true;
 }
 
 void prewarmDirectory(const std::string& vpath, const std::string& link);
+void prewarmRealDirectory(const std::string& realDir);
 
 void finishPrewarmJob()
 {
@@ -655,6 +673,31 @@ void finishPrewarmJob()
           g->prewarmCapped.load() ? " (stopped at the memory cap)" : "");
     }
   }
+}
+
+void prewarmRealDirectory(const std::string& realDir)
+{
+  {
+    std::unique_lock<std::mutex> lock(g->gateMutex);
+    while (g->prewarmRunning.load() >= g->prewarmLimit.load() && !g->pool.stopping())
+      g->gateCv.wait_for(lock, chr::milliseconds(100));
+    g->prewarmRunning.fetch_add(1);
+  }
+
+  if (!g->pool.stopping() && !g->prewarmCapped.load() && !g->store.nearlyFull()) {
+    const std::wstring nt  = toNtPath(realDir);
+    const std::wstring key = makeKey(nt);
+    if (!key.empty()) {
+      for (int cls : g->prewarmClasses)
+        prewarmListing(key, nt, cls);
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(g->gateMutex);
+    g->prewarmRunning.fetch_sub(1);
+  }
+  g->gateCv.notify_one();
+  finishPrewarmJob();
 }
 
 void prewarmDirectory(const std::string& vpath, const std::string& link)
@@ -696,6 +739,23 @@ void prewarmDirectory(const std::string& vpath, const std::string& link)
           });
         } else if (!c.dummy && !c.link.empty()) {
           prewarmAttr(toNtPath(c.link));
+
+          // The game looks files up one by one in the real (mod) directory by
+          // literal name; those queries are derived from a complete listing of
+          // it, so list each real directory once.
+          const size_t slash = c.link.find_last_of("/\\");
+          if (slash != std::string::npos && slash > 0) {
+            const std::string realDir = c.link.substr(0, slash);
+            bool fresh = false;
+            {
+              std::lock_guard<std::mutex> lock(g->realDirsMutex);
+              fresh = g->realDirs.insert(realDir).second;
+            }
+            if (fresh) {
+              g->prewarmPending.fetch_add(1);
+              g->pool.submit([realDir] { prewarmRealDirectory(realDir); });
+            }
+          }
         }
       }
     }

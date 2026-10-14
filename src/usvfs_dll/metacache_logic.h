@@ -202,14 +202,28 @@ struct Listing
   std::vector<std::string> records;  // raw records, NextEntryOffset zeroed
   std::vector<size_t> rawLengths;
   std::vector<std::wstring> names;
+  std::unordered_map<std::wstring, std::vector<uint32_t>> byName;  // folded name -> indices
   size_t bytes = 0;
 
   void add(std::string record, std::wstring name)
   {
     rawLengths.push_back(record.size());
-    bytes += record.size() + name.size() * sizeof(wchar_t) + 64;
+    bytes += record.size() + name.size() * sizeof(wchar_t) * 2 + 96;
+    std::wstring folded;
+    folded.reserve(name.size());
+    for (wchar_t c : name)
+      folded.push_back(foldChar(c));
+    byName[std::move(folded)].push_back(static_cast<uint32_t>(records.size()));
     records.push_back(std::move(record));
     names.push_back(std::move(name));
+  }
+
+  // indices of the entries whose name equals `foldedName` (already folded with
+  // foldChar, as normalizeMask does); null if none
+  const std::vector<uint32_t>* findLiteral(const std::wstring& foldedName) const
+  {
+    auto it = byName.find(foldedName);
+    return it == byName.end() ? nullptr : &it->second;
   }
 };
 
@@ -257,6 +271,12 @@ public:
       ++m_stats.attrHits;
     }
     return true;
+  }
+
+  void noteDerived()
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    ++m_stats.listingDerived;
   }
 
   bool hasListing(const std::wstring& dir, int cls, const std::wstring& mask)
