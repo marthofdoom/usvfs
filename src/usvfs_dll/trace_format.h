@@ -38,9 +38,12 @@ enum class Op : uint8_t {
   ProfString = 15,   // GetPrivateProfileString[AW]
   ProfSection = 16,  // GetPrivateProfileSection[AW]
   WriteMarker = 17,  // DeleteFile/MoveFile/WritePrivateProfileString: never replayed
+  FindNext = 18,     // FindNextFileW (hooked only for the trace)
+  FindClose = 19,    // FindClose (hooked only for the trace)
+  SetCwd = 20,       // current directory: once at start, then SetCurrentDirectoryW
 };
 
-constexpr int kOpCount = 18;
+constexpr int kOpCount = 21;
 
 inline const char* opName(Op op)
 {
@@ -62,6 +65,9 @@ inline const char* opName(Op op)
   case Op::ProfString: return "GetPrivateProfileString";
   case Op::ProfSection: return "GetPrivateProfileSection";
   case Op::WriteMarker: return "WriteMarker";
+  case Op::FindNext: return "FindNextFileW";
+  case Op::FindClose: return "FindClose";
+  case Op::SetCwd: return "SetCurrentDirectoryW";
   }
   return "?";
 }
@@ -100,6 +106,8 @@ static_assert(sizeof(FileHeader) == 40);
 //   ProfString: str=file, a=app name str id (0 = NULL), b=key name str id (0 = NULL),
 //            c=nSize, d=1 if the ANSI function was called (strings stored widened)
 //   ProfSection: str=file, a=app name str id, c=nSize, d as above
+//   FindNext: h=find handle, status=BOOL.  FindClose: h, status=BOOL.
+//   SetCwd: str=directory, status=BOOL (the first record is the directory at DLL init)
 //   WriteMarker: str=first path, a=1 delete / 2 move / 3 profile write
 // All ops: tid, ts (QPC ticks since qpcBase, at hook entry), dur (ticks spent in
 // the call), status (NTSTATUS as returned to the application).

@@ -93,6 +93,36 @@ DWORD WINAPI hook_GetPrivateProfileSectionW(LPCWSTR lpAppName, LPWSTR lpReturned
   return res;
 }
 
+BOOL WINAPI hook_SetCurrentDirectoryW(LPCWSTR lpPathName)
+{
+  trace::Scope ts;
+  ts.keepLastError();
+  const BOOL res = impl_SetCurrentDirectoryW(lpPathName);
+  TRACE_END(recSetCwd(ts, lpPathName, res));
+  return res;
+}
+
+// trace-only hooks (see kernel32_impl.h); the real function is reached through
+// the hook barrier, as in every other hook
+
+BOOL WINAPI hook_FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)
+{
+  trace::Scope ts;
+  ts.keepLastError();
+  const BOOL res = ::FindNextFileW(hFindFile, lpFindFileData);
+  TRACE_END(recFindNext(ts, hFindFile, res));
+  return res;
+}
+
+BOOL WINAPI hook_FindClose(HANDLE hFindFile)
+{
+  trace::Scope ts;
+  ts.keepLastError();
+  const BOOL res = ::FindClose(hFindFile);
+  TRACE_END(recFindClose(ts, hFindFile, res));
+  return res;
+}
+
 // writes: only a marker, never replayed
 
 BOOL WINAPI hook_DeleteFileW(LPCWSTR lpFileName)

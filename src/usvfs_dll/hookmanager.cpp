@@ -26,6 +26,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "readcache.h"
 #include "metacache.h"
 #include "trace.h"
+#include "hooks/kernel32_impl.h"
 #include "../thooklib/utility.h"
 #include "../thooklib/ttrampolinepool.h"
 #include <shmlogger.h>
@@ -280,6 +281,11 @@ void HookManager::initHooks()
   installHook(kbaseMod, k32Mod, "GetFullPathNameW", hook_GetFullPathNameW);
 
   installHook(kbaseMod, k32Mod, "FindFirstFileExW", hook_FindFirstFileExW);
+  if (trace::enabled()) {
+    // harness trace only: record the app's FindNext/FindClose calls
+    installHook(kbaseMod, k32Mod, "FindNextFileW", hook_FindNextFileW);
+    installHook(kbaseMod, k32Mod, "FindClose", hook_FindClose);
+  }
 
   HMODULE ntdllMod = GetModuleHandleA("ntdll.dll");
   spdlog::get("usvfs")->debug("ntdll.dll at {0:x}", reinterpret_cast<uintptr_t>(ntdllMod));

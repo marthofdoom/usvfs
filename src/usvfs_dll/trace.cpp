@@ -234,6 +234,8 @@ HANDLE openOutput(std::wstring path)
 
 }  // namespace
 
+static void emitInitialCwd();
+
 std::string init()
 try {
   std::wstring path;
@@ -270,6 +272,7 @@ try {
     g_state = nullptr;  // leaked on purpose; tracing stays off
     return "trace disabled: cannot start the writer thread";
   }
+  emitInitialCwd();
   g_enabled.store(true, std::memory_order_release);
   return "trace enabled, writing to '" + std::string(path.begin(), path.end()) + "'" +
          (g_state->crc ? " (with read crc32)" : "");
@@ -680,6 +683,76 @@ void recWriteMarker(const Scope& s, unsigned kind, bool ansi, const void* path)
   finish(s, r, defs);
   } catch (...) {
     // tracing must never take the application down
+  }
+}
+
+void recFindNext(const Scope& s, HANDLE find, int ok)
+{
+  if (!g_state)
+    return;
+  try {
+    Defs defs;
+    Record r;
+    r.op = Op::FindNext;
+    r.h = h64(find);
+    r.status = ok ? 1 : 0;
+    finish(s, r, defs);
+  } catch (...) {
+  }
+}
+
+void recFindClose(const Scope& s, HANDLE find, int ok)
+{
+  if (!g_state)
+    return;
+  try {
+    Defs defs;
+    Record r;
+    r.op = Op::FindClose;
+    r.h = h64(find);
+    r.status = ok ? 1 : 0;
+    finish(s, r, defs);
+  } catch (...) {
+  }
+}
+
+void recSetCwd(const Scope& s, const void* path, int ok)
+{
+  if (!g_state)
+    return;
+  try {
+    Defs defs;
+    Record r;
+    r.op = Op::SetCwd;
+    r.str = internApp(path, false, defs);
+    r.status = ok ? 1 : 0;
+    finish(s, r, defs);
+  } catch (...) {
+  }
+}
+
+// the directory the process starts in; replay restores it before anything else
+static void emitInitialCwd()
+{
+  try {
+    wchar_t cwd[2048];
+    const DWORD n = ::GetCurrentDirectoryW(2048, cwd);
+    if (n == 0 || n >= 2048)
+      return;
+    Defs defs;
+    Record r;
+    r.op = Op::SetCwd;
+    r.tid = ::GetCurrentThreadId();
+    r.ts = 0;
+    r.status = 1;
+    r.str = internApp(cwd, false, defs);
+    const Record* recs[2];
+    int k = 0;
+    for (int i = 0; i < defs.n; ++i)
+      recs[k++] = &defs.def[i];
+    recs[k++] = &r;
+    emit(recs, k);
+  } catch (...) {
   }
 }
 

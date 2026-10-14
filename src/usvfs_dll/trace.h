@@ -91,6 +91,9 @@ void recFindFirst(const Scope& s, const void* path, unsigned long level, unsigne
                   unsigned long flags, HANDLE result, unsigned long err);
 void recProfile(const Scope& s, bool section, bool ansi, const void* app, const void* key,
                 const void* file, unsigned long nSize, unsigned long result);
+void recFindNext(const Scope& s, HANDLE find, int ok);
+void recFindClose(const Scope& s, HANDLE find, int ok);
+void recSetCwd(const Scope& s, const void* path, int ok);
 // kind: 1 delete, 2 move, 3 profile write
 void recWriteMarker(const Scope& s, unsigned kind, bool ansi, const void* path);
 

@@ -20,7 +20,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -250,12 +252,19 @@ struct Index {
   std::vector<Block> blocks;
   std::vector<CreateInfo> creates;  // sorted by return time; position = instance id
   std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, int>>> byValue;
+  std::vector<CreateInfo> finds;  // successful FindFirstFileExW, sorted by return time
+  std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, int>>> findByValue;
+  std::vector<std::pair<uint64_t, uint32_t>> cwds;  // (ts, string id)
   std::vector<std::pair<uint64_t, uint64_t>> closes;  // (handle, ts), only for windows
   uint64_t minTs = ~0ull, maxTs = 0, records = 0;
 
   // A handle value is reused over the trace's lifetime: the instance of a use is
   // the latest create of that value which had returned by then.
-  int lookup(uint64_t h, uint64_t at) const
+  int lookup(uint64_t h, uint64_t at) const { return lookupIn(byValue, h, at); }
+  int lookupFind(uint64_t h, uint64_t at) const { return lookupIn(findByValue, h, at); }
+
+  using ValueMap = std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, int>>>;
+  static int lookupIn(const ValueMap& byValue, uint64_t h, uint64_t at)
   {
     if (!h) return -1;
     auto it = byValue.find(h);
@@ -315,6 +324,12 @@ bool buildIndex(TraceFile& tf, bool needCloses, Index& ix)
         c.a = (uint32_t)r.a; c.b = (uint32_t)r.b; c.c = (uint32_t)r.c; c.d = (uint32_t)r.d;
         c.e = (uint32_t)r.e; c.str = r.str; c.op = r.op;
         ix.creates.push_back(c);
+      } else if (r.op == Op::FindFirst && r.status == 1 && r.h) {
+        CreateInfo c;
+        c.exit = r.ts + r.dur; c.ts = r.ts; c.h = r.h; c.op = r.op;
+        ix.finds.push_back(c);
+      } else if (r.op == Op::SetCwd) {
+        ix.cwds.push_back({r.ts, r.str});
       } else if (needCloses && r.op == Op::Close) {
         ix.closes.push_back({r.h, r.ts});
       }
@@ -334,6 +349,11 @@ bool buildIndex(TraceFile& tf, bool needCloses, Index& ix)
                    [](const CreateInfo& a, const CreateInfo& b) { return a.exit < b.exit; });
   for (size_t k = 0; k < ix.creates.size(); ++k)
     ix.byValue[ix.creates[k].h].push_back({ix.creates[k].exit, (int)k});
+  std::stable_sort(ix.finds.begin(), ix.finds.end(),
+                   [](const CreateInfo& a, const CreateInfo& b) { return a.exit < b.exit; });
+  for (size_t k = 0; k < ix.finds.size(); ++k)
+    ix.findByValue[ix.finds[k].h].push_back({ix.finds[k].exit, (int)k});
+  std::sort(ix.cwds.begin(), ix.cwds.end());
   std::sort(ix.closes.begin(), ix.closes.end());
   if (ix.minTs == ~0ull) ix.minTs = 0;
   return true;
@@ -346,7 +366,48 @@ struct OpStat {
   uint64_t count = 0, ticks = 0, diffs = 0, recCount = 0, recTicks = 0;
 };
 
+// latency histogram: 8 buckets per power of two of nanoseconds
+struct Hist {
+  std::vector<uint64_t> b;
+  uint64_t maxNs = 0, n = 0;
+  static size_t index(uint64_t ns)
+  {
+    const uint64_t v = ns ? ns : 1;
+    const int lg = (int)std::bit_width(v) - 1;
+    const uint64_t sub = lg >= 3 ? (v >> (lg - 3)) & 7 : (v << (3 - lg)) & 7;
+    return (size_t)lg * 8 + (size_t)sub;
+  }
+  static double lowerNs(size_t idx) { return std::ldexp(1.0 + (double)(idx % 8) / 8.0, (int)(idx / 8)); }
+  void add(uint64_t ns)
+  {
+    if (b.empty()) b.assign(512, 0);
+    ++b[index(ns)];
+    ++n;
+    maxNs = std::max(maxNs, ns);
+  }
+  void merge(const Hist& o)
+  {
+    if (o.b.empty()) return;
+    if (b.empty()) b.assign(512, 0);
+    for (size_t i = 0; i < 512; ++i) b[i] += o.b[i];
+    n += o.n;
+    maxNs = std::max(maxNs, o.maxNs);
+  }
+  double percentileNs(double p) const
+  {
+    if (!n) return 0;
+    const uint64_t want = (uint64_t)std::ceil(p * (double)n);
+    uint64_t acc = 0;
+    for (size_t i = 0; i < b.size(); ++i) {
+      acc += b[i];
+      if (acc >= want && b[i]) return lowerNs(i) * (1.0 + 1.0 / 16.0);  // bucket middle
+    }
+    return (double)maxNs;
+  }
+};
+
 struct ThreadStats {
+  Hist hist[kOpCount];
   uint32_t tid = 0;
   uint64_t ops = 0, busyTicks = 0, startTicks = 0, endTicks = 0;
   uint64_t skipped = 0, unmapped = 0, verifyChecked = 0, verifyMismatch = 0;
@@ -430,7 +491,8 @@ class Pass
 {
 public:
   Pass(TraceFile& tf, const Index& ix, const Options& o)
-      : m_tf(tf), m_ix(ix), m_o(o), m_insts(new Inst[std::max<size_t>(ix.creates.size(), 1)])
+      : m_tf(tf), m_ix(ix), m_o(o), m_insts(new Inst[std::max<size_t>(ix.creates.size(), 1)]),
+        m_finds(new Inst[std::max<size_t>(ix.finds.size(), 1)])
   {
     const double f = (double)ix.hdr.qpcFreq;
     m_fromTs = ix.minTs + (uint64_t)(o.fromSec * f);
@@ -464,6 +526,7 @@ public:
     for (auto& [tid, v] : perThread)
       std::stable_sort(v.begin(), v.end(), [&](size_t a, size_t b) { return m_ix.blocks[a].firstTs < m_ix.blocks[b].firstTs; });
 
+    applyStartDirectory();
     preOpen();
 
     std::vector<std::unique_ptr<Cursor>> cursors;
@@ -505,6 +568,19 @@ public:
   }
 
 private:
+  // the application's working directory at the start of the window (relative paths!)
+  void applyStartDirectory()
+  {
+    const std::pair<uint64_t, uint32_t>* pick = nullptr;
+    for (auto& c : m_ix.cwds) {
+      if (!pick || c.first < m_fromTs) pick = &c;  // the last one before the window, else the first
+    }
+    const wchar_t* dir = pick ? str(pick->second) : nullptr;
+    if (!dir) { logf("trace has no working directory record; keeping the current one"); return; }
+    if (::SetCurrentDirectoryW(dir)) logf("working directory set to %s", toUtf8(dir).c_str());
+    else logf("SetCurrentDirectoryW(%s) failed: %s", toUtf8(dir).c_str(), lastErrorText(::GetLastError()).c_str());
+  }
+
   // handles that were already open when the window starts are opened up front
   void preOpen()
   {
@@ -587,10 +663,12 @@ private:
   }
 
   // live handle of an instance, waiting for the thread that opens it; null = skip
-  HANDLE resolve(int id, ThreadStats& ts)
+  HANDLE resolve(int id, ThreadStats& ts) { return resolveIn(m_insts.get(), id, ts); }
+
+  HANDLE resolveIn(Inst* arr, int id, ThreadStats& ts)
   {
     if (id < 0) { ++ts.unmapped; return nullptr; }
-    Inst& in = m_insts[id];
+    Inst& in = arr[id];
     const uint64_t t0 = qpcNow();
     while (!in.resolved.load(std::memory_order_acquire)) {
       if (ticksToUs(qpcNow() - t0) > 30e6) {  // never opened: don't wait again
@@ -609,11 +687,16 @@ private:
     OpStat& s = ts.op[(int)r.op];
     if ((uint32_t)got != r.status) {
       ++s.diffs;
-      if (ts.samples.size() < 20) {
-        char b[160];
-        std::snprintf(b, sizeof(b), "%s tid %u ts +%.2fs: %s recorded 0x%08x got 0x%08x", opName(r.op), r.tid,
-                      (double)(r.ts - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, what, r.status, (uint32_t)got);
+      if (m_diffSamples.fetch_add(1) < 20) {  // the first 20 failing calls overall, with their paths
+        const wchar_t* path = str(r.str);
+        std::string p = path ? toUtf8(path) : std::string();
+        if (p.size() > 220) p.resize(220);
+        char b[512];
+        std::snprintf(b, sizeof(b), "%s tid %u ts +%.2fs: %s recorded 0x%08x got 0x%08x err %lu path '%s'",
+                      opName(r.op), r.tid, (double)(r.ts - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, what, r.status,
+                      (uint32_t)got, ::GetLastError(), p.c_str());
         ts.samples.push_back(b);
+        logf("status diff: %s", b);
       }
     }
   }
@@ -665,7 +748,8 @@ private:
     uint64_t t0 = 0, t1 = 0;
     OpStat& os = ts.op[(int)r.op];
     int self = -1;  // instance of r.h (creates: the one this call produced)
-    if (r.op != Op::FindFirst && r.h) self = m_ix.lookup(r.h, (r.op == Op::Create || r.op == Op::Open) ? r.ts + r.dur : r.ts);
+    if (r.op != Op::FindFirst && r.op != Op::FindNext && r.op != Op::FindClose && r.h)
+      self = m_ix.lookup(r.h, (r.op == Op::Create || r.op == Op::Open) ? r.ts + r.dur : r.ts);
 
     switch (r.op) {
     case Op::Create:
@@ -719,7 +803,7 @@ private:
         const uint32_t crc = crc32Update(0, buf.data(), iosb.Information);
         if (crc != r.crc || iosb.Information != r.info) {
           ++ts.verifyMismatch;
-          if (ts.samples.size() < 20) {
+          if (m_verifySamples.fetch_add(1) < 20) {
             char b[200];
             std::snprintf(b, sizeof(b), "verify tid %u ts +%.2fs: len %llu off %lld recorded crc %08x/%llu got %08x/%llu",
                           r.tid, (double)(r.ts - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, (unsigned long long)r.a,
@@ -816,16 +900,19 @@ private:
         t1 = qpcNow();
         note(ts, r, ok ? 1 : 0, "getattrex");
       } else {
-        // the app's enumeration is replayed to its end (FindNext/FindClose are not hooked)
+        // only the FindFirst itself: the app's FindNext/FindClose calls are separate records
+        const int fid = r.h ? m_ix.lookupFind(r.h, r.ts + r.dur) : -1;
         WIN32_FIND_DATAW fd;
         t0 = qpcNow();
         HANDLE fh = ::FindFirstFileExW(path, (FINDEX_INFO_LEVELS)r.a, &fd, (FINDEX_SEARCH_OPS)r.b,
                                        nullptr, (DWORD)r.c);
-        if (fh != INVALID_HANDLE_VALUE) {
-          while (::FindNextFileW(fh, &fd)) {}
+        t1 = qpcNow();
+        if (fid >= 0) {
+          if (fh != INVALID_HANDLE_VALUE) m_finds[fid].live.store(fh, std::memory_order_release);
+          m_finds[fid].resolved.store(true, std::memory_order_release);
+        } else if (fh != INVALID_HANDLE_VALUE) {
           ::FindClose(fh);
         }
-        t1 = qpcNow();
         note(ts, r, fh != INVALID_HANDLE_VALUE ? 1 : 0, "findfirst");
       }
       break;
@@ -856,6 +943,35 @@ private:
       note(ts, r, (NTSTATUS)got, "profile");
       break;
     }
+    case Op::FindNext:
+    case Op::FindClose: {
+      const int fid = m_ix.lookupFind(r.h, r.ts);
+      HANDLE fh = resolveIn(m_finds.get(), fid, ts);
+      if (!fh) return;
+      BOOL ok;
+      if (r.op == Op::FindNext) {
+        WIN32_FIND_DATAW fd;
+        t0 = qpcNow();
+        ok = ::FindNextFileW(fh, &fd);
+        t1 = qpcNow();
+      } else {
+        t0 = qpcNow();
+        ok = ::FindClose(fh);
+        t1 = qpcNow();
+        m_finds[fid].live.store(nullptr, std::memory_order_release);
+      }
+      note(ts, r, ok ? 1 : 0, r.op == Op::FindNext ? "findnext" : "findclose");
+      break;
+    }
+    case Op::SetCwd: {
+      const wchar_t* dir = str(r.str);
+      if (!dir) { ++ts.skipped; return; }
+      t0 = qpcNow();
+      const BOOL ok = ::SetCurrentDirectoryW(dir);
+      t1 = qpcNow();
+      note(ts, r, ok ? 1 : 0, "setcwd");
+      break;
+    }
     case Op::WriteMarker:
       ++ts.skipped;  // writes are never replayed
       return;
@@ -866,6 +982,7 @@ private:
     ++ts.ops;
     ++os.count;
     os.ticks += t1 - t0;
+    ts.hist[(int)r.op].add((uint64_t)((double)(t1 - t0) * 1e9 / (double)qpcFreq()));
     ts.busyTicks += t1 - t0;
   }
 
@@ -873,6 +990,8 @@ private:
   const Index& m_ix;
   const Options& m_o;
   std::unique_ptr<Inst[]> m_insts;
+  std::unique_ptr<Inst[]> m_finds;
+  std::atomic<int> m_diffSamples{0}, m_verifySamples{0};
   std::unique_ptr<std::atomic<uint64_t>[]> m_progress;
   size_t m_nProgress = 0;
   uint64_t m_fromTs = 0, m_toTs = ~0ull, m_start = 0, m_planned = 0;
@@ -918,6 +1037,9 @@ int runChild(const Options& o)
     }
   });
   std::vector<ThreadStats> stats = pass.run(wall);
+  Hist hist[kOpCount];
+  for (auto& s : stats)
+    for (int i = 0; i < kOpCount; ++i) hist[i].merge(s.hist[i]);
   stopMonitor = true;
   monitor.join();
 
@@ -955,6 +1077,10 @@ int runChild(const Options& o)
       << "\n";
   }
   f << "status_diffs " << diffs << "\n";
+  for (int i = 2; i < kOpCount; ++i)
+    if (hist[i].n)
+      f << "hist " << opName((Op)i) << " " << (uint64_t)hist[i].percentileNs(0.5) << " "
+        << (uint64_t)hist[i].percentileNs(0.95) << " " << hist[i].maxNs << "\n";
   for (auto& s : stats)
     f << "thread " << s.tid << " " << s.ops << " " << (uint64_t)ticksToUs(s.busyTicks) << " "
       << (uint64_t)ticksToUs(s.endTicks - s.startTicks) << "\n";
@@ -970,6 +1096,7 @@ int runChild(const Options& o)
 // parent (never touches the trace)
 
 struct OpResult { std::string name; uint64_t count = 0, us = 0, diffs = 0, recCount = 0, recUs = 0; };
+struct HistResult { uint64_t p50 = 0, p95 = 0, max = 0; };
 struct ThreadResult { uint64_t tid = 0, ops = 0, busyUs = 0, spanUs = 0; };
 
 struct Result {
@@ -979,6 +1106,7 @@ struct Result {
   std::map<std::string, uint64_t> scalars;
   std::vector<OpResult> ops;
   std::vector<ThreadResult> threads;
+  std::map<std::string, HistResult> hists;
   std::vector<std::string> samples;
   uint64_t sc(const char* k) const { auto it = scalars.find(k); return it == scalars.end() ? 0 : it->second; }
 };
@@ -995,6 +1123,11 @@ void parseResult(const std::wstring& path, Result& r)
       OpResult o;
       ss >> o.name >> o.count >> o.us >> o.diffs >> o.recCount >> o.recUs;
       r.ops.push_back(o);
+    } else if (key == "hist") {
+      std::string name;
+      HistResult h;
+      ss >> name >> h.p50 >> h.p95 >> h.max;
+      r.hists[name] = h;
     } else if (key == "thread") {
       ThreadResult t;
       ss >> t.tid >> t.ops >> t.busyUs >> t.spanUs;
@@ -1138,7 +1271,14 @@ std::string writeJson(const Options& o, const std::vector<Result>& results)
         << ", \"total_us\": " << x.us << ", \"status_diffs\": " << x.diffs
         << ", \"recorded_count\": " << x.recCount << ", \"recorded_us\": " << x.recUs << "}";
     }
-    j << "\n      },\n      \"threads\": [";
+    j << "\n      },\n      \"latency_ns\": {";
+    {
+      size_t k = 0;
+      for (auto& [name, h] : r.hists)
+        j << (k++ ? ", " : "") << "\"" << name << "\": {\"p50\": " << h.p50 << ", \"p95\": " << h.p95
+          << ", \"max\": " << h.max << "}";
+    }
+    j << "},\n      \"threads\": [";
     for (size_t k = 0; k < r.threads.size(); ++k) {
       const ThreadResult& t = r.threads[k];
       j << (k ? ", " : "") << "{\"tid\": " << t.tid << ", \"ops\": " << t.ops << ", \"busy_us\": " << t.busyUs
@@ -1193,6 +1333,32 @@ std::string table(const std::vector<Result>& results)
       const OpResult* x = nullptr;
       for (auto& y : r.ops) if (y.name == n) x = &y;
       std::snprintf(b, sizeof(b), " %9llu/%9.1f", x ? (unsigned long long)x->count : 0ull, x ? x->us / 1000.0 : 0.0);
+      out += b;
+    }
+    out += "\n";
+  }
+  out += "\nlatency per call in us: p50 / p95 / max   (histogram, ~6% resolution)\n";
+  std::snprintf(b, sizeof(b), "%-27s", "op");
+  out += b;
+  for (const Result& r : results) {
+    std::snprintf(b, sizeof(b), " %26.26s", r.cfg.name.c_str());
+    out += b;
+  }
+  out += "\n";
+  for (const std::string& n : names) {
+    bool any = false;
+    for (const Result& r : results) any |= r.hists.count(n) != 0;
+    if (!any) continue;
+    std::snprintf(b, sizeof(b), "%-27s", n.c_str());
+    out += b;
+    for (const Result& r : results) {
+      auto it = r.hists.find(n);
+      if (it == r.hists.end()) { std::snprintf(b, sizeof(b), " %26s", "-"); }
+      else {
+        char cell[64];
+        std::snprintf(cell, sizeof(cell), "%.1f/%.1f/%.0f", it->second.p50 / 1000.0, it->second.p95 / 1000.0, it->second.max / 1000.0);
+        std::snprintf(b, sizeof(b), " %26s", cell);
+      }
       out += b;
     }
     out += "\n";

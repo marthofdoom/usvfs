@@ -1045,7 +1045,7 @@ BOOL WINAPI usvfs::hook_SetCurrentDirectoryA(LPCSTR lpPathName) {
       ush::string_cast<std::wstring>(lpPathName).c_str());
 }
 
-BOOL WINAPI usvfs::hook_SetCurrentDirectoryW(LPCWSTR lpPathName)
+BOOL WINAPI usvfs::impl_SetCurrentDirectoryW(LPCWSTR lpPathName)
 {
   BOOL res = FALSE;
 

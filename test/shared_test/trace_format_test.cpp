@@ -146,7 +146,7 @@ TEST(TraceFormat, Kernel32Ops)
   r.status = 5;
   EXPECT_EQ(r, roundTrip(r));
 
-  for (Op op : {Op::GetAttr, Op::GetAttrEx, Op::FindFirst, Op::ProfSection, Op::WriteMarker}) {
+  for (Op op : {Op::GetAttr, Op::GetAttrEx, Op::FindFirst, Op::ProfSection, Op::WriteMarker, Op::FindNext, Op::FindClose, Op::SetCwd}) {
     r.op = op;
     EXPECT_EQ(r, roundTrip(r));
   }

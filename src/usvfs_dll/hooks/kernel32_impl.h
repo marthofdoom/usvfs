@@ -21,6 +21,7 @@ DWORD WINAPI impl_GetPrivateProfileSectionA(LPCSTR lpAppName, LPSTR lpReturnedSt
                                             LPCSTR lpFileName);
 DWORD WINAPI impl_GetPrivateProfileSectionW(LPCWSTR lpAppName, LPWSTR lpReturnedString, DWORD nSize,
                                             LPCWSTR lpFileName);
+BOOL WINAPI impl_SetCurrentDirectoryW(LPCWSTR lpPathName);
 BOOL WINAPI impl_DeleteFileW(LPCWSTR lpFileName);
 BOOL WINAPI impl_MoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName);
 BOOL WINAPI impl_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags);
@@ -28,5 +29,10 @@ BOOL WINAPI impl_WritePrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, 
                                             LPCSTR lpFileName);
 BOOL WINAPI impl_WritePrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpString,
                                             LPCWSTR lpFileName);
+
+// installed only while tracing (usvfs itself does not hook them): FindNextFileW and
+// FindClose, so that the app's enumeration can be replayed call for call
+BOOL WINAPI hook_FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData);
+BOOL WINAPI hook_FindClose(HANDLE hFindFile);
 
 }  // namespace usvfs
