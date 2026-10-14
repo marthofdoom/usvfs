@@ -997,7 +997,7 @@ void init()
   const bool enabled =
       forced ? readcache::logic::parseFlag(forced, false) : isGameProcess();
   const uint64_t mb =
-      readcache::logic::parseNumber(env("USVFS_METACACHE_MB", buf, sizeof(buf)), 128);
+      readcache::logic::parseNumber(env("USVFS_METACACHE_MB", buf, sizeof(buf)), 1024);
   g = new State(mb << 20);
   g->lastLogTick.store(GetTickCount64());
   if (enabled)
