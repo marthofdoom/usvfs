@@ -28,7 +28,8 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 // Configuration of the cache layers. Every knob is named after its environment
 // variable (USVFS_READCACHE_MB, ...). Sources, highest priority first:
 //   1. the environment variable,
-//   2. the INI file named by USVFS_CONFIG, section/key derived from the name
+//   2. the INI file: the path in USVFS_CONFIG, else usvfs-cache.ini next to the usvfs
+//      DLL (optional; absent means built-in defaults); section/key derived from the name
 //      (USVFS_READCACHE_MB -> [readcache] mb, USVFS_READCACHE -> [readcache] enabled,
 //       USVFS_TRACE -> [trace] path, USVFS_CACHE_TOTAL_MB -> [cache] total_mb),
 //   3. the built-in default.
@@ -72,27 +73,72 @@ inline State& state()
   return *s;
 }
 
+// path of usvfs-cache.ini next to the DLL containing this code; empty on failure
+inline std::wstring dllIniPath()
+{
+  HMODULE mod = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(&dllIniPath), &mod))
+    return std::wstring();
+  std::wstring path(MAX_PATH, L'\0');
+  for (;;) {
+    const DWORD n =
+        GetModuleFileNameW(mod, path.data(), static_cast<DWORD>(path.size()));
+    if (n == 0 || path.size() > 32768)
+      return std::wstring();
+    if (n < path.size()) {
+      path.resize(n);
+      break;
+    }
+    path.resize(path.size() * 2);  // truncated: retry with a longer buffer
+  }
+  const size_t slash = path.find_last_of(L"\\/");
+  if (slash == std::wstring::npos)
+    return std::wstring();
+  return path.substr(0, slash + 1) + L"usvfs-cache.ini";
+}
+
 inline void load()
 {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.m);
   if (s.loaded)
     return;
-  s.loaded = true;
-  wchar_t wpath[2048];
-  const DWORD n = GetEnvironmentVariableW(L"USVFS_CONFIG", wpath, 2048);
-  if (n == 0 || n >= 2048)
-    return;
-  int len = WideCharToMultiByte(CP_UTF8, 0, wpath, static_cast<int>(n), nullptr, 0,
-                                nullptr, nullptr);
+  s.loaded     = true;
+  s.fileStatus = "none (no USVFS_CONFIG, no usvfs-cache.ini next to the DLL)";
+  wchar_t envPath[2048];
+  const DWORD n = GetEnvironmentVariableW(L"USVFS_CONFIG", envPath, 2048);
+  std::wstring wpath;
+  bool fromEnv = false;
+  if (n > 0 && n < 2048) {
+    wpath   = envPath;
+    fromEnv = true;
+  } else {
+    wpath = dllIniPath();
+    if (wpath.empty())
+      return;
+  }
+  int len =
+      WideCharToMultiByte(CP_UTF8, 0, wpath.c_str(), static_cast<int>(wpath.size()),
+                          nullptr, 0, nullptr, nullptr);
   s.filePath.resize(len > 0 ? len : 0);
   if (len > 0)
-    WideCharToMultiByte(CP_UTF8, 0, wpath, static_cast<int>(n), s.filePath.data(), len,
-                        nullptr, nullptr);
-  HANDLE h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, wpath.c_str(), static_cast<int>(wpath.size()),
+                        s.filePath.data(), len, nullptr, nullptr);
+  HANDLE h =
+      CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE) {
-    s.fileStatus = "cannot open (error " + std::to_string(GetLastError()) + ")";
+    if (!fromEnv) {
+      const DWORD err = GetLastError();
+      if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+        s.filePath.clear();  // optional file absent: built-in defaults, silently
+        return;
+      }
+    }
+    s.fileStatus = std::string(fromEnv ? "USVFS_CONFIG" : "next to DLL") +
+                   ", cannot open (error " + std::to_string(GetLastError()) + ")";
     return;
   }
   std::string text;
@@ -103,7 +149,8 @@ inline void load()
     text.append(buf, got);
   CloseHandle(h);
   s.file       = logic::parseIni(text);
-  s.fileStatus = "loaded, " + std::to_string(s.file.values.size()) + " keys";
+  s.fileStatus = std::string(fromEnv ? "USVFS_CONFIG" : "next to DLL") + ", loaded, " +
+                 std::to_string(s.file.values.size()) + " keys";
 }
 
 // raw value of a knob; `source` is "env", "file" or "" (not set)
@@ -235,8 +282,8 @@ inline void logEffective()
   State& s = state();
   std::lock_guard<std::mutex> lock(s.m);
   std::string out =
-      "effective configuration (USVFS_CONFIG=" +
-      (s.filePath.empty() ? std::string("<unset>") : s.filePath + ", " + s.fileStatus) +
+      "effective configuration (config file: " +
+      (s.filePath.empty() ? s.fileStatus : s.filePath + " [" + s.fileStatus + "]") +
       ")";
   for (const Entry& e : s.entries)
     out += "\n  " + e.name + " = " + e.value + "  [" + e.source + "]";

@@ -219,7 +219,8 @@ namespace
 
   bool envVar(const char* name, std::wstring& out)
   {
-    // environment first, then the USVFS_CONFIG file ([trace] path / crc)
+    // environment first, then the config file (USVFS_CONFIG, else usvfs-cache.ini next
+    // to the DLL) ([trace] path / crc)
     const std::string v = config::text(name);
     if (v.empty())
       return false;

@@ -486,7 +486,7 @@ namespace
 
     // layer 3
     bool splitEnabled      = true;
-    bool raEnabled         = true;
+    bool raEnabled         = false;
     uint64_t splitMinBytes = 256ull << 10;
     uint64_t splitChunk    = 256ull << 10;
     uint64_t raCapBytes    = 64ull << 20;
