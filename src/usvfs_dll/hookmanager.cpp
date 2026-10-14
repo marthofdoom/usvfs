@@ -23,6 +23,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "hooks/kernel32.h"
 #include "exceptionex.h"
 #include "usvfs.h"
+#include "readcache.h"
 #include "../thooklib/utility.h"
 #include "../thooklib/ttrampolinepool.h"
 #include <shmlogger.h>
@@ -58,6 +59,8 @@ HookManager::HookManager(const usvfsParameters& params, HMODULE module)
                              version.major, version.minor, version.build, version.servicpack, version.platformid,
                              shared::string_cast<std::string>(winapi::ex::wide::getWindowsBuildLab(true)).c_str());
 
+  readcache::init();
+
   initHooks();
 
   if (params.debugMode) {
@@ -68,6 +71,8 @@ HookManager::HookManager(const usvfsParameters& params, HMODULE module)
 HookManager::~HookManager()
 {
   spdlog::get("hooks")->debug("end hook of process {}", GetCurrentProcessId());
+  // stops the read cache workers; not called from DllMain, so waiting is safe
+  readcache::shutdown();
   removeHooks();
   m_Context.unregisterCurrentProcess();
 }
@@ -270,6 +275,9 @@ void HookManager::initHooks()
   installHook(ntdllMod, nullptr, "NtOpenFile", hook_NtOpenFile);
   installHook(ntdllMod, nullptr, "NtCreateFile", hook_NtCreateFile);
   installHook(ntdllMod, nullptr, "NtClose", hook_NtClose);
+  installHook(ntdllMod, nullptr, "NtReadFile", hook_NtReadFile);
+  installHook(ntdllMod, nullptr, "NtQueryInformationFile", hook_NtQueryInformationFile);
+  installHook(ntdllMod, nullptr, "NtSetInformationFile", hook_NtSetInformationFile);
   installHook(ntdllMod, nullptr, "NtTerminateProcess", hook_NtTerminateProcess);
 
   installHook(kbaseMod, k32Mod, "LoadLibraryExW", hook_LoadLibraryExW);

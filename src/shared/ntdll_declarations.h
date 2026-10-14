@@ -146,6 +146,12 @@ typedef struct _FILE_REPARSE_POINT_INFORMATION {
 #define STATUS_BUFFER_OVERFLOW ((NTSTATUS)0x80000005L)
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
 #define STATUS_NO_SUCH_FILE ((NTSTATUS)0xC000000FL)
+#ifndef STATUS_END_OF_FILE
+#define STATUS_END_OF_FILE ((NTSTATUS)0xC0000011L)
+#endif
+#ifndef STATUS_ACCESS_VIOLATION
+#define STATUS_ACCESS_VIOLATION ((NTSTATUS)0xC0000005L)
+#endif
 
 #define SL_RESTART_SCAN                 0x01
 #define SL_RETURN_SINGLE_ENTRY          0x02
@@ -158,7 +164,14 @@ typedef enum _FILE_INFORMATION_CLASS {
   FileDirectoryInformation       = 1,
   FileFullDirectoryInformation   = 2,
   FileBothDirectoryInformation   = 3,
+  FileStandardInformation        = 5,
+  FileInternalInformation        = 6,
+  FileAccessInformation          = 8,
+  FileNameInformation            = 9,
   FileNamesInformation           = 12,
+  FilePositionInformation        = 14,
+  FileModeInformation            = 16,
+  FileAllInformation             = 18,
   FileObjectIdInformation        = 29,
   FileReparsePointInformation    = 33,
   FileIdBothDirectoryInformation = 37,
@@ -277,6 +290,87 @@ typedef struct _FILE_BASIC_INFORMATION {
   ULONG         FileAttributes;
 } FILE_BASIC_INFORMATION, *PFILE_BASIC_INFORMATION;
 
+typedef struct _FILE_STANDARD_INFORMATION {
+  LARGE_INTEGER AllocationSize;
+  LARGE_INTEGER EndOfFile;
+  ULONG NumberOfLinks;
+  BOOLEAN DeletePending;
+  BOOLEAN Directory;
+} FILE_STANDARD_INFORMATION, *PFILE_STANDARD_INFORMATION;
+
+typedef struct _FILE_INTERNAL_INFORMATION {
+  LARGE_INTEGER IndexNumber;
+} FILE_INTERNAL_INFORMATION, *PFILE_INTERNAL_INFORMATION;
+
+typedef struct _FILE_EA_INFORMATION {
+  ULONG EaSize;
+} FILE_EA_INFORMATION, *PFILE_EA_INFORMATION;
+
+typedef struct _FILE_ACCESS_INFORMATION {
+  ACCESS_MASK AccessFlags;
+} FILE_ACCESS_INFORMATION, *PFILE_ACCESS_INFORMATION;
+
+typedef struct _FILE_POSITION_INFORMATION {
+  LARGE_INTEGER CurrentByteOffset;
+} FILE_POSITION_INFORMATION, *PFILE_POSITION_INFORMATION;
+
+typedef struct _FILE_MODE_INFORMATION {
+  ULONG Mode;
+} FILE_MODE_INFORMATION, *PFILE_MODE_INFORMATION;
+
+typedef struct _FILE_ALIGNMENT_INFORMATION {
+  ULONG AlignmentRequirement;
+} FILE_ALIGNMENT_INFORMATION, *PFILE_ALIGNMENT_INFORMATION;
+
+typedef struct _FILE_NAME_INFORMATION {
+  ULONG FileNameLength;
+  WCHAR FileName[1];
+} FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
+
+// the name at the end is variable-length; a call with a buffer that is too
+// small fails with STATUS_BUFFER_OVERFLOW but still fills in the fixed part
+typedef struct _FILE_ALL_INFORMATION {
+  FILE_BASIC_INFORMATION BasicInformation;
+  FILE_STANDARD_INFORMATION StandardInformation;
+  FILE_INTERNAL_INFORMATION InternalInformation;
+  FILE_EA_INFORMATION EaInformation;
+  FILE_ACCESS_INFORMATION AccessInformation;
+  FILE_POSITION_INFORMATION PositionInformation;
+  FILE_MODE_INFORMATION ModeInformation;
+  FILE_ALIGNMENT_INFORMATION AlignmentInformation;
+  FILE_NAME_INFORMATION NameInformation;
+} FILE_ALL_INFORMATION, *PFILE_ALL_INFORMATION;
+
+typedef enum _FS_INFORMATION_CLASS {
+  FileFsVolumeInformation = 1,
+  FileFsDeviceInformation = 4
+} FS_INFORMATION_CLASS,
+    *PFS_INFORMATION_CLASS;
+
+typedef struct _FILE_FS_VOLUME_INFORMATION {
+  LARGE_INTEGER VolumeCreationTime;
+  ULONG VolumeSerialNumber;
+  ULONG VolumeLabelLength;
+  BOOLEAN SupportsObjects;
+  WCHAR VolumeLabel[1];
+} FILE_FS_VOLUME_INFORMATION, *PFILE_FS_VOLUME_INFORMATION;
+
+typedef struct _FILE_FS_DEVICE_INFORMATION {
+  ULONG DeviceType;
+  ULONG Characteristics;
+} FILE_FS_DEVICE_INFORMATION, *PFILE_FS_DEVICE_INFORMATION;
+
+#ifndef FILE_DEVICE_DISK
+#define FILE_DEVICE_DISK 0x00000007
+#endif
+
+// NtQueryObject information class / result (name of the object behind a handle)
+#define ObjectNameInformationClass 1
+
+typedef struct _OBJECT_NAME_INFORMATION {
+  UNICODE_STRING Name;
+} OBJECT_NAME_INFORMATION, *POBJECT_NAME_INFORMATION;
+
 #define FILE_DIRECTORY_FILE                       0x00000001
 #define FILE_WRITE_THROUGH                        0x00000002
 #define FILE_SEQUENTIAL_ONLY                      0x00000004
@@ -328,6 +422,24 @@ typedef NTSTATUS(WINAPI *NtCreateFile_type)(PHANDLE, ACCESS_MASK,
 
 typedef NTSTATUS(WINAPI *NtClose_type)(HANDLE);
 
+typedef NTSTATUS(WINAPI *NtReadFile_type)(HANDLE, HANDLE, PIO_APC_ROUTINE,
+                                          PVOID, PIO_STATUS_BLOCK, PVOID, ULONG,
+                                          PLARGE_INTEGER, PULONG);
+
+typedef NTSTATUS(WINAPI *NtQueryInformationFile_type)(HANDLE, PIO_STATUS_BLOCK,
+                                                      PVOID, ULONG,
+                                                      FILE_INFORMATION_CLASS);
+
+typedef NTSTATUS(WINAPI *NtSetInformationFile_type)(HANDLE, PIO_STATUS_BLOCK,
+                                                    PVOID, ULONG,
+                                                    FILE_INFORMATION_CLASS);
+
+typedef NTSTATUS(WINAPI *NtQueryVolumeInformationFile_type)(
+    HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
+
+typedef NTSTATUS(WINAPI *NtQueryObject_type)(HANDLE, ULONG, PVOID, ULONG,
+                                             PULONG);
+
 typedef NTSYSAPI BOOLEAN(NTAPI *RtlDoesFileExists_U_type)(PCWSTR);
 
 typedef NTSTATUS(NTAPI *RtlDosPathNameToRelativeNtPathName_U_WithStatus_type)(
@@ -346,6 +458,11 @@ extern NtQueryAttributesFile_type NtQueryAttributesFile;
 extern NtOpenFile_type NtOpenFile;
 extern NtCreateFile_type NtCreateFile;
 extern NtClose_type NtClose;
+extern NtReadFile_type NtReadFile;
+extern NtQueryInformationFile_type NtQueryInformationFile;
+extern NtSetInformationFile_type NtSetInformationFile;
+extern NtQueryVolumeInformationFile_type NtQueryVolumeInformationFile;
+extern NtQueryObject_type NtQueryObject;
 extern RtlDoesFileExists_U_type RtlDoesFileExists_U;
 extern RtlDosPathNameToRelativeNtPathName_U_WithStatus_type RtlDosPathNameToRelativeNtPathName_U_WithStatus;
 extern RtlReleaseRelativeName_type RtlReleaseRelativeName;

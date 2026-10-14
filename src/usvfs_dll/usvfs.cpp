@@ -21,6 +21,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "usvfs.h"
 #include "usvfs_version.h"
 #include "hookmanager.h"
+#include "readcache.h"
 #include "usvfsparametersprivate.h"
 #include "redirectiontree.h"
 #include "loghelpers.h"
@@ -327,6 +328,10 @@ LONG WINAPI VEHandler(PEXCEPTION_POINTERS exceptionPtrs)
 {
   // NOTICE: don't use logger in VEHandler as it can cause another fault causing VEHandler
   // to be called again and so on.
+
+  // access violations inside the read cache's guarded copy are expected and handled
+  if (usvfs::readcache::inProtectedCopy())
+    return EXCEPTION_CONTINUE_SEARCH;
 
   if (   (exceptionPtrs->ExceptionRecord->ExceptionCode  < 0x80000000)      // non-critical
       || (exceptionPtrs->ExceptionRecord->ExceptionCode == 0xe06d7363)) {   // cpp exception

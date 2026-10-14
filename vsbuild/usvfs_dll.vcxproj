@@ -452,6 +452,7 @@
       <PrecompiledHeaderFile Condition="'$(Configuration)|$(Platform)'=='Release|x64'">pch.h</PrecompiledHeaderFile>
       <PrecompiledHeaderFile Condition="'$(Configuration)|$(Platform)'=='ReleaseTest|x64'">pch.h</PrecompiledHeaderFile>
     </ClCompile>
+    <ClCompile Include="..\src\usvfs_dll\readcache.cpp" />
     <ClCompile Include="..\src\usvfs_dll\redirectiontree.cpp" />
     <ClCompile Include="..\src\usvfs_dll\semaphore.cpp" />
     <ClCompile Include="..\src\usvfs_dll\sharedparameters.cpp" />
@@ -473,6 +474,8 @@
     <ClInclude Include="..\src\usvfs_dll\hooks\ntdll.h" />
     <ClInclude Include="..\src\usvfs_dll\hooks\sharedids.h" />
     <ClInclude Include="..\src\usvfs_dll\maptracker.h" />
+    <ClInclude Include="..\src\usvfs_dll\readcache.h" />
+    <ClInclude Include="..\src\usvfs_dll\readcache_logic.h" />
     <ClInclude Include="..\src\usvfs_dll\redirectiontree.h" />
     <ClInclude Include="..\src\usvfs_dll\semaphore.h" />
     <ClInclude Include="..\src\usvfs_dll\stringcast_boost.h" />

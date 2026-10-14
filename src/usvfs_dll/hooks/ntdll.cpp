@@ -4,6 +4,7 @@
 #include "../hookcontext.h"
 #include "../hookcallcontext.h"
 #include "../maptracker.h"
+#include "../readcache.h"
 #include "../stringcast_boost.h"
 #include <usvfs.h>
 #include <stringutils.h>
@@ -1302,6 +1303,9 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
 {
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
+  // must happen before the real close: handle values get reused
+  usvfs::readcache::onClose(Handle);
+
   NTSTATUS res = STATUS_NO_SUCH_FILE;
 
   HOOK_START_GROUP(MutExHookGroup::ALL_GROUPS)
@@ -1425,6 +1429,92 @@ NTSTATUS WINAPI usvfs::hook_NtQueryFullAttributesFile(
   HOOK_END
 
   return res;
+}
+
+NTSTATUS WINAPI usvfs::hook_NtReadFile(
+  HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
+  PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+  PLARGE_INTEGER ByteOffset, PULONG Key)
+{
+  // read cache switched off: plain passthrough
+  if (!usvfs::readcache::enabled()) {
+    return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                        Buffer, Length, ByteOffset, Key);
+  }
+
+  PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
+
+  // readcache::read() ends up in the real function by itself whenever it
+  // doesn't serve the request, and never throws
+  HOOK_START_GROUP(MutExHookGroup::ALL_GROUPS)
+  if (!callContext.active()) {
+    return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                        Buffer, Length, ByteOffset, Key);
+  }
+
+  return usvfs::readcache::read(FileHandle, Event, ApcRoutine, ApcContext,
+                                IoStatusBlock, Buffer, Length, ByteOffset, Key);
+  HOOK_END
+
+  // only reached if the shim threw; nothing was read yet in that case
+  return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                      Buffer, Length, ByteOffset, Key);
+}
+
+NTSTATUS WINAPI usvfs::hook_NtQueryInformationFile(
+  HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+  ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
+{
+  // only the position is of interest
+  if (!usvfs::readcache::enabled() ||
+      (FileInformationClass != FilePositionInformation &&
+       FileInformationClass != FileAllInformation)) {
+    return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                    Length, FileInformationClass);
+  }
+
+  PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
+
+  HOOK_START_GROUP(MutExHookGroup::ALL_GROUPS)
+  if (!callContext.active()) {
+    return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                    Length, FileInformationClass);
+  }
+
+  return usvfs::readcache::queryInformation(FileHandle, IoStatusBlock,
+                                            FileInformation, Length,
+                                            FileInformationClass);
+  HOOK_END
+
+  return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                  Length, FileInformationClass);
+}
+
+NTSTATUS WINAPI usvfs::hook_NtSetInformationFile(
+  HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+  ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
+{
+  if (!usvfs::readcache::enabled() ||
+      FileInformationClass != FilePositionInformation) {
+    return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                  Length, FileInformationClass);
+  }
+
+  PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
+
+  HOOK_START_GROUP(MutExHookGroup::ALL_GROUPS)
+  if (!callContext.active()) {
+    return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                  Length, FileInformationClass);
+  }
+
+  return usvfs::readcache::setInformation(FileHandle, IoStatusBlock,
+                                          FileInformation, Length,
+                                          FileInformationClass);
+  HOOK_END
+
+  return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                Length, FileInformationClass);
 }
 
 NTSTATUS WINAPI usvfs::hook_NtTerminateProcess(
