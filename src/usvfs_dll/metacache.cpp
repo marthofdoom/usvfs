@@ -1134,6 +1134,11 @@ bool enumFrontEnabled()
   return gEnum != nullptr && enabled();
 }
 
+bool enumFrontActive()
+{
+  return gEnum != nullptr;
+}
+
 static void enumPublish(const std::wstring& key, const std::wstring& dirNt, uint64_t gen,
                         std::shared_ptr<EnumListing> listing)
 {

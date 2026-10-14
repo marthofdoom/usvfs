@@ -136,6 +136,8 @@ struct EnumTicket
 };
 
 bool enumFrontEnabled();
+// registry exists (also true after shutdown(), so open searches are still routed)
+bool enumFrontActive();
 // true if answered from a listing (res/err are the results; `data` is filled)
 bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, DWORD flags,
                void* data, HANDLE& res, DWORD& err, EnumTicket& ticket);
