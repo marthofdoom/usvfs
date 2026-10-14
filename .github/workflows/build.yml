@@ -2,14 +2,14 @@ name: Build USVFS
 
 on:
   push:
-    branches: [master, dev/cmake]
+    branches: [master, dev/cmake, readcache-for-omni-ci]
     tags:
       - "*"
   pull_request:
     types: [opened, synchronize, reopened]
 
 env:
-  VCPKG_BINARY_SOURCES: clear;x-azblob,${{ vars.AZ_BLOB_VCPKG_URL }},${{ secrets.AZ_BLOB_SAS }},readwrite
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
 
 jobs:
   build:
@@ -28,6 +28,12 @@ jobs:
 
       # checkout USVFS and vcpkg
       - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-${{ matrix.arch }}-
 
       # configure
       - run: cmake --preset vs2022-windows-${{ matrix.arch }} -B build_${{ matrix.arch }} "-DCMAKE_INSTALL_PREFIX=install/${{ matrix.config }}"
