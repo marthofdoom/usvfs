@@ -29,7 +29,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 // variable (USVFS_READCACHE_MB, ...). Sources, highest priority first:
 //   1. the environment variable,
 //   2. the INI file: the path in USVFS_CONFIG, else usvfs-cache.ini next to the usvfs
-//      DLL (optional; absent means built-in defaults); section/key derived from the name
+//      DLL (optional; absent means built-in defaults); key derived from the name
 //      (USVFS_READCACHE_MB -> [readcache] mb, USVFS_READCACHE -> [readcache] enabled,
 //       USVFS_TRACE -> [trace] path, USVFS_CACHE_TOTAL_MB -> [cache] total_mb),
 //   3. the built-in default.
