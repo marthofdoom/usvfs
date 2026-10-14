@@ -37,7 +37,10 @@ inside the injected usvfs DLL (see `/mnt/gaming/modlists/Projects/Linux-Storage-
 - Memory: `USVFS_METACACHE_MB` (default clamp(RAM/64,256,1024)) caps the attr/listing store; the enum front gets
   up to half of it again and the attr front up to a quarter, so the metacache totals ~1.75x that value, plus the
   readcache budget (`USVFS_READCACHE_MB`, default clamp(RAM/32,256,1024)). Front pre-warm
-  (`USVFS_METACACHE_FRONT_PREWARM`, `_SEC`) runs on its own thread (BgPool workers block all hooks), untraced.
+  (`USVFS_METACACHE_FRONT_PREWARM`) : attr front entries are synthesized during the main pre-warm walk from the real
+  target's attributes (no hooked calls); the enum front is filled by `_THREADS` (default 4) dedicated BELOW_NORMAL threads
+  running the hooked FindFirstFileExW per directory (Data first, then breadth-first), untraced (BgPool workers block all
+  hooks). Progress is logged every 5 s; `_SEC` (default 0 = none) is an optional time budget.
   Enum front derives only literal masks from a cached "*" listing (long or short name equality).
 - Trace (harness): `src/usvfs_dll/trace.{h,cpp}`, `trace_format.h`. `USVFS_TRACE=<win path>`,
   `USVFS_TRACE_CRC=1`. Init logs one line to the usvfs log ("trace enabled/disabled: reason").

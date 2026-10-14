@@ -425,3 +425,14 @@ TEST(MetaCacheFront, EnumKeyRejected)
   EXPECT_EQ(L"", frontEnumKey(L"*", L"", 0, 0));                  // no cwd
   EXPECT_EQ(L"", frontEnumKey(LR"(\*)", LR"(C:\G)", 0, 0));       // rooted without drive
 }
+
+TEST(MetaCacheFront, PrewarmRank)
+{
+  EXPECT_EQ(0, frontPrewarmRank("Z:/game/Data"));
+  EXPECT_EQ(0, frontPrewarmRank("Z:/game/data/Meshes"));
+  EXPECT_EQ(0, frontPrewarmRank("Z:\\game\\DATA"));
+  EXPECT_LT(frontPrewarmRank("Z:/game/data/meshes"), frontPrewarmRank("Z:/game/saves"));
+  EXPECT_GT(frontPrewarmRank("Z:/game/data/meshes/actors"), frontPrewarmRank("Z:/game/saves"));
+  EXPECT_LT(frontPrewarmRank("Z:/a"), frontPrewarmRank("Z:/a/b"));
+  EXPECT_EQ(1, frontPrewarmRank(""));
+}

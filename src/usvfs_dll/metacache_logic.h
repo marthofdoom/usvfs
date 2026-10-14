@@ -195,6 +195,32 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
   return key;
 }
 
+// Visiting order of the enumeration front pre-warm (lower first): the "Data"
+// directory and its direct children (what the game lists first) rank 0, every
+// other directory ranks by its depth (breadth-first), below Data by 1 + depth.
+// `vpath` uses '/' or '\\' separators.
+inline int frontPrewarmRank(std::string_view vpath)
+{
+  int depth = 0, dataAt = -1;
+  size_t pos = 0;
+  while (pos < vpath.size()) {
+    size_t end = pos;
+    while (end < vpath.size() && vpath[end] != '/' && vpath[end] != '\\')
+      ++end;
+    if (end > pos) {
+      const std::string_view seg = vpath.substr(pos, end - pos);
+      if (dataAt < 0 && seg.size() == 4 && (seg[0] | 0x20) == 'd' && (seg[1] | 0x20) == 'a' &&
+          (seg[2] | 0x20) == 't' && (seg[3] | 0x20) == 'a')
+        dataAt = depth;
+      ++depth;
+    }
+    pos = end + 1;
+  }
+  if (dataAt >= 0 && depth - 1 - dataAt <= 1)
+    return 0;
+  return 1 + depth;
+}
+
 // parent directory of a normalized path; empty if there is none
 inline std::wstring parentPath(const std::wstring& normalized)
 {

@@ -32,6 +32,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include <cwchar>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <thread>
@@ -317,7 +318,12 @@ struct State
   std::thread frontThread;
   std::atomic<bool> frontRunning{false};
   bool frontPrewarm = false;  // USVFS_METACACHE_FRONT_PREWARM (game process only)
-  int frontPrewarmSec = 90;   // time budget of the front pre-warm
+  int frontPrewarmSec = 0;    // optional time budget of the front pre-warm (0 = none)
+  int frontPrewarmThreads = 4;
+  std::atomic<uint64_t> frontAttrSynth{0};  // attr front entries synthesized by the main pre-warm
+  std::atomic<uint64_t> frontDirsDone{0};
+  std::atomic<uint64_t> frontListsDone{0};
+  std::atomic<uint64_t> frontStartTick{0};
   std::atomic<bool> prewarmCapped{false};
 
   std::atomic<uint64_t> tick{0};
@@ -831,11 +837,13 @@ HANDLE openDirectory(const std::wstring& ntPath)
   return (st < 0) ? nullptr : h;
 }
 
-void prewarmAttr(const std::wstring& realNtPath)
+// Stores the real file's attributes in the store; `out` (optional) receives them
+// when the file exists (also if they were already stored: it is queried again).
+bool prewarmAttr(const std::wstring& realNtPath, logic::Attr* out = nullptr)
 {
   const std::wstring key = makeKey(realNtPath);
-  if (key.empty() || g->store.hasAttr(key))
-    return;
+  if (key.empty() || (!out && g->store.hasAttr(key)))
+    return false;
 
   UNICODE_STRING name;
   name.Buffer        = const_cast<PWSTR>(realNtPath.c_str());
@@ -850,11 +858,78 @@ void prewarmAttr(const std::wstring& realNtPath)
   FILE_NETWORK_OPEN_INFORMATION info;
   std::memset(&info, 0, sizeof(info));
   const NTSTATUS st = ::NtQueryFullAttributesFile(&attrs, &info);
+  bool ok = false;
   if (cacheableStatus(st)) {
-    g->store.putAttr(key, toAttr(st, &info));
-    g->prewarmAttrStored.fetch_add(1, std::memory_order_relaxed);
+    const logic::Attr a = toAttr(st, &info);
+    if (!g->store.hasAttr(key)) {
+      g->store.putAttr(key, a);
+      g->prewarmAttrStored.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (out && st == STATUS_SUCCESS) {
+      *out = a;
+      ok   = true;
+    }
   }
   g->prewarmFiles.fetch_add(1, std::memory_order_relaxed);
+  return ok;
+}
+
+// Attr front entries for virtual files, synthesized from the real target's
+// attributes (what hook_GetFileAttributesW/ExW would return for the virtual
+// path: the real call's result). Built per directory, inserted in one batch.
+struct FrontBatch
+{
+  std::vector<std::pair<FrontKey, FrontResult>> items;
+};
+
+void frontBatchAdd(FrontBatch& batch, const std::string& vpath, const logic::Attr& a)
+{
+  std::wstring w = shared::string_cast<std::wstring>(vpath, shared::CodePage::UTF8);
+  std::replace(w.begin(), w.end(), L'/', L'\\');
+  std::wstring key = logic::frontKey(w, std::wstring_view());
+  if (key.empty() || key.size() < 3 || key[1] != L':')
+    return;
+  const std::wstring virtualNt = makeKey(std::wstring(LR"(\??\)") + key);
+  if (virtualNt.empty() || g->store.isVolatile(virtualNt))
+    return;
+  FrontResult r;
+  r.ok   = true;
+  r.err  = 0;
+  r.attr = a.attributes;
+  WIN32_FILE_ATTRIBUTE_DATA& d = r.data;
+  d.dwFileAttributes = a.attributes;
+  auto ft = [](int64_t v, FILETIME& f) {
+    f.dwLowDateTime  = static_cast<DWORD>(static_cast<uint64_t>(v) & 0xFFFFFFFFu);
+    f.dwHighDateTime = static_cast<DWORD>(static_cast<uint64_t>(v) >> 32);
+  };
+  ft(a.creation, d.ftCreationTime);
+  ft(a.access, d.ftLastAccessTime);
+  ft(a.write, d.ftLastWriteTime);
+  d.nFileSizeLow  = static_cast<DWORD>(static_cast<uint64_t>(a.endOfFile) & 0xFFFFFFFFu);
+  d.nFileSizeHigh = static_cast<DWORD>(static_cast<uint64_t>(a.endOfFile) >> 32);
+  std::wstring k1 = key, k2 = key;
+  k1.push_back(L'\x01');
+  k2.push_back(L'\x02');
+  batch.items.emplace_back(makeFrontKey(k1), r);
+  batch.items.emplace_back(makeFrontKey(k2), r);
+}
+
+void frontBatchCommit(FrontBatch& batch, uint64_t gen)
+{
+  FrontState* f = gFront;
+  if (!f || batch.items.empty())
+    return;
+  std::unique_lock<std::shared_mutex> lock(f->mutex);
+  if (g->store.generation() != gen)
+    return;
+  if (f->entries.size() * 4 + batch.items.size() * 4 >= f->maxEntries * 3)
+    return;  // keep room for what the game fills itself
+  for (auto& it : batch.items) {
+    FrontEntry& e = f->entries[it.first];
+    e.gen    = gen;
+    e.result = it.second;
+  }
+  g->frontAttrSynth.fetch_add(batch.items.size(), std::memory_order_relaxed);
 }
 
 void prewarmListing(const std::wstring& virtualKey, const std::wstring& realNtPath, int cls)
@@ -958,106 +1033,203 @@ void prewarmDirectory(const std::string& vpath, const std::string& link);
 void prewarmRealDirectory(const std::string& realDir);
 
 
-// Pre-warm of the front caches: runs the real (hooked) FindFirstFileExW "*"
+// Enumeration front pre-warm (the attribute front is synthesized during the main
+// pre-warm walk, see frontBatchAdd). Runs the real (hooked) FindFirstFileExW "*"
 // enumeration of every virtual directory, which records and publishes the
-// listing, and GetFileAttributesExW of every virtual file, which stores the
-// attribute front entry. One low-priority job after the main pre-warm; stops at
-// the time budget, at 75% of either front cache, when the generation moves or
-// at shutdown. Never touches game threads' data except through the same
-// publish paths they use.
-void frontPrewarmJob()
+// listing: exact usvfs merge semantics. N worker threads (dedicated threads, not
+// BgPool workers, which block every hook group: the hooks must behave as for the
+// game or nothing would be recorded), BELOW_NORMAL, never traced. Directories
+// are visited by logic::frontPrewarmRank (Data and its children first, then
+// breadth-first). Stops when the enum cache is 75% full, when the generation
+// moves, at shutdown, or at the optional time budget.
+struct FrontJob
 {
-  // A dedicated thread (not a BgPool worker, which blocks every hook group): the
-  // hooks must behave as for the game or nothing would be recorded. Never traced.
+  std::mutex m;
+  std::condition_variable cv;
+  std::multimap<std::pair<int, uint64_t>, std::string> queue;  // (rank, seq) -> vpath
+  uint64_t seq    = 0;
+  int busy        = 0;  // workers holding a directory
+  int alive       = 0;  // workers not yet finished
+  bool stop       = false;
+  const char* why = "done";
+  uint64_t gen0   = 0;
+};
+
+void frontJobStop(FrontJob& job, const char* why)
+{
+  std::lock_guard<std::mutex> lock(job.m);
+  if (!job.stop) {
+    job.stop = true;
+    job.why  = why;
+  }
+  job.cv.notify_all();
+}
+
+void frontPrewarmWorker(std::shared_ptr<FrontJob> job)
+{
   trace::setInternalThread(true);
-  const uint64_t start = GetTickCount64();
-  const uint64_t gen0  = g->store.generation();
-  uint64_t dirs = 0, files = 0, lists = 0;
-  const char* stop = "done";
-  const HANDLE self = GetCurrentThread();
-  SetThreadPriority(self, THREAD_PRIORITY_BELOW_NORMAL);
-  auto frontFill = [&]() -> size_t {
-    if (!gFront)
-      return 0;
-    std::shared_lock<std::shared_mutex> lock(gFront->mutex);
-    return gFront->entries.size();
-  };
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   auto enumBytes = [&]() -> size_t {
     if (!gEnum)
       return 0;
     std::lock_guard<std::mutex> lock(gEnum->mutex);
     return gEnum->bytes;
   };
-  const uint64_t recordsBefore = gEnum ? gEnum->records.load() : 0;
-  const size_t frontBefore     = frontFill();
   try {
-    std::vector<std::string> todo{std::string()};
-    while (!todo.empty() && stop[0] == 'd') {
-      const std::string vpath = std::move(todo.back());
-      todo.pop_back();
-      std::vector<Child> kids;
-      if (!listChildren(vpath, kids))
-        continue;
-      if (gEnum && !vpath.empty() && !kids.empty()) {
-        std::wstring winDir = shared::string_cast<std::wstring>(vpath, shared::CodePage::UTF8);
-        std::replace(winDir.begin(), winDir.end(), L'/', L'\\');
-        for (int level = 0; level <= 1; ++level) {
-          WIN32_FIND_DATAW fd;
-          const std::wstring pat = winDir + L"\\*";
-          HANDLE h = ::FindFirstFileExW(pat.c_str(), static_cast<FINDEX_INFO_LEVELS>(level), &fd,
-                                        FindExSearchNameMatch, nullptr, 0);
-          if (h != INVALID_HANDLE_VALUE) {
-            while (::FindNextFileW(h, &fd) && !g->pool.stopping()) {
+    uint32_t n = 0;
+    for (;;) {
+      std::string vpath;
+      {
+        std::unique_lock<std::mutex> lock(job->m);
+        for (;;) {
+          if (job->stop)
+            goto out;
+          if (!job->queue.empty()) {
+            auto it = job->queue.begin();
+            vpath   = std::move(it->second);
+            job->queue.erase(it);
+            ++job->busy;
+            break;
+          }
+          if (job->busy == 0) {  // nothing queued, nobody can add more
+            job->cv.notify_all();
+            goto out;
+          }
+          job->cv.wait_for(lock, chr::milliseconds(100));
+        }
+      }
+      bool failed = false;
+      try {
+        if (g->pool.stopping()) {
+          frontJobStop(*job, "shutdown");
+        } else if (g->store.generation() != job->gen0) {
+          frontJobStop(*job, "generation moved");
+        } else if (gEnum && enumBytes() * 4 >= gEnum->maxBytes * 3) {
+          frontJobStop(*job, "cache budget");
+        } else if (g->frontPrewarmSec > 0 &&
+                   GetTickCount64() - g->frontStartTick.load() >
+                       static_cast<uint64_t>(g->frontPrewarmSec) * 1000) {
+          frontJobStop(*job, "time budget");
+        } else {
+          std::vector<Child> kids;
+          if (listChildren(vpath, kids)) {
+            {
+              std::lock_guard<std::mutex> lock(job->m);
+              for (const Child& c : kids) {
+                if (!c.dir)
+                  continue;
+                std::string child = vpath.empty() ? c.name : vpath + "/" + c.name;
+                const int rank    = logic::frontPrewarmRank(child);
+                job->queue.emplace(std::make_pair(rank, job->seq++), std::move(child));
+              }
+              job->cv.notify_all();
             }
-            ::FindClose(h);
-            ++lists;
+            if (gEnum && !vpath.empty() && !kids.empty()) {
+              std::wstring winDir =
+                  shared::string_cast<std::wstring>(vpath, shared::CodePage::UTF8);
+              std::replace(winDir.begin(), winDir.end(), L'/', L'\\');
+              for (int level = 0; level <= 1; ++level) {
+                WIN32_FIND_DATAW fd;
+                const std::wstring pat = winDir + L"\\*";
+                HANDLE h = ::FindFirstFileExW(pat.c_str(), static_cast<FINDEX_INFO_LEVELS>(level),
+                                              &fd, FindExSearchNameMatch, nullptr, 0);
+                if (h != INVALID_HANDLE_VALUE) {
+                  while (::FindNextFileW(h, &fd) && !g->pool.stopping()) {
+                  }
+                  ::FindClose(h);
+                  g->frontListsDone.fetch_add(1, std::memory_order_relaxed);
+                }
+              }
+              g->frontDirsDone.fetch_add(1, std::memory_order_relaxed);
+            }
           }
         }
-        ++dirs;
-        Sleep(1);  // yield: every hooked search takes the context write lock
+      } catch (...) {
+        failed = true;
       }
-      uint32_t n = 0;
-      for (const Child& c : kids) {
-        if (g->pool.stopping()) {
-          stop = "shutdown";
-          break;
-        }
-        if (g->store.generation() != gen0) {
-          stop = "generation moved";
-          break;
-        }
-        if (GetTickCount64() - start > static_cast<uint64_t>(g->frontPrewarmSec) * 1000) {
-          stop = "time budget";
-          break;
-        }
-        if ((gFront && frontFill() * 4 >= gFront->maxEntries * 3) ||
-            (gEnum && enumBytes() * 4 >= gEnum->maxBytes * 3)) {
-          stop = "cache budget";
-          break;
-        }
-        const std::string childPath = vpath.empty() ? c.name : vpath + "/" + c.name;
-        if (c.dir) {
-          todo.push_back(childPath);
-        } else if (c.file && gFront) {
-          std::wstring w = shared::string_cast<std::wstring>(childPath, shared::CodePage::UTF8);
-          std::replace(w.begin(), w.end(), L'/', L'\\');
-          WIN32_FILE_ATTRIBUTE_DATA data;
-          ::GetFileAttributesExW(w.c_str(), GetFileExInfoStandard, &data);
-          ++files;
-          if ((++n & 63) == 0)
-            Sleep(0);
-        }
+      {
+        std::lock_guard<std::mutex> lock(job->m);
+        --job->busy;
+        job->cv.notify_all();
       }
+      if (failed)
+        frontJobStop(*job, "exception");
+      if ((++n & 3) == 0)
+        Sleep(0);  // yield: every hooked search takes the context write lock
     }
   } catch (...) {
-    stop = "exception";
+    frontJobStop(*job, "exception");
   }
-  if (auto logger = spdlog::get("usvfs")) {
-    logger->info("metacache: front pre-warm {} after {} ms: {} directories, {} searches, {} files; "
-                 "front entries {} -> {}, enum listings recorded +{}, enum bytes={}",
-                 stop, GetTickCount64() - start, dirs, lists, files, frontBefore, frontFill(),
-                 (gEnum ? gEnum->records.load() : 0) - recordsBefore, enumBytes());
+out:
+  std::lock_guard<std::mutex> lock(job->m);
+  --job->alive;
+  job->cv.notify_all();
+}
+
+void frontLogProgress(const char* what, uint64_t sinceMs, size_t frontNow, uint64_t recordsGained)
+{
+  if (auto logger = spdlog::get("usvfs"))
+    logger->info("metacache: front pre-warm {} after {} ms: {} directories, {} searches, "
+                 "attr entries synthesized {} (front now {}), enum listings recorded +{}",
+                 what, sinceMs, g->frontDirsDone.load(), g->frontListsDone.load(),
+                 g->frontAttrSynth.load(), frontNow, recordsGained);
+}
+
+void frontPrewarmJob()
+{
+  trace::setInternalThread(true);
+  const uint64_t start = GetTickCount64();
+  g->frontStartTick.store(start);
+  auto job  = std::make_shared<FrontJob>();
+  job->gen0 = g->store.generation();
+  job->queue.emplace(std::make_pair(std::make_pair(-1, job->seq++), std::string()));
+  const uint64_t recordsBefore = gEnum ? gEnum->records.load() : 0;
+  auto frontFill = [&]() -> size_t {
+    if (!gFront)
+      return 0;
+    std::shared_lock<std::shared_mutex> lock(gFront->mutex);
+    return gFront->entries.size();
+  };
+  if (auto logger = spdlog::get("usvfs"))
+    logger->info("metacache: front pre-warm start: {} threads, attr entries synthesized so far {}, "
+                 "front entries {}",
+                 g->frontPrewarmThreads, g->frontAttrSynth.load(), frontFill());
+  int started = 0;
+  for (int i = 0; i < g->frontPrewarmThreads; ++i) {
+    try {
+      {
+        std::lock_guard<std::mutex> lock(job->m);
+        ++job->alive;
+      }
+      std::thread([job] { frontPrewarmWorker(job); }).detach();
+      ++started;
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(job->m);
+      --job->alive;
+    }
   }
+  uint64_t lastLog = start;
+  {
+    std::unique_lock<std::mutex> lock(job->m);
+    while (job->alive > 0) {
+      job->cv.wait_for(lock, chr::milliseconds(200));
+      if (g->pool.stopping() && !job->stop) {
+        job->stop = true;
+        job->why  = "shutdown";
+      }
+      const uint64_t now = GetTickCount64();
+      if (now - lastLog >= 5000) {
+        lastLog = now;
+        lock.unlock();
+        frontLogProgress("progress", now - start, frontFill(),
+                         (gEnum ? gEnum->records.load() : 0) - recordsBefore);
+        lock.lock();
+      }
+    }
+  }
+  (void)started;
+  frontLogProgress(job->why, GetTickCount64() - start, frontFill(),
+                   (gEnum ? gEnum->records.load() : 0) - recordsBefore);
   g->frontRunning.store(false);
 }
 
@@ -1065,7 +1237,7 @@ void finishPrewarmJob()
 {
   if (g->prewarmPending.fetch_sub(1) == 1 && !g->prewarmDone.exchange(true)) {
     const uint64_t ms = GetTickCount64() - g->prewarmStart.load();
-    if (g->frontPrewarm && (gFront || gEnum) && !g->pool.stopping())
+    if (g->frontPrewarm && gEnum && !g->pool.stopping())
     {
       try {
         g->frontRunning.store(true);
@@ -1139,6 +1311,8 @@ void prewarmDirectory(const std::string& vpath, const std::string& link)
         }
       }
 
+      FrontBatch batch;
+      const uint64_t frontGen = g->store.generation();
       for (const Child& c : kids) {
         if (g->pool.stopping())
           break;
@@ -1153,7 +1327,13 @@ void prewarmDirectory(const std::string& vpath, const std::string& link)
             prewarmDirectory(childPath, link);
           });
         } else if (!c.dummy && !c.link.empty()) {
-          prewarmAttr(toNtPath(c.link));
+          if (gFront && g->frontPrewarm) {
+            logic::Attr a;
+            if (prewarmAttr(toNtPath(c.link), &a) && !g->store.isVolatile(makeKey(toNtPath(c.link))))
+              frontBatchAdd(batch, childPath, a);
+          } else {
+            prewarmAttr(toNtPath(c.link));
+          }
 
           // The game looks files up one by one in the real (mod) directory by
           // literal name; those queries are derived from a complete listing of
@@ -1173,6 +1353,7 @@ void prewarmDirectory(const std::string& vpath, const std::string& link)
           }
         }
       }
+      frontBatchCommit(batch, frontGen);
     }
   }
   {
@@ -1295,7 +1476,10 @@ void init()
     const char* fp = env("USVFS_METACACHE_FRONT_PREWARM", buf, sizeof(buf));
     g->frontPrewarm = fp ? readcache::logic::parseFlag(fp, true) : true;
     g->frontPrewarmSec = static_cast<int>(readcache::logic::parseNumber(
-        env("USVFS_METACACHE_FRONT_PREWARM_SEC", buf, sizeof(buf)), 90));
+        env("USVFS_METACACHE_FRONT_PREWARM_SEC", buf, sizeof(buf)), 0));
+    g->frontPrewarmThreads = static_cast<int>(std::clamp<uint64_t>(
+        readcache::logic::parseNumber(env("USVFS_METACACHE_FRONT_PREWARM_THREADS", buf, sizeof(buf)), 4),
+        1, 16));
   }
 
   const char* fe = env("USVFS_METACACHE_FRONT_ENUM", buf, sizeof(buf));
@@ -1338,8 +1522,11 @@ void shutdown()
     const uint64_t deadline = GetTickCount64() + 2000;
     while (g->frontRunning.load() && GetTickCount64() < deadline)
       Sleep(2);
-    if (g->frontRunning.load())
+    if (g->frontRunning.load()) {
+      frontLogProgress("still running at shutdown", GetTickCount64() - g->frontStartTick.load(),
+                       0, 0);
       g->frontThread.detach();
+    }
     else
       g->frontThread.join();
   }
