@@ -802,10 +802,17 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
   { // scope to limit context lifetime
     HookContext::ConstPtr context = READ_CONTEXT();
     Searches &activeSearches = context->customData<Searches>(SearchInfo);
-    std::lock_guard<std::mutex> mapLock(activeSearches.mapMutex);
+    // old entry is destroyed after mapMutex is released (~Info closes a handle,
+    // which re-enters impl_NtClose)
+    std::shared_ptr<Searches::Info> doomed;
+    std::unique_lock<std::mutex> mapLock(activeSearches.mapMutex);
 
     if (RestartScan) {
-      activeSearches.info.erase(FileHandle);
+      auto it = activeSearches.info.find(FileHandle);
+      if (it != activeSearches.info.end()) {
+        doomed = std::move(it->second);
+        activeSearches.info.erase(it);
+      }
     }
 
     // see if we already have a running search
@@ -832,9 +839,14 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
     // lock before publishing so no other thread can use the entry half-built
     infoLock = std::unique_lock<std::mutex>(infoPtr->mutex);
     {
-      std::lock_guard<std::mutex> mapLock(activeSearches.mapMutex);
-      activeSearches.info[FileHandle] = infoPtr;
-    }
+      std::shared_ptr<Searches::Info> replaced;
+      {
+        std::lock_guard<std::mutex> mapLock(activeSearches.mapMutex);
+        auto &slot = activeSearches.info[FileHandle];
+        replaced = std::move(slot);
+        slot = infoPtr;
+      }
+    } // replaced destructs outside mapMutex
     infoPtr->searchPattern.appendPath(FileName);
 
     SearchHandleMap &searchMap
@@ -976,10 +988,17 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
   { // scope to limit context lifetime
     HookContext::ConstPtr context = READ_CONTEXT();
     Searches &activeSearches = context->customData<Searches>(SearchInfo);
-    std::lock_guard<std::mutex> mapLock(activeSearches.mapMutex);
+    // old entry is destroyed after mapMutex is released (~Info closes a handle,
+    // which re-enters impl_NtClose)
+    std::shared_ptr<Searches::Info> doomed;
+    std::unique_lock<std::mutex> mapLock(activeSearches.mapMutex);
 
     if ((QueryFlags & SL_RESTART_SCAN)) {
-      activeSearches.info.erase(FileHandle);
+      auto it = activeSearches.info.find(FileHandle);
+      if (it != activeSearches.info.end()) {
+        doomed = std::move(it->second);
+        activeSearches.info.erase(it);
+      }
     }
 
     // see if we already have a running search
@@ -1006,9 +1025,14 @@ NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
     // lock before publishing so no other thread can use the entry half-built
     infoLock = std::unique_lock<std::mutex>(infoPtr->mutex);
     {
-      std::lock_guard<std::mutex> mapLock(activeSearches.mapMutex);
-      activeSearches.info[FileHandle] = infoPtr;
-    }
+      std::shared_ptr<Searches::Info> replaced;
+      {
+        std::lock_guard<std::mutex> mapLock(activeSearches.mapMutex);
+        auto &slot = activeSearches.info[FileHandle];
+        replaced = std::move(slot);
+        slot = infoPtr;
+      }
+    } // replaced destructs outside mapMutex
     infoPtr->searchPattern.appendPath(FileName);
 
     SearchHandleMap &searchMap
