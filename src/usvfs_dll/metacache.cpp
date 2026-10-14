@@ -1227,7 +1227,10 @@ void frontPrewarmJob()
       }
     }
   }
-  (void)started;
+  if (started == 0) {
+    if (auto logger = spdlog::get("usvfs"))
+      logger->warn("metacache: front pre-warm: no worker thread could be started");
+  }
   frontLogProgress(job->why, GetTickCount64() - start, frontFill(),
                    (gEnum ? gEnum->records.load() : 0) - recordsBefore);
   g->frontRunning.store(false);
@@ -1296,6 +1299,7 @@ void prewarmDirectory(const std::string& vpath, const std::string& link)
 
   if (!g->pool.stopping() && !g->prewarmCapped.load()) {
     std::vector<Child> kids;
+    const uint64_t frontGen = g->store.generation();  // before the tree is read
     if (listChildren(vpath, kids)) {
       g->prewarmDirs.fetch_add(1, std::memory_order_relaxed);
 
@@ -1312,7 +1316,6 @@ void prewarmDirectory(const std::string& vpath, const std::string& link)
       }
 
       FrontBatch batch;
-      const uint64_t frontGen = g->store.generation();
       for (const Child& c : kids) {
         if (g->pool.stopping())
           break;

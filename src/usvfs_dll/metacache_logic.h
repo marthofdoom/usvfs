@@ -196,7 +196,7 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
 }
 
 // Visiting order of the enumeration front pre-warm (lower first): the "Data"
-// directory and its direct children (what the game lists first) rank 0, every
+// directory (the last segment named data) and its direct children (what the game lists first) rank 0, every
 // other directory ranks by its depth (breadth-first), below Data by 1 + depth.
 // `vpath` uses '/' or '\\' separators.
 inline int frontPrewarmRank(std::string_view vpath)
@@ -209,7 +209,7 @@ inline int frontPrewarmRank(std::string_view vpath)
       ++end;
     if (end > pos) {
       const std::string_view seg = vpath.substr(pos, end - pos);
-      if (dataAt < 0 && seg.size() == 4 && (seg[0] | 0x20) == 'd' && (seg[1] | 0x20) == 'a' &&
+      if (seg.size() == 4 && (seg[0] | 0x20) == 'd' && (seg[1] | 0x20) == 'a' &&
           (seg[2] | 0x20) == 't' && (seg[3] | 0x20) == 'a')
         dataAt = depth;
       ++depth;

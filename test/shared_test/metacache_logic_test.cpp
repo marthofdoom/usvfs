@@ -435,4 +435,6 @@ TEST(MetaCacheFront, PrewarmRank)
   EXPECT_GT(frontPrewarmRank("Z:/game/data/meshes/actors"), frontPrewarmRank("Z:/game/saves"));
   EXPECT_LT(frontPrewarmRank("Z:/a"), frontPrewarmRank("Z:/a/b"));
   EXPECT_EQ(1, frontPrewarmRank(""));
+  EXPECT_EQ(0, frontPrewarmRank("Z:/data/game/Data/meshes"));
+  EXPECT_GT(frontPrewarmRank("Z:/data/game/Data/meshes/a"), 0);
 }
