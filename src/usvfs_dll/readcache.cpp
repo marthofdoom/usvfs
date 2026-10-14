@@ -17,6 +17,8 @@ You should have received a copy of the GNU General Public License
 along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #include "readcache.h"
+#include "config.h"
+#include "metacache.h"
 #include "readcache_logic.h"
 #include "hookcallcontext.h"
 
@@ -83,10 +85,18 @@ namespace chr = std::chrono;
 constexpr NTSTATUS kStatusInfoLengthMismatch = static_cast<NTSTATUS>(0xC0000004L);
 constexpr NTSTATUS kStatusBufferTooSmall     = static_cast<NTSTATUS>(0xC0000023L);
 
-constexpr uint64_t kSyncChunk  = 8ull << 20;  // layer 1 fill chunk
-constexpr uint64_t kAsyncChunk = 1ull << 20;  // layer 2 fill chunk
-constexpr auto kWaitLimit      = chr::seconds(30);
-constexpr uint64_t kLogIntervalMs = 30000;
+// tunables (defaults here, overridden from the configuration in init())
+uint64_t kSyncChunk  = 8ull << 20;  // layer 1 fill chunk
+uint64_t kAsyncChunk = 1ull << 20;  // layer 2 fill chunk
+chr::seconds kWaitLimit{30};
+uint64_t kLogIntervalMs = 30000;
+bool g_serveEnabled     = true;  // serve small reads from memory
+bool g_infoEnabled      = true;  // answer file-information queries from the snapshot
+bool g_positionEnabled  = true;  // answer FilePositionInformation of probation handles
+bool g_shareToMeta      = true;  // feed the metacache attr store from classifications
+uint64_t g_raCheckBytes = 128ull << 20;
+uint64_t g_raWastePct   = 30;
+uint64_t g_raBackoffMs  = 10000;
 
 // ---------------------------------------------------------------------------
 // guarded memory access (no C++ objects with destructors in these functions)
@@ -486,7 +496,7 @@ struct State
 // intentionally leaked: detached workers may outlive the static destructors
 State* g = nullptr;
 
-constexpr int kMaxWorkerHandles = 256;
+int kMaxWorkerHandles = 256;
 
 // called for every handle we close ourselves, so that the hooks' own
 // bookkeeping (handle tracker, directory cursors) forgets it too
@@ -1485,12 +1495,12 @@ bool readaheadAllowed()
                           g->raBaseIssued.load(std::memory_order_relaxed);
   const uint64_t wasted = g->stats.big.raWasted.load(std::memory_order_relaxed) -
                           g->raBaseWasted.load(std::memory_order_relaxed);
-  if (issued >= (128ull << 20)) {
-    const bool bad = wasted * 100 > issued * 30;
+  if (issued >= g_raCheckBytes) {
+    const bool bad = wasted * 100 > issued * g_raWastePct;
     g->raBaseIssued.store(g->stats.big.raBytes.load(std::memory_order_relaxed));
     g->raBaseWasted.store(g->stats.big.raWasted.load(std::memory_order_relaxed));
     if (bad) {
-      g->raBackoffUntil.store(now + 10000, std::memory_order_relaxed);
+      g->raBackoffUntil.store(now + g_raBackoffMs, std::memory_order_relaxed);
       g->stats.big.raBackoffs.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
@@ -1936,6 +1946,26 @@ bool admit(HandleState& hs, HANDLE h)
     return false;
   }
 
+  // the classification already holds what NtQueryFullAttributesFile would say about
+  // this file: hand it to the metacache attribute store (exactness: only while this
+  // process has not written the file since the snapshot, and the metacache refuses
+  // volatile/overwrite paths and stale generations itself)
+  if (g_shareToMeta && !e.ntPath.empty() && metacache::enabled() &&
+      hs.snapFileGen == g_fileGen[hs.snapSlot].load(std::memory_order_acquire) &&
+      hs.snapGlobalGen == g_writeGeneration.load(std::memory_order_acquire) &&
+      (hs.snap.attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    FILE_NETWORK_OPEN_INFORMATION n;
+    std::memset(&n, 0, sizeof(n));
+    n.CreationTime.QuadPart   = hs.snap.creation;
+    n.LastAccessTime.QuadPart = hs.snap.lastAccess;
+    n.LastWriteTime.QuadPart  = hs.snap.written;
+    n.ChangeTime.QuadPart     = hs.snap.changed;
+    n.AllocationSize.QuadPart = hs.snap.allocation;
+    n.EndOfFile.QuadPart      = hs.snap.endOfFile;
+    n.FileAttributes          = hs.snap.attributes;
+    metacache::feedFull(e.ntPath, n);
+  }
+
   dropWindows(hs);  // served mode takes over
   hs.shadowPos = pos;
   g->stats.bucket[logic::sizeBucket(e.size)].admitted.fetch_add(
@@ -2109,7 +2139,7 @@ NTSTATUS bigRead(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
         dropWindow(hs, hs.window2);
 
       if (g->raEnabled && !hs.raDisabled && hs.splitFailures < 3 &&
-          hs.seq.run >= logic::kSequentialRunForReadahead) {
+          hs.seq.run >= logic::g_sequentialRun) {
         if (!hs.window) {
           issueWindow(hs, h, lastEnd, total, hs.window);
         } else if (logic::needNextWindow(true, hs.window->start, hs.window->length,
@@ -2145,7 +2175,7 @@ Peek peek(HANDLE h, ULONG length)
   if (it == g->handles.end())
     return Peek::Unknown;
   HandleState& hs = *it->second;
-  const bool big = hs.splitOk.load(std::memory_order_acquire) && length >= logic::kSmallReadLimit &&
+  const bool big = hs.splitOk.load(std::memory_order_acquire) && length >= logic::g_smallReadLimit &&
                    (g->splitEnabled || g->raEnabled);
   switch (hs.mode.load(std::memory_order_acquire)) {
   case kHandleServed:
@@ -2161,7 +2191,7 @@ Peek peek(HANDLE h, ULONG length)
     const uint32_t count = e.smallReads.fetch_add(1, std::memory_order_relaxed) + 1;
     const int state      = e.state.load(std::memory_order_relaxed);
     const bool resident  = state == kReady || state == kLoading;
-    if (logic::shouldAdmit(count, g->admitReads, resident))
+    if (g_serveEnabled && logic::shouldAdmit(count, g->admitReads, resident))
       return Peek::Serve;
     probEnter(hs);  // left again by afterProbationRead()
     return Peek::PassthroughTracked;
@@ -2243,42 +2273,49 @@ bool inProtectedCopy()
 
 void init()
 {
-  auto env = [](const char* name, char* buf, DWORD size) -> const char* {
-    const DWORD n = GetEnvironmentVariableA(name, buf, size);
-    return (n > 0 && n < size) ? buf : nullptr;
-  };
-
-  char buf[64];
   g = new State();
 
-  const bool enabled = logic::parseFlag(env("USVFS_READCACHE", buf, sizeof(buf)), true);
+  const bool enabled = config::flag("USVFS_READCACHE", true);
   MEMORYSTATUSEX ms{};
   ms.dwLength = sizeof(ms);
   const uint64_t ramBytes = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : (16ull << 30);
-  g->limits.budgetBytes =
-      logic::parseNumber(env("USVFS_READCACHE_MB", buf, sizeof(buf)),
-                         logic::scaledDefaultMb(ramBytes, 32)) << 20;
+  // one combined budget (USVFS_CACHE_TOTAL_MB) splits between readcache and metacache
+  uint64_t defaultMb = logic::scaledDefaultMb(ramBytes, 32);
+  if (config::isSet("USVFS_CACHE_TOTAL_MB")) {
+    const uint64_t total = config::number("USVFS_CACHE_TOTAL_MB", 0);
+    const uint64_t pct   = config::number("USVFS_CACHE_READCACHE_PCT", 50, 0, 100);
+    if (total > 0)
+      defaultMb = config::logic::splitTotalBudget(total, static_cast<unsigned>(pct)).readcacheMb;
+  }
+  g->limits.budgetBytes = config::number("USVFS_READCACHE_MB", defaultMb) << 20;
   if (auto lg = spdlog::get("usvfs"))
     lg->info("readcache: RAM {} MiB, budget {} MiB", ramBytes >> 20, g->limits.budgetBytes >> 20);
-  g->limits.maxFileBytes =
-      logic::parseNumber(env("USVFS_READCACHE_MAXFILE_MB", buf, sizeof(buf)), 64) << 20;
-  g->admitReads = static_cast<uint32_t>(std::min<uint64_t>(
-      logic::parseNumber(env("USVFS_READCACHE_ADMIT_READS", buf, sizeof(buf)), 8),
-      1u << 20));
-  g->splitEnabled = logic::parseFlag(env("USVFS_READCACHE_SPLIT", buf, sizeof(buf)), true);
-  g->raEnabled    = logic::parseFlag(env("USVFS_READCACHE_RA", buf, sizeof(buf)), true);
-  g->splitMinBytes =
-      std::max<uint64_t>(logic::parseNumber(env("USVFS_READCACHE_SPLIT_MIN_KB", buf, sizeof(buf)), 256), 64)
-      << 10;
-  g->splitChunk =
-      std::max<uint64_t>(logic::parseNumber(env("USVFS_READCACHE_SPLIT_CHUNK_KB", buf, sizeof(buf)), 256), 16)
-      << 10;
-  g->raCapBytes =
-      logic::parseNumber(env("USVFS_READCACHE_RA_MB", buf, sizeof(buf)), 64) << 20;
-  g->async =
-      logic::parseFlag(env("USVFS_READCACHE_ASYNC", buf, sizeof(buf)), true);
-  g->threads = static_cast<int>(std::clamp<uint64_t>(
-      logic::parseNumber(env("USVFS_READCACHE_THREADS", buf, sizeof(buf)), 4), 1, 16));
+  g->limits.maxFileBytes = config::number("USVFS_READCACHE_MAXFILE_MB", 64) << 20;
+  g->admitReads = static_cast<uint32_t>(config::number("USVFS_READCACHE_ADMIT_READS", 8, 0, 1u << 20));
+  g->splitEnabled = config::flag("USVFS_READCACHE_SPLIT", true);
+  g->raEnabled    = config::flag("USVFS_READCACHE_RA", true);
+  g->splitMinBytes = config::number("USVFS_READCACHE_SPLIT_MIN_KB", 256, 64) << 10;
+  g->splitChunk    = config::number("USVFS_READCACHE_SPLIT_CHUNK_KB", 256, 16) << 10;
+  g->raCapBytes    = config::number("USVFS_READCACHE_RA_MB", 64) << 20;
+  g->async         = config::flag("USVFS_READCACHE_ASYNC", true);
+  g->threads = static_cast<int>(config::number("USVFS_READCACHE_THREADS", 4, 1, 16));
+
+  // tunables that used to be constants
+  logic::g_smallReadLimit = config::number("USVFS_READCACHE_SMALL_READ_KB", 64, 1) << 10;
+  kSyncChunk              = config::number("USVFS_READCACHE_SYNC_CHUNK_KB", 8192, 64) << 10;
+  kAsyncChunk             = config::number("USVFS_READCACHE_ASYNC_CHUNK_KB", 1024, 64) << 10;
+  kWaitLimit              = chr::seconds(config::number("USVFS_READCACHE_WAIT_SEC", 30, 1));
+  kLogIntervalMs          = config::number("USVFS_READCACHE_LOG_SEC", 30, 1) * 1000;
+  kMaxWorkerHandles       = static_cast<int>(config::number("USVFS_READCACHE_MAX_WORKER_HANDLES", 256, 1, 100000));
+  logic::g_maxWindow      = config::number("USVFS_READCACHE_RA_MAX_WINDOW_KB", 4096, 64) << 10;
+  logic::g_sequentialRun  = static_cast<uint32_t>(config::number("USVFS_READCACHE_RA_SEQ_RUN", 2, 1, 1000));
+  g_raCheckBytes          = config::number("USVFS_READCACHE_RA_BACKOFF_CHECK_MB", 128, 1) << 20;
+  g_raWastePct            = config::number("USVFS_READCACHE_RA_BACKOFF_WASTE_PCT", 30, 0, 100);
+  g_raBackoffMs           = config::number("USVFS_READCACHE_RA_BACKOFF_SEC", 10) * 1000;
+  g_serveEnabled          = config::flag("USVFS_READCACHE_SERVE", true);
+  g_infoEnabled           = config::flag("USVFS_READCACHE_INFO", true);
+  g_positionEnabled       = config::flag("USVFS_READCACHE_POSITION", true);
+  g_shareToMeta           = config::flag("USVFS_CACHE_SHARE", true);
   g->lastLogTick.store(GetTickCount64());
 
   if (auto logger = spdlog::get("usvfs")) {
@@ -2410,7 +2447,7 @@ NTSTATUS readImpl(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
   }
 
   // big reads on handles that are not served from memory (layer 3)
-  const bool bigCandidate = hs->splitOk.load(std::memory_order_acquire) && Length >= logic::kSmallReadLimit &&
+  const bool bigCandidate = hs->splitOk.load(std::memory_order_acquire) && Length >= logic::g_smallReadLimit &&
                             (g->splitEnabled || g->raEnabled) && Event == nullptr &&
                             ApcRoutine == nullptr && Key == nullptr &&
                             IoStatusBlock != nullptr && Buffer != nullptr;
@@ -2440,7 +2477,7 @@ NTSTATUS readImpl(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
       return r;
     };
     if (Event != nullptr || ApcRoutine != nullptr || Key != nullptr ||
-        IoStatusBlock == nullptr)
+        IoStatusBlock == nullptr || !g_serveEnabled)
       return trackedPassthrough();
     if (justClassified) {
       // peek() counts the reads of every later call
@@ -2585,6 +2622,9 @@ bool tryServeInfo(HANDLE h, PIO_STATUS_BLOCK iosb, PVOID info, ULONG length,
   if (mode != kHandleProbation && mode != kHandleServed && !splitOnly)
     return false;
 
+  if (!g_infoEnabled && cls != FilePositionInformation)
+    return false;
+
   const int c = static_cast<int>(cls);
   const bool counted = c >= 0 && c < 80;
   auto passed = [&]() {
@@ -2596,7 +2636,7 @@ bool tryServeInfo(HANDLE h, PIO_STATUS_BLOCK iosb, PVOID info, ULONG length,
   // FilePositionInformation: probation handles answer from the tracked position;
   // served handles are answered by queryInformation() (shadow position)
   if (cls == FilePositionInformation) {
-    if (splitOnly)
+    if (splitOnly || !g_positionEnabled)
       return false;
     if (mode == kHandleServed) {
       g->stats.infoServed[14].fetch_add(1, std::memory_order_relaxed);

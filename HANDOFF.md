@@ -45,6 +45,61 @@ inside the injected usvfs DLL (see `/mnt/gaming/modlists/Projects/Linux-Storage-
 - Trace (harness): `src/usvfs_dll/trace.{h,cpp}`, `trace_format.h`. `USVFS_TRACE=<win path>`,
   `USVFS_TRACE_CRC=1`. Init logs one line to the usvfs log ("trace enabled/disabled: reason").
 
+## Configuration (USVFS_CONFIG file + env, `src/usvfs_dll/config.h`)
+Every knob is named after its env var. Precedence: env var > INI file named by `USVFS_CONFIG=<path>` > default.
+File section/key derive from the name: `USVFS_READCACHE_MB` -> `[readcache] mb`; bare `USVFS_READCACHE` ->
+`[readcache] enabled`; `USVFS_METACACHE_FRONT_PREWARM_SEC` -> `[metacache] front_prewarm_sec`; `USVFS_TRACE` ->
+`[trace] path`, `USVFS_TRACE_CRC` -> `[trace] crc`; `USVFS_CACHE_*` -> `[cache]`. INI: `;`/`#` comments, `key=value`,
+optional "quotes", case-insensitive names. Read once at init; the effective values with their source
+(default/file/env), unknown file keys and parse errors are logged in ONE block in the usvfs log
+("effective configuration ..."). Flags: 0/false/off/no = off. Sizes below are the units in the name.
+Unit-tested parser: `config_logic.h` / `test/shared_test/config_logic_test.cpp`.
+
+| Name | Default | Meaning |
+|---|---|---|
+| USVFS_CONFIG | unset | path of the INI file (env only) |
+| USVFS_CACHE_TOTAL_MB | unset | combined budget; when set it provides the defaults of READCACHE_MB and METACACHE_MB (explicit ones still win) |
+| USVFS_CACHE_READCACHE_PCT | 50 | share of the total for the readcache; the rest / 1.75 becomes the METACACHE_MB cap value (metacache uses ~1.75x it) |
+| USVFS_CACHE_SHARE | 1 | when the readcache admits an async-filled file it feeds its classification snapshot (times/size/attrs) to the metacache attr store for that real path (only if unwritten since, not volatile, current generation, not already known). The reverse direction (metacache answering classification) is not done: classification queries by handle |
+| USVFS_READCACHE | 1 | readcache on/off |
+| USVFS_READCACHE_MB | clamp(RAM/32,256,1024) | budget |
+| USVFS_READCACHE_MAXFILE_MB | 64 | largest cached file |
+| USVFS_READCACHE_ADMIT_READS | 8 | small reads before a file is admitted |
+| USVFS_READCACHE_SMALL_READ_KB | 64 | reads below this are "small" (cacheable); larger are split/readahead candidates |
+| USVFS_READCACHE_SERVE | 1 | serve small reads from memory (off: classify/track only) |
+| USVFS_READCACHE_INFO | 1 | answer file-information queries from the classification snapshot |
+| USVFS_READCACHE_POSITION | 1 | answer FilePositionInformation of probation handles from the tracked position |
+| USVFS_READCACHE_ASYNC | 1 | async fill by worker threads (0: synchronous fill) |
+| USVFS_READCACHE_THREADS | 4 (1-16) | fill workers |
+| USVFS_READCACHE_SYNC_CHUNK_KB | 8192 | layer 1 fill chunk |
+| USVFS_READCACHE_ASYNC_CHUNK_KB | 1024 | layer 2 fill / readahead chunk |
+| USVFS_READCACHE_WAIT_SEC | 30 | max wait of a reader for a fill |
+| USVFS_READCACHE_MAX_WORKER_HANDLES | 256 | cap of worker-owned file handles |
+| USVFS_READCACHE_LOG_SEC | 30 | statistics log interval |
+| USVFS_READCACHE_SPLIT | 1 | split big reads into parallel chunks |
+| USVFS_READCACHE_SPLIT_MIN_KB / _SPLIT_CHUNK_KB | 256 / 256 | minimum size to split / chunk size |
+| USVFS_READCACHE_RA | 1 | readahead |
+| USVFS_READCACHE_RA_MB | 64 | total readahead memory |
+| USVFS_READCACHE_RA_MAX_WINDOW_KB | 4096 | largest readahead window |
+| USVFS_READCACHE_RA_SEQ_RUN | 2 | sequential continuations before readahead starts |
+| USVFS_READCACHE_RA_BACKOFF_CHECK_MB / _WASTE_PCT / _SEC | 128 / 30 / 10 | readahead pauses for _SEC when more than _WASTE_PCT% of the last _CHECK_MB issued was wasted |
+| USVFS_METACACHE | 1 in SkyrimSE.exe, else 0 | metacache on/off |
+| USVFS_METACACHE_MB | clamp(RAM/64,256,1024) | store cap (total use ~1.75x with the fronts) |
+| USVFS_METACACHE_FRONT | 1 | attr front (GetFileAttributes*) |
+| USVFS_METACACHE_FRONT_MB | METACACHE_MB/4 | attr front budget (entries = MB*1M/150, max 1M) |
+| USVFS_METACACHE_FRONT_ENUM | 1 | enumeration front |
+| USVFS_METACACHE_FRONT_ENUM_MB | METACACHE_MB/2 | enum front budget |
+| USVFS_METACACHE_PREWARM | 1 in SkyrimSE.exe | main pre-warm walk (also synthesizes attr front entries) |
+| USVFS_METACACHE_PREWARM_THREADS | 4 (1-16) | main pre-warm workers |
+| USVFS_METACACHE_PREWARM_CLASSES | 3 | comma list of directory information classes pre-listed |
+| USVFS_METACACHE_LISTING_PCT | 60 | main pre-warm stops storing listings above this store fullness |
+| USVFS_METACACHE_FRONT_PREWARM | 1 | enum front pre-warm job (game process, needs PREWARM) |
+| USVFS_METACACHE_FRONT_PREWARM_THREADS | 4 (1-16) | its worker threads |
+| USVFS_METACACHE_FRONT_PREWARM_SEC | 0 | optional time budget (0 = none) |
+| USVFS_METACACHE_STOP_PCT | 75 | the front pre-warm (and attr synthesis) stops when a front cache is this full |
+| USVFS_METACACHE_DATA_ROOT | `<game exe dir>/Data` | directory the enum pre-warm visits first (it, its direct children and its ancestors rank 0, the rest breadth-first). Virtual path, e.g. `Z:/Games/Skyrim/Data`; empty outside the game process = name heuristic ("data" segment) |
+| USVFS_TRACE / USVFS_TRACE_CRC | unset | harness trace output / CRCs |
+
 ## Hook structure
 - `hooks/ntdll.cpp`: bodies renamed `impl_Nt*` (NtCreateFile/OpenFile/ReadFile/QueryInformationFile/
   SetInformationFile/QueryDirectoryFile(Ex)/QueryAttributes/QueryFullAttributes/Close); declared in

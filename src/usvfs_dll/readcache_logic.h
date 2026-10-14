@@ -42,6 +42,8 @@ constexpr uint32_t kDeviceTypeDiskFileSystem    = 0x00000008;
 
 // reads of this size or more are not worth caching
 constexpr uint64_t kSmallReadLimit = 64 * 1024;
+// runtime values of the tunables (set once from the configuration at init)
+inline uint64_t g_smallReadLimit = kSmallReadLimit;
 
 // ByteOffset value meaning "use the current file pointer"
 constexpr int64_t kUseFilePointerPosition = -2;
@@ -124,7 +126,7 @@ inline Eligibility evaluateEligibility(const HandleAttrs& a, const Limits& l)
     return Eligibility::Writable;
   if (a.endOfFile > l.maxFileBytes || a.endOfFile > l.budgetBytes)
     return Eligibility::TooLarge;
-  if (a.firstReadLength >= kSmallReadLimit)
+  if (a.firstReadLength >= g_smallReadLimit)
     return Eligibility::BigRead;
   return Eligibility::Eligible;
 }
@@ -185,7 +187,7 @@ inline ReadPlan planRead(uint64_t fileSize, uint64_t shadowPos,
 
 inline bool isSmallRead(uint64_t length)
 {
-  return length < kSmallReadLimit;
+  return length < g_smallReadLimit;
 }
 
 // `smallReads` includes the current read. A file that is already resident
@@ -329,6 +331,8 @@ struct WindowPlan
 };
 
 constexpr uint64_t kMaxWindow = 4ull << 20;
+inline uint64_t g_maxWindow = kMaxWindow;
+inline uint32_t g_sequentialRun = kSequentialRunForReadahead;
 
 // next readahead window: 2x the last read (at most 1 MiB for reads below 1 MiB), capped at kMaxWindow, the end of the
 // file and what is left of the readahead memory budget
@@ -338,7 +342,7 @@ inline WindowPlan planWindow(uint64_t lastEnd, uint64_t lastReadSize,
   WindowPlan w;
   if (lastEnd >= fileSize)
     return w;
-  uint64_t len = std::min<uint64_t>(lastReadSize * 2, kMaxWindow);
+  uint64_t len = std::min<uint64_t>(lastReadSize * 2, g_maxWindow);
   if (lastReadSize < (1ull << 20))
     len = std::min<uint64_t>(len, 1ull << 20);  // small reads: no more than 1 MiB ahead
   len          = std::min<uint64_t>(len, fileSize - lastEnd);

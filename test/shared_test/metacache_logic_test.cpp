@@ -438,3 +438,16 @@ TEST(MetaCacheFront, PrewarmRank)
   EXPECT_EQ(0, frontPrewarmRank("Z:/data/game/Data/meshes"));
   EXPECT_GT(frontPrewarmRank("Z:/data/game/Data/meshes/a"), 0);
 }
+
+TEST(MetaCacheFront, PrewarmRankExplicitRoot)
+{
+  const std::string root = normalizeDataRoot("Z:\\Games\\Skyrim\\Data\\");
+  EXPECT_EQ("z:/games/skyrim/data", root);
+  EXPECT_EQ(0, frontPrewarmRank("Z:/Games/Skyrim/Data", root));
+  EXPECT_EQ(0, frontPrewarmRank("Z:/Games/Skyrim/Data/Meshes", root));
+  EXPECT_EQ(0, frontPrewarmRank("Z:/Games", root));  // ancestor
+  EXPECT_EQ(0, frontPrewarmRank("", root));
+  EXPECT_GT(frontPrewarmRank("Z:/Games/Skyrim/Data/Meshes/a", root), 0);
+  EXPECT_GT(frontPrewarmRank("Z:/Games/Other", root), 0);
+  EXPECT_GT(frontPrewarmRank("Z:/Games/Skyrim/Data2", root), 0);  // not a prefix match
+}

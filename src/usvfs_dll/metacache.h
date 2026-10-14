@@ -73,6 +73,10 @@ bool lookupFull(const std::wstring& key, PFILE_NETWORK_OPEN_INFORMATION out,
                 NTSTATUS& status);
 void storeBasic(const std::wstring& key, NTSTATUS status,
                 const FILE_BASIC_INFORMATION* info, uint64_t generation);
+// stores a full attribute record for a real file (NT path of its handle), e.g. one
+// the readcache learned at classification. Ignored if the path is not cacheable,
+// already known, excluded, or the cache is off.
+void feedFull(const std::wstring& ntPath, const FILE_NETWORK_OPEN_INFORMATION& info);
 void storeFull(const std::wstring& key, NTSTATUS status,
                const FILE_NETWORK_OPEN_INFORMATION* info, uint64_t generation);
 

@@ -199,7 +199,52 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
 // directory (the last segment named data) and its direct children (what the game lists first) rank 0, every
 // other directory ranks by its depth (breadth-first), below Data by 1 + depth.
 // `vpath` uses '/' or '\\' separators.
-inline int frontPrewarmRank(std::string_view vpath)
+inline int frontPrewarmRankByName(std::string_view vpath);
+
+inline std::string normalizeDataRoot(std::string_view path)
+{
+  std::string r(path);
+  for (char& c : r) {
+    if (c == '\\')
+      c = '/';
+    else if (c >= 'A' && c <= 'Z')
+      c = static_cast<char>(c + 32);
+  }
+  while (!r.empty() && r.back() == '/')
+    r.pop_back();
+  return r;
+}
+
+// With an explicit `dataRoot` (normalizeDataRoot form) the ranking is: the root,
+// its direct children and every ancestor of the root rank 0 (ancestors must be
+// walked to get there), all else 1 + depth. Without one, the name heuristic below.
+inline int frontPrewarmRank(std::string_view vpath, const std::string& dataRoot = std::string())
+{
+  if (!dataRoot.empty()) {
+    const std::string v = normalizeDataRoot(vpath);
+    auto depthOf = [](const std::string& p) {
+      int d = 0;
+      for (size_t i = 0; i < p.size();) {
+        size_t e = p.find('/', i);
+        if (e == std::string::npos)
+          e = p.size();
+        if (e > i)
+          ++d;
+        i = e + 1;
+      }
+      return d;
+    };
+    if (v.empty() || v == dataRoot || dataRoot.compare(0, v.size() + 1, v + "/") == 0)
+      return 0;  // root or an ancestor of it
+    if (v.compare(0, dataRoot.size() + 1, dataRoot + "/") == 0 &&
+        v.find('/', dataRoot.size() + 1) == std::string::npos)
+      return 0;  // direct child
+    return 1 + depthOf(v);
+  }
+  return frontPrewarmRankByName(vpath);
+}
+
+inline int frontPrewarmRankByName(std::string_view vpath)
 {
   int depth = 0, dataAt = -1;
   size_t pos = 0;

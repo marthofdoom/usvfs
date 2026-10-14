@@ -13,6 +13,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include "config.h"
 
 namespace usvfs::trace
 {
@@ -211,12 +212,15 @@ void writerMain(State* st)
 
 bool envVar(const char* name, std::wstring& out)
 {
-  wchar_t buf[2048];
-  std::wstring wname(name, name + strlen(name));
-  const DWORD n = ::GetEnvironmentVariableW(wname.c_str(), buf, 2048);
-  if (n == 0 || n >= 2048)
+  // environment first, then the USVFS_CONFIG file ([trace] path / crc)
+  const std::string v = config::text(name);
+  if (v.empty())
     return false;
-  out.assign(buf, n);
+  const int n = ::MultiByteToWideChar(CP_UTF8, 0, v.c_str(), static_cast<int>(v.size()), nullptr, 0);
+  if (n <= 0)
+    return false;
+  out.resize(n);
+  ::MultiByteToWideChar(CP_UTF8, 0, v.c_str(), static_cast<int>(v.size()), out.data(), n);
   return true;
 }
 

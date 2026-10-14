@@ -19,6 +19,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "metacache.h"
 #include "metacache_logic.h"
 #include "readcache.h"
+#include "config.h"
 #include "readcache_logic.h"
 #include "hookcallcontext.h"
 #include "hookcontext.h"
@@ -320,6 +321,9 @@ struct State
   bool frontPrewarm = false;  // USVFS_METACACHE_FRONT_PREWARM (game process only)
   int frontPrewarmSec = 0;    // optional time budget of the front pre-warm (0 = none)
   int frontPrewarmThreads = 4;
+  int stopPct = 75;               // front pre-warm stops when a front cache is this full
+  unsigned listingPct = 60;       // pre-warm stops storing listings above this store fullness
+  std::string dataRoot;           // normalized ('/', lower case) directory visited first; may be empty
   std::atomic<uint64_t> frontAttrSynth{0};  // attr front entries synthesized by the main pre-warm
   std::atomic<uint64_t> frontDirsDone{0};
   std::atomic<uint64_t> frontListsDone{0};
@@ -922,7 +926,7 @@ void frontBatchCommit(FrontBatch& batch, uint64_t gen)
   std::unique_lock<std::shared_mutex> lock(f->mutex);
   if (g->store.generation() != gen)
     return;
-  if (f->entries.size() * 4 + batch.items.size() * 4 >= f->maxEntries * 3)
+  if ((f->entries.size() + batch.items.size()) * 100 >= f->maxEntries * static_cast<size_t>(g->stopPct))
     return;  // keep room for what the game fills itself
   for (auto& it : batch.items) {
     FrontEntry& e = f->entries[it.first];
@@ -935,7 +939,7 @@ void frontBatchCommit(FrontBatch& batch, uint64_t gen)
 void prewarmListing(const std::wstring& virtualKey, const std::wstring& realNtPath, int cls)
 {
   // listings are the big items: leave most of the memory to what the game fills
-  if (g->store.usedAbove(60) || g->store.hasListing(virtualKey, cls, L"*"))
+  if (g->store.usedAbove(g->listingPct) || g->store.hasListing(virtualKey, cls, L"*"))
     return;
   const uint64_t generation = g->store.generation();
   HANDLE h = openDirectory(realNtPath);
@@ -1104,7 +1108,7 @@ void frontPrewarmWorker(std::shared_ptr<FrontJob> job)
           frontJobStop(*job, "shutdown");
         } else if (g->store.generation() != job->gen0) {
           frontJobStop(*job, "generation moved");
-        } else if (gEnum && enumBytes() * 4 >= gEnum->maxBytes * 3) {
+        } else if (gEnum && enumBytes() * 100 >= gEnum->maxBytes * static_cast<size_t>(g->stopPct)) {
           frontJobStop(*job, "cache budget");
         } else if (g->frontPrewarmSec > 0 &&
                    GetTickCount64() - g->frontStartTick.load() >
@@ -1119,7 +1123,7 @@ void frontPrewarmWorker(std::shared_ptr<FrontJob> job)
                 if (!c.dir)
                   continue;
                 std::string child = vpath.empty() ? c.name : vpath + "/" + c.name;
-                const int rank    = logic::frontPrewarmRank(child);
+                const int rank    = logic::frontPrewarmRank(child, g->dataRoot);
                 job->queue.emplace(std::make_pair(rank, job->seq++), std::move(child));
               }
               job->cv.notify_all();
@@ -1420,47 +1424,49 @@ void registerOverwrite()
 
 void init()
 {
-  auto env = [](const char* name, char* buf, DWORD size) -> const char* {
-    const DWORD n = GetEnvironmentVariableA(name, buf, size);
-    return (n > 0 && n < size) ? buf : nullptr;
-  };
-  char buf[128];
-
   logic::g_upcaseHook = upcaseNt;
 
   // other processes (MO2's tools, the editors) may change files behind our back
   // while the game process is the one that is known to run on a frozen modlist
-  const char* forced = env("USVFS_METACACHE", buf, sizeof(buf));
-  const bool enabled =
-      forced ? readcache::logic::parseFlag(forced, false) : isGameProcess();
+  const bool gameProcess = isGameProcess();
+  const bool enabled     = config::flag("USVFS_METACACHE", gameProcess);
   MEMORYSTATUSEX memStatus{};
   memStatus.dwLength = sizeof(memStatus);
   const uint64_t ramBytes = GlobalMemoryStatusEx(&memStatus) ? memStatus.ullTotalPhys : (16ull << 30);
-  const uint64_t mb       = readcache::logic::parseNumber(
-      env("USVFS_METACACHE_MB", buf, sizeof(buf)), readcache::logic::scaledDefaultMb(ramBytes, 64));
+  // one combined budget (USVFS_CACHE_TOTAL_MB) splits between readcache and metacache
+  uint64_t defaultMb = readcache::logic::scaledDefaultMb(ramBytes, 64);
+  if (config::isSet("USVFS_CACHE_TOTAL_MB")) {
+    const uint64_t total = config::number("USVFS_CACHE_TOTAL_MB", 0);
+    const uint64_t pct   = config::number("USVFS_CACHE_READCACHE_PCT", 50, 0, 100);
+    if (total > 0)
+      defaultMb = std::max<uint64_t>(
+          config::logic::splitTotalBudget(total, static_cast<unsigned>(pct)).metacacheCapMb, 16);
+  }
+  const uint64_t mb = config::number("USVFS_METACACHE_MB", defaultMb);
   g = new State(mb << 20);
   g->lastLogTick.store(GetTickCount64());
+  g->stopPct    = static_cast<int>(config::number("USVFS_METACACHE_STOP_PCT", 75, 1, 100));
+  g->listingPct = static_cast<unsigned>(config::number("USVFS_METACACHE_LISTING_PCT", 60, 1, 100));
   if (enabled)
     registerOverwrite();
-  const char* fr = env("USVFS_METACACHE_FRONT", buf, sizeof(buf));
-  if (enabled && (fr ? readcache::logic::parseFlag(fr, true) : true))
+  const uint64_t frontAttrMb = config::number("USVFS_METACACHE_FRONT_MB", mb / 4);
+  const uint64_t frontEnumMb = config::number("USVFS_METACACHE_FRONT_ENUM_MB", mb / 2);
+  if (enabled && config::flag("USVFS_METACACHE_FRONT", true))
   {
     gFront = new FrontState();
-    // ~150 bytes per entry (hashed key), at most a quarter of the cap
-    gFront->maxEntries = static_cast<size_t>(std::clamp<uint64_t>((mb << 20) / 4 / 150, 1000, 1000000));
+    // ~150 bytes per entry (hashed key), by default at most a quarter of the cap
+    gFront->maxEntries = static_cast<size_t>(std::clamp<uint64_t>((frontAttrMb << 20) / 150, 1000, 1000000));
   }
 
-  const char* pw = env("USVFS_METACACHE_PREWARM", buf, sizeof(buf));
-  g->prewarm = pw ? readcache::logic::parseFlag(pw, false) : isGameProcess();
-  g->prewarmThreads = static_cast<int>(std::clamp<uint64_t>(
-      readcache::logic::parseNumber(env("USVFS_METACACHE_PREWARM_THREADS", buf, sizeof(buf)), 4),
-      1, 16));
+  g->prewarm = config::flag("USVFS_METACACHE_PREWARM", gameProcess);
+  g->prewarmThreads = static_cast<int>(config::number("USVFS_METACACHE_PREWARM_THREADS", 4, 1, 16));
   g->prewarmLimit.store(g->prewarmThreads);
 
-  if (const char* cl = env("USVFS_METACACHE_PREWARM_CLASSES", buf, sizeof(buf))) {
+  {
+    const std::string cl = config::text("USVFS_METACACHE_PREWARM_CLASSES", "3");
     std::vector<int> classes;
     std::string tok;
-    for (const char* c = cl;; ++c) {
+    for (const char* c = cl.c_str();; ++c) {
       if (*c == ',' || *c == 0) {
         const uint64_t v = readcache::logic::parseNumber(tok.c_str(), 0);
         if (v != 0 && classSupported(static_cast<FILE_INFORMATION_CLASS>(v)))
@@ -1472,23 +1478,36 @@ void init()
         tok.push_back(*c);
       }
     }
-    g->prewarmClasses = classes;
+    if (cl != "3" || !classes.empty())
+      g->prewarmClasses = classes;
   }
 
-  if (enabled && g->prewarm && isGameProcess()) {
-    const char* fp = env("USVFS_METACACHE_FRONT_PREWARM", buf, sizeof(buf));
-    g->frontPrewarm = fp ? readcache::logic::parseFlag(fp, true) : true;
-    g->frontPrewarmSec = static_cast<int>(readcache::logic::parseNumber(
-        env("USVFS_METACACHE_FRONT_PREWARM_SEC", buf, sizeof(buf)), 0));
-    g->frontPrewarmThreads = static_cast<int>(std::clamp<uint64_t>(
-        readcache::logic::parseNumber(env("USVFS_METACACHE_FRONT_PREWARM_THREADS", buf, sizeof(buf)), 4),
-        1, 16));
+  {
+    // game process only (the pre-warm job needs the game's frozen modlist)
+    const bool frontOk = config::flag("USVFS_METACACHE_FRONT_PREWARM", true);
+    g->frontPrewarm    = frontOk && enabled && g->prewarm && gameProcess;
+    g->frontPrewarmSec = static_cast<int>(config::number("USVFS_METACACHE_FRONT_PREWARM_SEC", 0));
+    g->frontPrewarmThreads = static_cast<int>(config::number("USVFS_METACACHE_FRONT_PREWARM_THREADS", 4, 1, 16));
+  }
+  // directory the enum pre-warm visits first (explicit path, else <game dir>\Data)
+  {
+    std::string root = config::text("USVFS_METACACHE_DATA_ROOT");
+    if (root.empty() && gameProcess) {
+      wchar_t path[MAX_PATH * 2] = {};
+      const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
+      if (n > 0 && n < MAX_PATH * 2) {
+        std::wstring w(path, n);
+        const size_t slash = w.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+          root = narrow(w.substr(0, slash)) + "/Data";
+      }
+    }
+    g->dataRoot = logic::normalizeDataRoot(root);
   }
 
-  const char* fe = env("USVFS_METACACHE_FRONT_ENUM", buf, sizeof(buf));
-  if (enabled && (fe ? readcache::logic::parseFlag(fe, true) : true)) {
+  if (enabled && config::flag("USVFS_METACACHE_FRONT_ENUM", true)) {
     gEnum           = new EnumState();
-    gEnum->maxBytes = static_cast<size_t>(mb << 20) / 2;
+    gEnum->maxBytes = static_cast<size_t>(frontEnumMb << 20);
   }
 
   if (auto logger = spdlog::get("usvfs")) {
@@ -1979,6 +1998,16 @@ void storeFull(const std::wstring& key, NTSTATUS status,
       (!info || !readcache::guardedCopy(&copy, info, sizeof(copy))))
     return;
   g->store.putAttr(key, toAttr(status, &copy), gen);
+}
+
+void feedFull(const std::wstring& ntPath, const FILE_NETWORK_OPEN_INFORMATION& info)
+{
+  if (!g || !enabled())
+    return;
+  const std::wstring key = makeKey(ntPath);
+  if (key.empty() || g->store.hasAttr(key))
+    return;
+  g->store.putAttr(key, toAttr(STATUS_SUCCESS, &info), g->store.generation());
 }
 
 NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK iosb,

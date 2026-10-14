@@ -25,6 +25,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "usvfs.h"
 #include "readcache.h"
 #include "metacache.h"
+#include "config.h"
 #include "trace.h"
 #include "hooks/kernel32_impl.h"
 #include "../thooklib/utility.h"
@@ -71,6 +72,7 @@ HookManager::HookManager(const usvfsParameters& params, HMODULE module)
   readcache::init();
   readcache::setForgetCallback(forgetWorkerHandle);
   metacache::init();
+  config::logEffective();
 
   initHooks();
 
