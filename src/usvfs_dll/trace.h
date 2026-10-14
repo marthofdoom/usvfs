@@ -34,6 +34,10 @@ void shutdown();
 // tracing is on and the call comes from the application itself, i.e. not from
 // inside another hook or from one of our own worker threads. Also preserves
 // GetLastError across the recording.
+// marks the calling thread as one of our own: its hooked calls run the normal hook
+// logic but are never recorded
+void setInternalThread(bool internal);
+
 class Scope
 {
 public:

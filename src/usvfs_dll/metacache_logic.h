@@ -277,12 +277,13 @@ inline std::wstring frontEnumStarKey(const std::wstring& key)
   return key.substr(0, last + 1) + L"*";
 }
 
-// A mask whose result can be derived from the "*" listing with maskMatches: no
-// DOS wildcards, no "*.*" (dot semantics differ between implementations), no
-// trailing dot or space (stripped by the system).
+// A mask whose result can be derived from the "*" listing: only literal names
+// (matched exactly against the long and the short name; wildcard masks can
+// match short names in ways the long names do not show), no trailing dot or
+// space (stripped by the system).
 inline bool isDerivableMask(std::wstring_view mask)
 {
-  if (mask.empty() || mask == L"*" || mask == L"*.*" || !isCacheableMask(mask))
+  if (mask.empty() || !isLiteralMask(mask) || !isCacheableMask(mask))
     return false;
   return mask.back() != L'.' && mask.back() != L' ';
 }

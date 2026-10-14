@@ -23,6 +23,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "hookcallcontext.h"
 #include "hookcontext.h"
 #include "redirectiontree.h"
+#include "trace.h"
 
 #include <stringcast.h>
 
@@ -33,6 +34,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include <functional>
 #include <memory>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 
 // Directory enumeration
@@ -313,6 +315,8 @@ struct State
   std::condition_variable gateCv;
   std::atomic<uint64_t> prewarmStart{0};
   std::atomic<bool> prewarmDone{false};
+  std::thread frontThread;
+  std::atomic<bool> frontRunning{false};
   bool frontPrewarm = false;  // USVFS_METACACHE_FRONT_PREWARM (game process only)
   int frontPrewarmSec = 90;   // time budget of the front pre-warm
   std::atomic<bool> prewarmCapped{false};
@@ -398,7 +402,7 @@ class PackedFinds
 public:
   size_t size() const { return m_offs.size(); }
   bool empty() const { return m_offs.empty(); }
-  size_t capacityBytes() const { return m_blob.capacity() + m_offs.capacity() * sizeof(uint32_t); }
+  size_t capacityBytes() const { return m_blob.capacity() + m_offs.capacity() * sizeof(uint32_t) + m_byHash.size() * 48; }
 
   void push_back(const WIN32_FIND_DATAW& fd)
   {
@@ -413,6 +417,10 @@ public:
     h.sizeLow  = fd.nFileSizeLow;
     h.nl = static_cast<uint16_t>(wcsnlen(fd.cFileName, 260));
     h.al = static_cast<uint16_t>(wcsnlen(fd.cAlternateFileName, 14));
+    const uint32_t idx = static_cast<uint32_t>(m_offs.size());
+    m_byHash.emplace(logic::Listing::hashFolded(std::wstring_view(fd.cFileName, h.nl), true), idx);
+    if (h.al != 0)
+      m_byHash.emplace(logic::Listing::hashFolded(std::wstring_view(fd.cAlternateFileName, h.al), true), idx);
     m_offs.push_back(static_cast<uint32_t>(m_blob.size()));
     m_blob.append(reinterpret_cast<const char*>(&h), sizeof(h));
     m_blob.append(reinterpret_cast<const char*>(fd.cFileName), h.nl * sizeof(wchar_t));
@@ -439,6 +447,28 @@ public:
     return fd;
   }
 
+  // indices (ascending) of the entries whose long or short name equals
+  // `foldedName` (folded with foldChar); compares on the packed names
+  std::vector<uint32_t> findLiteral(const std::wstring& foldedName) const
+  {
+    std::vector<uint32_t> out;
+    auto range = m_byHash.equal_range(logic::Listing::hashFolded(foldedName, false));
+    for (auto it = range.first; it != range.second; ++it) {
+      const uint32_t i = it->second;
+      Head h;
+      std::memcpy(&h, m_blob.data() + m_offs[i], sizeof(h));
+      const char* p = m_blob.data() + m_offs[i] + sizeof(h);
+      if (nameEquals(p, h.nl, foldedName) ||
+          (h.al != 0 && nameEquals(p + h.nl * sizeof(wchar_t), h.al, foldedName))) {
+        if (out.empty() || out.back() != i)
+          out.push_back(i);
+      }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+  }
+
   void shrink_to_fit()
   {
     m_blob.shrink_to_fit();
@@ -446,6 +476,19 @@ public:
   }
 
 private:
+  static bool nameEquals(const char* raw, size_t n, const std::wstring& folded)
+  {
+    if (n != folded.size())
+      return false;
+    for (size_t k = 0; k < n; ++k) {
+      wchar_t c;
+      std::memcpy(&c, raw + k * sizeof(wchar_t), sizeof(c));
+      if (logic::foldChar(c) != folded[k])
+        return false;
+    }
+    return true;
+  }
+
   struct Head
   {
     DWORD attrs, res0, res1, sizeHigh, sizeLow;
@@ -454,6 +497,7 @@ private:
   };
   std::string m_blob;
   std::vector<uint32_t> m_offs;
+  std::unordered_multimap<uint64_t, uint32_t> m_byHash;  // folded long/short name -> index
 };
 
 struct EnumListing
@@ -918,13 +962,29 @@ void prewarmRealDirectory(const std::string& realDir);
 // publish paths they use.
 void frontPrewarmJob()
 {
+  // A dedicated thread (not a BgPool worker, which blocks every hook group): the
+  // hooks must behave as for the game or nothing would be recorded. Never traced.
+  trace::setInternalThread(true);
   const uint64_t start = GetTickCount64();
   const uint64_t gen0  = g->store.generation();
   uint64_t dirs = 0, files = 0, lists = 0;
   const char* stop = "done";
   const HANDLE self = GetCurrentThread();
-  const int oldPrio = GetThreadPriority(self);
   SetThreadPriority(self, THREAD_PRIORITY_BELOW_NORMAL);
+  auto frontFill = [&]() -> size_t {
+    if (!gFront)
+      return 0;
+    std::shared_lock<std::shared_mutex> lock(gFront->mutex);
+    return gFront->entries.size();
+  };
+  auto enumBytes = [&]() -> size_t {
+    if (!gEnum)
+      return 0;
+    std::lock_guard<std::mutex> lock(gEnum->mutex);
+    return gEnum->bytes;
+  };
+  const uint64_t recordsBefore = gEnum ? gEnum->records.load() : 0;
+  const size_t frontBefore     = frontFill();
   try {
     std::vector<std::string> todo{std::string()};
     while (!todo.empty() && stop[0] == 'd') {
@@ -933,9 +993,8 @@ void frontPrewarmJob()
       std::vector<Child> kids;
       if (!listChildren(vpath, kids))
         continue;
-      std::wstring winDir;
-      if (!vpath.empty() && !kids.empty()) {
-        winDir = shared::string_cast<std::wstring>(vpath, shared::CodePage::UTF8);
+      if (gEnum && !vpath.empty() && !kids.empty()) {
+        std::wstring winDir = shared::string_cast<std::wstring>(vpath, shared::CodePage::UTF8);
         std::replace(winDir.begin(), winDir.end(), L'/', L'\\');
         for (int level = 0; level <= 1; ++level) {
           WIN32_FIND_DATAW fd;
@@ -950,7 +1009,9 @@ void frontPrewarmJob()
           }
         }
         ++dirs;
+        Sleep(1);  // yield: every hooked search takes the context write lock
       }
+      uint32_t n = 0;
       for (const Child& c : kids) {
         if (g->pool.stopping()) {
           stop = "shutdown";
@@ -964,8 +1025,8 @@ void frontPrewarmJob()
           stop = "time budget";
           break;
         }
-        if ((gFront && gFront->entries.size() * 4 >= gFront->maxEntries * 3) ||
-            (gEnum && gEnum->bytes * 4 >= gEnum->maxBytes * 3)) {
+        if ((gFront && frontFill() * 4 >= gFront->maxEntries * 3) ||
+            (gEnum && enumBytes() * 4 >= gEnum->maxBytes * 3)) {
           stop = "cache budget";
           break;
         }
@@ -978,19 +1039,21 @@ void frontPrewarmJob()
           WIN32_FILE_ATTRIBUTE_DATA data;
           ::GetFileAttributesExW(w.c_str(), GetFileExInfoStandard, &data);
           ++files;
+          if ((++n & 63) == 0)
+            Sleep(0);
         }
       }
     }
   } catch (...) {
     stop = "exception";
   }
-  SetThreadPriority(self, oldPrio);
   if (auto logger = spdlog::get("usvfs")) {
-    logger->info("metacache: front pre-warm {} after {} ms: {} directories, {} listings, {} files, "
-                 "front entries={} enum listings={}",
-                 stop, GetTickCount64() - start, dirs, lists, files,
-                 gFront ? gFront->entries.size() : 0, gEnum ? gEnum->listings.size() : 0);
+    logger->info("metacache: front pre-warm {} after {} ms: {} directories, {} searches, {} files; "
+                 "front entries {} -> {}, enum listings recorded +{}, enum bytes={}",
+                 stop, GetTickCount64() - start, dirs, lists, files, frontBefore, frontFill(),
+                 (gEnum ? gEnum->records.load() : 0) - recordsBefore, enumBytes());
   }
+  g->frontRunning.store(false);
 }
 
 void finishPrewarmJob()
@@ -998,7 +1061,14 @@ void finishPrewarmJob()
   if (g->prewarmPending.fetch_sub(1) == 1 && !g->prewarmDone.exchange(true)) {
     const uint64_t ms = GetTickCount64() - g->prewarmStart.load();
     if (g->frontPrewarm && (gFront || gEnum) && !g->pool.stopping())
-      g->pool.submit([] { frontPrewarmJob(); });
+    {
+      try {
+        g->frontRunning.store(true);
+        g->frontThread = std::thread([] { frontPrewarmJob(); });
+      } catch (...) {
+        g->frontRunning.store(false);
+      }
+    }
     if (auto logger = spdlog::get("usvfs")) {
       logger->info(
           "metacache: pre-warm finished in {} ms: {} directories, {} files, {} listings, "
@@ -1259,6 +1329,15 @@ void shutdown()
     return;
   g_enabled.store(false, std::memory_order_release);
   g->pool.stop();
+  if (g->frontThread.joinable()) {
+    const uint64_t deadline = GetTickCount64() + 2000;
+    while (g->frontRunning.load() && GetTickCount64() < deadline)
+      Sleep(2);
+    if (g->frontRunning.load())
+      g->frontThread.detach();
+    else
+      g->frontThread.join();
+  }
   try {
     logSummary("metacache final");
   } catch (...) {
@@ -1433,6 +1512,7 @@ bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, D
   }
   const uint64_t gen = g->store.generation();
   tick();
+  std::shared_ptr<const EnumListing> star;
   {
     std::lock_guard<std::mutex> lock(e->mutex);
     auto it = e->listings.find(key);
@@ -1457,46 +1537,47 @@ bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, D
         return true;
       }
     }
-    // not recorded for this mask: derive it from the "*" listing of the same
-    // directory, level and flags (existence checks, narrower wildcards)
     if (logic::isDerivableMask(maskView)) {
       auto st = e->listings.find(logic::frontEnumStarKey(key));
-      if (st != e->listings.end() && st->second.gen == gen) {
-        const std::shared_ptr<const EnumListing>& all = st->second.listing;
-        if (all->failed) {
-          res = INVALID_HANDLE_VALUE;
-          err = all->err;
-          e->hits.fetch_add(1, std::memory_order_relaxed);
-          e->derived.fetch_add(1, std::memory_order_relaxed);
-          return true;
-        }
-        auto l = std::make_shared<EnumListing>();
-        for (size_t ei = 0; ei < all->entries.size(); ++ei) {
-          const WIN32_FIND_DATAW fd = all->entries[ei];
-          if (logic::maskMatches(maskView, fd.cFileName) ||
-              (fd.cAlternateFileName[0] != 0 && logic::maskMatches(maskView, fd.cAlternateFileName)))
-            l->entries.push_back(fd);
-        }
-        if (l->entries.empty()) {
-          res = INVALID_HANDLE_VALUE;
-          err = ERROR_FILE_NOT_FOUND;
-          e->hits.fetch_add(1, std::memory_order_relaxed);
-          e->derived.fetch_add(1, std::memory_order_relaxed);
-          return true;
-        }
-        const WIN32_FIND_DATAW first = l->entries[0];
-        if (readcache::guardedCopy(data, &first, sizeof(WIN32_FIND_DATAW))) {
-          auto s    = std::make_shared<EnumSearch>();
-          s->replay = l;
-          s->next   = 1;
-          res       = s.get();
-          e->searches[res] = std::move(s);
-          err              = 0;
-          e->hits.fetch_add(1, std::memory_order_relaxed);
-          e->derived.fetch_add(1, std::memory_order_relaxed);
-          return true;
-        }
+      if (st != e->listings.end() && st->second.gen == gen)
+        star = st->second.listing;
+    }
+  }
+  // not recorded for this literal mask: derive it from the "*" listing of the same
+  // directory, level and flags (existence checks); scanned without the lock
+  if (star) {
+    if (star->failed) {
+      res = INVALID_HANDLE_VALUE;
+      err = star->err;
+      e->hits.fetch_add(1, std::memory_order_relaxed);
+      e->derived.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    const std::vector<uint32_t> idx = star->entries.findLiteral(logic::normalizeMask(maskView));
+    if (idx.empty()) {
+      res = INVALID_HANDLE_VALUE;
+      err = ERROR_FILE_NOT_FOUND;
+      e->hits.fetch_add(1, std::memory_order_relaxed);
+      e->derived.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    auto l = std::make_shared<EnumListing>();
+    for (uint32_t i : idx)
+      l->entries.push_back(star->entries[i]);
+    const WIN32_FIND_DATAW first = l->entries[0];
+    if (readcache::guardedCopy(data, &first, sizeof(WIN32_FIND_DATAW))) {
+      auto s    = std::make_shared<EnumSearch>();
+      s->replay = l;
+      s->next   = 1;
+      res       = s.get();
+      {
+        std::lock_guard<std::mutex> lock(e->mutex);
+        e->searches[res] = std::move(s);
       }
+      err = 0;
+      e->hits.fetch_add(1, std::memory_order_relaxed);
+      e->derived.fetch_add(1, std::memory_order_relaxed);
+      return true;
     }
   }
   e->misses.fetch_add(1, std::memory_order_relaxed);

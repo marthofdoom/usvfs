@@ -34,6 +34,11 @@ inside the injected usvfs DLL (see `/mnt/gaming/modlists/Projects/Linux-Storage-
   listings recorded from what the app iterated (published at ERROR_NO_MORE_FILES, or FindFirst not-found),
   replayed verbatim with a synthetic handle (heap object registered in metacache.cpp, freed by FindClose).
   FindNextFileW/FindClose are now hooked whenever it is on (hooks/kernel32.cpp impl_FindNextFileW/_FindClose).
+- Memory: `USVFS_METACACHE_MB` (default clamp(RAM/64,256,1024)) caps the attr/listing store; the enum front gets
+  up to half of it again and the attr front up to a quarter, so the metacache totals ~1.75x that value, plus the
+  readcache budget (`USVFS_READCACHE_MB`, default clamp(RAM/32,256,1024)). Front pre-warm
+  (`USVFS_METACACHE_FRONT_PREWARM`, `_SEC`) runs on its own thread (BgPool workers block all hooks), untraced.
+  Enum front derives only literal masks from a cached "*" listing (long or short name equality).
 - Trace (harness): `src/usvfs_dll/trace.{h,cpp}`, `trace_format.h`. `USVFS_TRACE=<win path>`,
   `USVFS_TRACE_CRC=1`. Init logs one line to the usvfs log ("trace enabled/disabled: reason").
 

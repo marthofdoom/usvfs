@@ -51,6 +51,7 @@ struct State {
 State* g_state = nullptr;
 thread_local ThreadBuf* t_buf = nullptr;
 thread_local int t_depth = 0;
+thread_local bool t_internal = false;
 
 inline uint64_t qpc()
 {
@@ -300,9 +301,14 @@ void shutdown()
   g_state->file = INVALID_HANDLE_VALUE;
 }
 
+void setInternalThread(bool internal)
+{
+  t_internal = internal;
+}
+
 void Scope::begin()
 try {
-  if (t_depth > 0)
+  if (t_depth > 0 || t_internal)
     return;  // nested call made by one of our own hooks
   {
     // Skip when ANY hook group is active on this thread: that is either one of
