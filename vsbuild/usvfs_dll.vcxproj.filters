@@ -18,6 +18,9 @@
     <ClCompile Include="..\src\usvfs_dll\hookmanager.cpp">
       <Filter>src</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\usvfs_dll\metacache.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\usvfs_dll\readcache.cpp">
       <Filter>src</Filter>
     </ClCompile>
@@ -57,6 +60,12 @@
       <Filter>src</Filter>
     </ClInclude>
     <ClInclude Include="..\src\usvfs_dll\maptracker.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\usvfs_dll\metacache.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\usvfs_dll\metacache_logic.h">
       <Filter>src</Filter>
     </ClInclude>
     <ClInclude Include="..\src\usvfs_dll\readcache.h">

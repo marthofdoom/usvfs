@@ -5,6 +5,7 @@
 #include "../hookcallcontext.h"
 #include "../maptracker.h"
 #include "../readcache.h"
+#include "../metacache.h"
 #include "../stringcast_boost.h"
 #include <usvfs.h>
 #include <stringutils.h>
@@ -498,9 +499,17 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
     PVOID lastValidRecord = nullptr;
     PVOID bufferInit = buffer;
     IO_STATUS_BLOCK status;
-    res = NtQueryDirectoryFile(hdl, event, apcRoutine, apcContext, &status,
-                               buffer, bufferSize, FileInformationClass,
-                               returnSingleEntry, FileName, FALSE);
+    if (usvfs::metacache::enabled() && event == nullptr && apcRoutine == nullptr) {
+      // repeated enumerations of a directory are answered from memory
+      res = usvfs::metacache::queryDirectory(
+          std::wstring(static_cast<LPCWSTR>(ntdllHandleTracker.lookup(hdl))), hdl,
+          &status, buffer, bufferSize, FileInformationClass, returnSingleEntry,
+          FileName);
+    } else {
+      res = NtQueryDirectoryFile(hdl, event, apcRoutine, apcContext, &status,
+                                 buffer, bufferSize, FileInformationClass,
+                                 returnSingleEntry, FileName, FALSE);
+    }
 
     if ((res != STATUS_SUCCESS) || (status.Information <= 0)) {
       bufferSize = 0UL;
@@ -1121,6 +1130,14 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle,
     unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
         = makeObjectAttributes(redir, ObjectAttributes);
 
+    if (usvfs::metacache::enabled() &&
+        usvfs::metacache::isWriteIntent(DesiredAccess, FILE_OPEN)) {
+      // opened for writing/deleting: forget and never cache the file (both its
+      // virtual and its real path) and its directory
+      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(fullName));
+      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(redir.path));
+    }
+
     PRE_REALCALL
     res = ::NtOpenFile(FileHandle, DesiredAccess, adjustedAttributes.get(),
                        IoStatusBlock, ShareAccess, OpenOptions);
@@ -1239,6 +1256,12 @@ NTSTATUS ntdll_mess_NtCreateFile(
     unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
       = makeObjectAttributes(redir, ObjectAttributes);
 
+    if (usvfs::metacache::enabled() &&
+        usvfs::metacache::isWriteIntent(DesiredAccess, originalDisposition)) {
+      usvfs::metacache::noteWrite(inPathW);
+      usvfs::metacache::noteWrite(static_cast<LPCWSTR>(redir.path));
+    }
+
     PRE_REALCALL
       res = ::NtCreateFile(FileHandle, DesiredAccess, adjustedAttributes.get(),
         IoStatusBlock, AllocationSize, FileAttributes,
@@ -1273,6 +1296,10 @@ NTSTATUS ntdll_mess_NtCreateFile(
     }
   } else {
     // make the original call to set up the proper errors and return statuses
+    if (usvfs::metacache::enabled() &&
+        usvfs::metacache::isWriteIntent(DesiredAccess, originalDisposition))
+      usvfs::metacache::noteWrite(inPathW);
+
     PRE_REALCALL
       res = ::NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
         IoStatusBlock, AllocationSize, FileAttributes,
@@ -1305,6 +1332,7 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
 
   // must happen before the real close: handle values get reused
   usvfs::readcache::onClose(Handle);
+  usvfs::metacache::onClose(Handle);
 
   NTSTATUS res = STATUS_NO_SUCH_FILE;
 
@@ -1373,9 +1401,20 @@ NTSTATUS WINAPI usvfs::hook_NtQueryAttributesFile(
   unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
       = makeObjectAttributes(redir, ObjectAttributes);
 
+  std::wstring cacheKey;
+  if (usvfs::metacache::enabled()) {
+    cacheKey = usvfs::metacache::makeKey(static_cast<LPCWSTR>(redir.path));
+    if (!cacheKey.empty() &&
+        usvfs::metacache::lookupBasic(cacheKey, FileInformation, res))
+      return res;
+  }
+
   PRE_REALCALL
   res = ::NtQueryAttributesFile(adjustedAttributes.get(), FileInformation);
   POST_REALCALL
+
+  if (!cacheKey.empty() && FileInformation)
+    usvfs::metacache::storeBasic(cacheKey, res, FileInformation);
 
   if (redir.redirected) {
     LOG_CALL()
@@ -1415,9 +1454,20 @@ NTSTATUS WINAPI usvfs::hook_NtQueryFullAttributesFile(
   unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
       = makeObjectAttributes(redir, ObjectAttributes);
 
+  std::wstring cacheKey;
+  if (usvfs::metacache::enabled()) {
+    cacheKey = usvfs::metacache::makeKey(static_cast<LPCWSTR>(redir.path));
+    if (!cacheKey.empty() &&
+        usvfs::metacache::lookupFull(cacheKey, FileInformation, res))
+      return res;
+  }
+
   PRE_REALCALL
   res = ::NtQueryFullAttributesFile(adjustedAttributes.get(), FileInformation);
   POST_REALCALL
+
+  if (!cacheKey.empty() && FileInformation)
+    usvfs::metacache::storeFull(cacheKey, res, FileInformation);
 
   if (redir.redirected) {
     LOG_CALL()
@@ -1502,6 +1552,30 @@ NTSTATUS WINAPI usvfs::hook_NtSetInformationFile(
   HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
   ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
+  if (usvfs::metacache::enabled() &&
+      usvfs::metacache::isMutatingClass(FileInformationClass)) {
+    // before the call: nothing may be cached from now on
+    try {
+      UnicodeString handlePath = ntdllHandleTracker.lookup(FileHandle);
+      std::wstring root;
+      if (FileInformationClass != FilePositionInformation && FileInformation &&
+          Length >= sizeof(HANDLE) * 2) {
+        // rename/link information may name a root directory handle
+        HANDLE rootHandle = nullptr;
+        const size_t rootOffset = sizeof(HANDLE);  // after the flags (padded)
+        if (usvfs::readcache::guardedCopy(
+                &rootHandle, static_cast<const char*>(FileInformation) + rootOffset,
+                sizeof(rootHandle)) && rootHandle != nullptr) {
+          root = std::wstring(static_cast<LPCWSTR>(ntdllHandleTracker.lookup(rootHandle)));
+        }
+      }
+      usvfs::metacache::noteSetInformation(
+          std::wstring(static_cast<LPCWSTR>(handlePath)), root, FileInformationClass,
+          FileInformation, Length);
+    } catch (const std::exception&) {
+    }
+  }
+
   if (!usvfs::readcache::enabled() ||
       FileInformationClass != FilePositionInformation) {
     return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,

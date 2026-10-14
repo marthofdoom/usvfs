@@ -21,5 +21,8 @@
     <ClCompile Include="..\test\shared_test\readcache_logic_test.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\test\shared_test\metacache_logic_test.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

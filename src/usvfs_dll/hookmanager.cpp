@@ -24,6 +24,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "exceptionex.h"
 #include "usvfs.h"
 #include "readcache.h"
+#include "metacache.h"
 #include "../thooklib/utility.h"
 #include "../thooklib/ttrampolinepool.h"
 #include <shmlogger.h>
@@ -60,8 +61,12 @@ HookManager::HookManager(const usvfsParameters& params, HMODULE module)
                              shared::string_cast<std::string>(winapi::ex::wide::getWindowsBuildLab(true)).c_str());
 
   readcache::init();
+  metacache::init();
 
   initHooks();
+
+  // walks the virtual tree in the background (game process only by default)
+  metacache::startPrewarm();
 
   if (params.debugMode) {
     MessageBoxA(nullptr, "Hooks initialized", "Pause", MB_OK);
@@ -72,6 +77,7 @@ HookManager::~HookManager()
 {
   spdlog::get("hooks")->debug("end hook of process {}", GetCurrentProcessId());
   // stops the read cache workers; not called from DllMain, so waiting is safe
+  metacache::shutdown();
   readcache::shutdown();
   removeHooks();
   m_Context.unregisterCurrentProcess();
