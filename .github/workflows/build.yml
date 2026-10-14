@@ -127,7 +127,8 @@ jobs:
         if: always()
       - run: ./test/bin/tvfs_test_${{ matrix.arch }}.exe
         if: always()
-      - run: ./test/bin/usvfs_test_runner_${{ matrix.arch }}.exe
+      # the fork only builds x64: skip the scenarios that spawn x86 binaries
+      - run: ./test/bin/usvfs_test_runner_${{ matrix.arch }}.exe --gtest_filter=-UsvfsTest.basic_x86:UsvfsTest.basic_ops32_x64:UsvfsTest.basic_ops64_x86
         if: always()
       - uses: actions/upload-artifact@master
         if: always()
