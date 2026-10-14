@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <string>
 #include <ntdll_declarations.h>
 
 // Application file-API trace for the replay harness (replay.exe). Records what
@@ -23,7 +24,8 @@ inline bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
 
 // reads configuration and opens the output; must be called before the hooks
 // are installed (the output file is opened with the real, unhooked functions)
-void init();
+// returns a log line (empty if tracing was not requested); never throws
+std::string init();
 
 // stops the writer thread and flushes. Must NOT be called from DllMain.
 void shutdown();

@@ -234,16 +234,17 @@ HANDLE openOutput(std::wstring path)
 
 }  // namespace
 
-void init()
-{
+std::string init()
+try {
   std::wstring path;
   if (!envVar("USVFS_TRACE", path) || path.empty())
-    return;
+    return {};
 
   auto st = std::make_unique<State>();
   st->file = openOutput(path);
   if (st->file == INVALID_HANDLE_VALUE)
-    return;
+    return "trace disabled: cannot create '" + std::string(path.begin(), path.end()) +
+           "' (error " + std::to_string(::GetLastError()) + ")";
 
   std::wstring v;
   st->crc = envVar("USVFS_TRACE_CRC", v) && !v.empty() && v[0] != L'0';
@@ -262,8 +263,19 @@ void init()
   writeAll(st->file, &hdr, sizeof(hdr));
 
   g_state = st.release();
-  g_state->writer = std::thread(writerMain, g_state);
+  try {
+    g_state->writer = std::thread(writerMain, g_state);
+  } catch (...) {
+    ::CloseHandle(g_state->file);
+    g_state = nullptr;  // leaked on purpose; tracing stays off
+    return "trace disabled: cannot start the writer thread";
+  }
   g_enabled.store(true, std::memory_order_release);
+  return "trace enabled, writing to '" + std::string(path.begin(), path.end()) + "'" +
+         (g_state->crc ? " (with read crc32)" : "");
+} catch (...) {
+  g_enabled.store(false);
+  return "trace disabled: exception during init";
 }
 
 void shutdown()
@@ -286,14 +298,15 @@ void shutdown()
 }
 
 void Scope::begin()
-{
+try {
   if (t_depth > 0)
     return;  // nested call made by one of our own hooks
   {
     // Skip when ANY hook group is active on this thread: that is either one of
     // our worker threads (ALL_GROUPS) or an ntdll call made by a kernel32 hook,
     // whose paths may be rerouted and are not what the application asked for.
-    for (int g = 0; g <= static_cast<int>(MutExHookGroup::LAST); ++g) {
+    // (LAST == NO_GROUP is not a bit of the group set: probing it throws)
+    for (int g = 0; g < static_cast<int>(MutExHookGroup::LAST); ++g) {
       HookCallContext probe(static_cast<MutExHookGroup>(g));
       if (!probe.active())
         return;
@@ -303,6 +316,8 @@ void Scope::begin()
   m_start = qpc();
   m_on = true;
   ++t_depth;
+} catch (...) {
+  m_on = false;
 }
 
 void Scope::end()
@@ -331,6 +346,7 @@ void recCreate(const Scope& s, bool isOpen, PHANDLE FileHandle, POBJECT_ATTRIBUT
 {
   if (!g_state)
     return;
+  try {
   Record r;
   r.op = isOpen ? Op::Open : Op::Create;
   r.status = static_cast<uint32_t>(status);
@@ -343,6 +359,9 @@ void recCreate(const Scope& s, bool isOpen, PHANDLE FileHandle, POBJECT_ATTRIBUT
   r.d = options;
   r.e = fileAttributes;
   submit(s, r, oa ? oa->ObjectName : nullptr, oa && oa->ObjectName);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recRead(const Scope& s, HANDLE handle, HANDLE event, PIO_STATUS_BLOCK iosb,
@@ -350,6 +369,7 @@ void recRead(const Scope& s, HANDLE handle, HANDLE event, PIO_STATUS_BLOCK iosb,
 {
   if (!g_state)
     return;
+  try {
   Record r;
   r.op = Op::Read;
   r.status = static_cast<uint32_t>(status);
@@ -382,6 +402,9 @@ void recRead(const Scope& s, HANDLE handle, HANDLE event, PIO_STATUS_BLOCK iosb,
     }
   }
   submit(s, r, nullptr, false);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recQueryInfo(const Scope& s, HANDLE handle, PIO_STATUS_BLOCK iosb, ULONG length,
@@ -389,6 +412,7 @@ void recQueryInfo(const Scope& s, HANDLE handle, PIO_STATUS_BLOCK iosb, ULONG le
 {
   if (!g_state)
     return;
+  try {
   Record r;
   r.op = Op::QueryInfo;
   r.status = static_cast<uint32_t>(status);
@@ -397,6 +421,9 @@ void recQueryInfo(const Scope& s, HANDLE handle, PIO_STATUS_BLOCK iosb, ULONG le
   r.b = length;
   r.info = ioInfo(iosb, status);
   submit(s, r, nullptr, false);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recSetInfo(const Scope& s, HANDLE handle, PIO_STATUS_BLOCK iosb, PVOID info,
@@ -404,6 +431,7 @@ void recSetInfo(const Scope& s, HANDLE handle, PIO_STATUS_BLOCK iosb, PVOID info
 {
   if (!g_state)
     return;
+  try {
   Record r;
   r.op = Op::SetInfo;
   r.status = static_cast<uint32_t>(status);
@@ -417,6 +445,9 @@ void recSetInfo(const Scope& s, HANDLE handle, PIO_STATUS_BLOCK iosb, PVOID info
   }
   r.info = ioInfo(iosb, status);
   submit(s, r, nullptr, false);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recQueryDir(const Scope& s, bool ex, HANDLE handle, PIO_STATUS_BLOCK iosb,
@@ -425,6 +456,7 @@ void recQueryDir(const Scope& s, bool ex, HANDLE handle, PIO_STATUS_BLOCK iosb,
 {
   if (!g_state)
     return;
+  try {
   Record r;
   r.op = ex ? Op::QueryDirEx : Op::QueryDir;
   r.status = static_cast<uint32_t>(status);
@@ -434,28 +466,39 @@ void recQueryDir(const Scope& s, bool ex, HANDLE handle, PIO_STATUS_BLOCK iosb,
   r.c = flags;
   r.info = ioInfo(iosb, status);
   submit(s, r, mask, mask != nullptr);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recQueryAttr(const Scope& s, bool full, POBJECT_ATTRIBUTES oa, NTSTATUS status)
 {
   if (!g_state)
     return;
+  try {
   Record r;
   r.op = full ? Op::QueryFullAttr : Op::QueryAttr;
   r.status = static_cast<uint32_t>(status);
   r.h2 = oa ? h64(oa->RootDirectory) : 0;
   submit(s, r, oa ? oa->ObjectName : nullptr, oa && oa->ObjectName);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recClose(const Scope& s, HANDLE handle, NTSTATUS status)
 {
   if (!g_state)
     return;
+  try {
   Record r;
   r.op = Op::Close;
   r.status = static_cast<uint32_t>(status);
   r.h = h64(handle);
   submit(s, r, nullptr, false);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +591,7 @@ void recGetAttr(const Scope& s, const void* path, unsigned long result, unsigned
 {
   if (!g_state)
     return;
+  try {
   Defs defs;
   Record r;
   r.op = Op::GetAttr;
@@ -555,6 +599,9 @@ void recGetAttr(const Scope& s, const void* path, unsigned long result, unsigned
   r.status = result;
   r.info = result == INVALID_FILE_ATTRIBUTES ? err : 0;
   finish(s, r, defs);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recGetAttrEx(const Scope& s, const void* path, unsigned long level, int ok,
@@ -562,6 +609,7 @@ void recGetAttrEx(const Scope& s, const void* path, unsigned long level, int ok,
 {
   if (!g_state)
     return;
+  try {
   Defs defs;
   Record r;
   r.op = Op::GetAttrEx;
@@ -570,6 +618,9 @@ void recGetAttrEx(const Scope& s, const void* path, unsigned long level, int ok,
   r.status = ok ? 1 : 0;
   r.info = ok ? 0 : err;
   finish(s, r, defs);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recFindFirst(const Scope& s, const void* path, unsigned long level, unsigned long op,
@@ -577,6 +628,7 @@ void recFindFirst(const Scope& s, const void* path, unsigned long level, unsigne
 {
   if (!g_state)
     return;
+  try {
   Defs defs;
   Record r;
   r.op = Op::FindFirst;
@@ -589,6 +641,9 @@ void recFindFirst(const Scope& s, const void* path, unsigned long level, unsigne
   r.status = ok ? 1 : 0;
   r.info = ok ? 0 : err;
   finish(s, r, defs);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recProfile(const Scope& s, bool section, bool ansi, const void* app, const void* key,
@@ -596,6 +651,7 @@ void recProfile(const Scope& s, bool section, bool ansi, const void* app, const 
 {
   if (!g_state)
     return;
+  try {
   Defs defs;
   Record r;
   r.op = section ? Op::ProfSection : Op::ProfString;
@@ -606,18 +662,25 @@ void recProfile(const Scope& s, bool section, bool ansi, const void* app, const 
   r.d = ansi ? 1 : 0;
   r.status = result;
   finish(s, r, defs);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 void recWriteMarker(const Scope& s, unsigned kind, bool ansi, const void* path)
 {
   if (!g_state)
     return;
+  try {
   Defs defs;
   Record r;
   r.op = Op::WriteMarker;
   r.str = internApp(path, ansi, defs);
   r.a = kind;
   finish(s, r, defs);
+  } catch (...) {
+    // tracing must never take the application down
+  }
 }
 
 }  // namespace usvfs::trace

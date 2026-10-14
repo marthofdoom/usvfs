@@ -61,7 +61,12 @@ HookManager::HookManager(const usvfsParameters& params, HMODULE module)
                              version.major, version.minor, version.build, version.servicpack, version.platformid,
                              shared::string_cast<std::string>(winapi::ex::wide::getWindowsBuildLab(true)).c_str());
 
-  trace::init();  // harness trace (USVFS_TRACE); before any hook exists
+  {
+    // harness trace (USVFS_TRACE); before any hook exists
+    const std::string traceMsg = trace::init();
+    if (!traceMsg.empty())
+      spdlog::get("usvfs")->info("{}", traceMsg);
+  }
   readcache::init();
   readcache::setForgetCallback(forgetWorkerHandle);
   metacache::init();
