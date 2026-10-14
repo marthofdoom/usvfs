@@ -83,10 +83,15 @@ inline bool frontIsDriveAbs(std::wstring_view p)
 // relative names. Empty if the name is not safe to cache: anything that the
 // system would interpret (".", "..", trailing dot/space/separator, streams,
 // wildcards, device/UNC/\\?\ forms, drive-relative names, empty segments).
-inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd)
+inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd, int* why = nullptr)
 {
-  if (path.empty() || path.size() > 32000)
+  auto fail = [&](int code) {
+    if (why)
+      *why = code;
     return std::wstring();
+  };
+  if (path.empty() || path.size() > 32000)
+    return fail(2);
 
   std::wstring abs;
   if (frontIsDriveAbs(path)) {
@@ -94,13 +99,13 @@ inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd)
   } else if (frontIsSep(path[0])) {
     // rooted without drive: take the drive of the cwd; UNC / device forms out
     if (path.size() < 2 || frontIsSep(path[1]) || !frontIsDriveAbs(cwd))
-      return std::wstring();
+      return fail(3);
     abs = std::wstring(cwd.substr(0, 2)) + std::wstring(path);
   } else {
     if (path.size() >= 2 && path[1] == L':')
-      return std::wstring();  // drive-relative
+      return fail(4);  // drive-relative
     if (!frontIsDriveAbs(cwd))
-      return std::wstring();
+      return fail(5);
     while (cwd.size() > 3 && frontIsSep(cwd.back()))
       cwd.remove_suffix(1);
     abs = std::wstring(cwd);
@@ -117,16 +122,16 @@ inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd)
       ++end;
     const std::wstring_view seg(abs.data() + pos, end - pos);
     if (seg.empty() || seg == L"." || seg == L".." || seg.back() == L'.' || seg.back() == L' ')
-      return std::wstring();
+      return fail(6);
     for (wchar_t c : seg) {
       if (c < 32 || c == L':' || c == L'*' || c == L'?' || c == L'<' || c == L'>' ||
           c == L'"' || c == L'|')
-        return std::wstring();
+        return fail(7);
     }
     pos = end + 1;
   }
   if (abs.size() > 3 && frontIsSep(abs.back()))
-    return std::wstring();  // trailing separator (a segment ending there is empty above)
+    return fail(8);  // trailing separator (a segment ending there is empty above)
   return normalizePath(abs);
 }
 
@@ -135,18 +140,27 @@ inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd)
 // Empty if the search is not cacheable. `cwd` is used for a bare mask and for
 // relative directories.
 inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, int infoLevel,
-                                 unsigned long flags, std::wstring* dirKeyOut = nullptr)
+                                 unsigned long flags, std::wstring* dirKeyOut = nullptr, int* why = nullptr)
 {
-  if (path.empty() || (infoLevel != 0 && infoLevel != 1) || (flags != 0 && flags != 2))
+  auto fail = [&](int code) {
+    if (why)
+      *why = code;
     return std::wstring();
+  };
+  if (path.empty())
+    return fail(10);
+  if (infoLevel != 0 && infoLevel != 1)
+    return fail(11);
+  if (flags != 0 && flags != 2)
+    return fail(12);
   const size_t pos = path.find_last_of(L"\\/");
   std::wstring dir;
   std::wstring_view mask;
   if (pos == std::wstring_view::npos) {
     if (path.size() >= 2 && path[1] == L':')
-      return std::wstring();  // drive-relative
+      return fail(13);  // drive-relative
     if (!frontIsDriveAbs(cwd))
-      return std::wstring();
+      return fail(14);
     dir  = std::wstring(cwd);
     mask = path;
   } else {
@@ -159,14 +173,15 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
   while (dir.size() > 3 && frontIsSep(dir.back()) && pos == std::wstring_view::npos)
     dir.pop_back();
   if (mask.empty() || mask.size() > 255)
-    return std::wstring();
+    return fail(15);
   for (wchar_t c : mask) {
     if (c < 32 || c == L':')
-      return std::wstring();
+      return fail(16);
   }
-  const std::wstring dirKey = frontKey(dir, cwd);
+  int dirWhy = 0;
+  const std::wstring dirKey = frontKey(dir, cwd, &dirWhy);
   if (dirKey.empty())
-    return std::wstring();
+    return fail(20 + dirWhy);
   if (dirKeyOut)
     *dirKeyOut = dirKey;
   std::wstring key = dirKey;

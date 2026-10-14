@@ -30,6 +30,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -300,6 +301,7 @@ struct State
   std::atomic<int> diagDirLookups{0};
   std::atomic<int> diagPrewarmStores{0};
   std::atomic<int> diagAttrMisses{0};
+  std::atomic<int> diagEnumRejects{0};
   std::atomic<uint64_t> prewarmLockWaitUs{0};  // time spent waiting for the context lock
   std::atomic<uint64_t> prewarmLockWaits{0};
   std::atomic<int> prewarmLimit{4};            // concurrently working pre-warm jobs
@@ -352,6 +354,11 @@ struct FrontState
   std::unordered_map<std::wstring, FrontEntry> entries;  // key + kind char
   std::atomic<uint64_t> hits{0};
   std::atomic<uint64_t> misses{0};
+  // diagnostics: misses of a key seen before (bloom-ish, 2 hashes) vs first time
+  std::atomic<uint64_t> missesFirst{0};
+  std::atomic<uint64_t> missesRepeat{0};
+  static constexpr size_t kSeenBits = size_t(1) << 23;
+  std::unique_ptr<std::atomic<uint64_t>[]> seen{new std::atomic<uint64_t>[kSeenBits / 64]()};
   size_t maxEntries = 100000;  // set from the memory cap in init()
 };
 
@@ -394,6 +401,11 @@ struct EnumState
   std::atomic<uint64_t> hits{0};
   std::atomic<uint64_t> misses{0};
   std::atomic<uint64_t> records{0};
+  // diagnostics: rejections by reason (see enumFirst), key kinds, unfinished searches
+  std::atomic<uint64_t> rejects[64]{};
+  std::atomic<uint64_t> keyedWild{0};
+  std::atomic<uint64_t> keyedLiteral{0};
+  std::atomic<uint64_t> unfinished{0};
   static constexpr size_t kMaxEntries = 50000;  // per listing
 };
 
@@ -440,6 +452,23 @@ void logSummary(const char* prefix)
       classes += std::format(" {}={}", i, ld(g->dirClassCount[i]));
   }
 
+  if (gFront) {
+    logger->info("{}: attr front misses first-time={} repeat={}", prefix,
+                 ld(gFront->missesFirst), ld(gFront->missesRepeat));
+  }
+  if (gEnum) {
+    std::string rj;
+    for (int i = 0; i < 64; ++i) {
+      if (ld(gEnum->rejects[i]) != 0)
+        rj += std::format(" {}={}", i, ld(gEnum->rejects[i]));
+    }
+    logger->info("{}: enum front rejections by reason[{} ] (10 empty,11 level,12 flags,13 drive-rel,"
+                 "14 bare-mask-no-cwd,15 mask empty/long,16 mask bad char,20+k dir key reject k "
+                 "(2 empty,3 UNC/device/rooted,4 drive-rel,5 rel-no-cwd,6 bad segment,7 bad char/wildcard,"
+                 "8 trailing sep),30 no data,31 filter,32 searchOp) keyed wildcard={} literal={} "
+                 "searches closed unfinished={}",
+                 prefix, rj, ld(gEnum->keyedWild), ld(gEnum->keyedLiteral), ld(gEnum->unfinished));
+  }
   logger->info(
       "{}: attr hits={} negativeHits={} misses={} | dir enumerations replayed={} "
       "(calls {}) recorded={} uncached={} listingsDerived={} classes[{} ] | "
@@ -1083,6 +1112,18 @@ bool frontLookup(bool ex, const wchar_t* name, FrontResult& out, FrontTicket& ti
     }
   }
   f->misses.fetch_add(1, std::memory_order_relaxed);
+  {
+    const size_t h1 = std::hash<std::wstring>()(key);
+    const size_t h2 = (h1 * 0x9E3779B97F4A7C15ull) >> 17 ^ (h1 >> 7);
+    bool repeat = true;
+    for (size_t h : {h1, h2}) {
+      const size_t bit = h & (FrontState::kSeenBits - 1);
+      const uint64_t m = uint64_t(1) << (bit & 63);
+      if (!(f->seen[bit >> 6].fetch_or(m, std::memory_order_relaxed) & m))
+        repeat = false;
+    }
+    (repeat ? f->missesRepeat : f->missesFirst).fetch_add(1, std::memory_order_relaxed);
+  }
   ticket.key = std::move(key);
   ticket.gen = gen;
   return false;
@@ -1168,13 +1209,36 @@ bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, D
 {
   ticket.key.clear();
   EnumState* e = gEnum;
-  if (!e || !g || !enabled() || !name || !data || filter != nullptr || searchOp != 0)
+  if (!e || !g || !enabled() || !name)
     return false;
+  auto reject = [&](int why) {
+    e->rejects[why & 63].fetch_add(1, std::memory_order_relaxed);
+    diag(g->diagEnumRejects, [&](spdlog::logger& l) {
+      l.info("metacache diag: enum front rejected reason={} name='{}' level={} op={} filter={} flags={}",
+             why, narrow(name), infoLevel, searchOp, filter != nullptr, flags);
+    });
+    return false;
+  };
+  if (!data)
+    return reject(30);
+  if (filter != nullptr)
+    return reject(31);
+  if (searchOp != 0)
+    return reject(32);
   std::wstring dirKey;
+  int why = 0;
   std::wstring key =
-      logic::frontEnumKey(name, frontCwd(name), infoLevel, flags, &dirKey);
+      logic::frontEnumKey(name, frontCwd(name), infoLevel, flags, &dirKey, &why);
   if (key.empty())
-    return false;
+    return reject(why);
+  {
+    const wchar_t* sep = wcsrchr(name, L'\\');
+    const wchar_t* sep2 = wcsrchr(name, L'/');
+    if (sep2 > sep)
+      sep = sep2;
+    const std::wstring_view mask = sep ? std::wstring_view(sep + 1) : std::wstring_view(name);
+    (logic::isLiteralMask(mask) ? e->keyedLiteral : e->keyedWild).fetch_add(1, std::memory_order_relaxed);
+  }
   const uint64_t gen = g->store.generation();
   tick();
   {
@@ -1309,6 +1373,8 @@ bool enumClose(HANDLE h)
   if (it == e->searches.end())
     return false;
   const bool synthetic = static_cast<bool>(it->second->replay);
+  if (!synthetic && it->second->building)
+    e->unfinished.fetch_add(1, std::memory_order_relaxed);
   e->searches.erase(it);
   return synthetic;
 }
