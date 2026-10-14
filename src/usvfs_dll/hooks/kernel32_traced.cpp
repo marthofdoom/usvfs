@@ -12,11 +12,11 @@ namespace usvfs
 
 namespace
 {
-#define TRACE_END(...)                                                              \\
-  if (ts.on()) {                                                                    \\
-    const DWORD err_ = ::GetLastError();                                            \\
-    trace::__VA_ARGS__;                                                             \\
-    ::SetLastError(err_);                                                           \\
+#define TRACE_END(call)                                                             \
+  if (ts.on()) {                                                                    \
+    const DWORD err_ = ::GetLastError();                                            \
+    trace::call;                                                                    \
+    ::SetLastError(err_);                                                           \
   }
 }  // namespace
 
