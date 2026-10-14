@@ -578,6 +578,7 @@ void prewarmListing(const std::wstring& virtualKey, const std::wstring& realNtPa
 {
   if (g->store.hasListing(virtualKey, cls, L"*"))
     return;
+  const uint64_t generation = g->store.generation();
   HANDLE h = openDirectory(realNtPath);
   if (!h)
     return;
@@ -604,7 +605,7 @@ void prewarmListing(const std::wstring& virtualKey, const std::wstring& realNtPa
   }
   ::NtClose(h);
   if (complete) {
-    g->store.putListing(virtualKey, cls, L"*", listing);
+    g->store.putListing(virtualKey, cls, L"*", listing, false, generation);
     g->prewarmListings.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -1092,7 +1093,43 @@ bool isWriteIntent(ACCESS_MASK access, ULONG disposition)
   constexpr ACCESS_MASK kWriteBits =
       FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
       DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED;
-  return disposition != 1 /* FILE_OPEN */ || (access & kWriteBits) != 0;
+  const bool write = disposition != 1 /* FILE_OPEN */ || (access & kWriteBits) != 0;
+  if (write)
+    readcache::bumpWriteGeneration();  // snapshots of file information are stale
+  return write;
+}
+
+// Which names are files we cache? Device paths, pipes, mailslots and other
+// non-file namespaces are none of our business and must not disturb the cache.
+// Result: 0 = ignore, 1 = a drive/UNC file path, 2 = unresolved relative name.
+static int classifyWriteName(std::wstring_view p)
+{
+  auto startsWith = [&](std::wstring_view prefix) {
+    return p.size() >= prefix.size() &&
+           _wcsnicmp(p.data(), prefix.data(), prefix.size()) == 0;
+  };
+
+  if (startsWith(LR"(\Device\)") || startsWith(LR"(\??\pipe\)") ||
+      startsWith(LR"(\??\mailslot\)") || startsWith(LR"(\\.\)"))
+    return 0;
+
+  std::wstring_view rest;
+  if (startsWith(LR"(\??\)") || startsWith(LR"(\\?\)")) {
+    rest = p.substr(4);
+  } else if (!p.empty() && p[0] == L'\\') {
+    return 0;  // some other NT namespace
+  } else {
+    // a drive path without prefix is fine, anything else is a relative name
+    if (p.size() >= 3 && p[1] == L':' && (p[2] == L'\\' || p[2] == L'/'))
+      return 1;
+    return p.empty() ? 0 : 2;
+  }
+
+  if (rest.size() >= 2 && rest[1] == L':')
+    return 1;  // \??\C:\...
+  if (rest.size() >= 4 && _wcsnicmp(rest.data(), L"UNC\\", 4) == 0)
+    return 1;
+  return 0;  // \??\ConDrv, hid#..., Volume{...}, etc.
 }
 
 void noteWrite(std::wstring_view ntPath)
@@ -1101,9 +1138,23 @@ void noteWrite(std::wstring_view ntPath)
     return;
   while (ntPath.size() > 1 && (ntPath.back() == L'\\' || ntPath.back() == L'/'))
     ntPath.remove_suffix(1);
-  const std::wstring key = makeKey(ntPath);
+
+  switch (classifyWriteName(ntPath)) {
+  case 0:
+    return;
+  case 2:
+    g->store.clear();  // an unresolved relative name: can't tell what it touches
+    return;
+  default:
+    break;
+  }
+
+  std::wstring full(ntPath);
+  if (full.size() >= 3 && full[1] == L':')
+    full = LR"(\??\)" + full;  // plain drive path
+  const std::wstring key = makeKey(full);
   if (key.empty()) {
-    g->store.clear();  // can't tell what this is: forget everything
+    g->store.clear();
   } else {
     g->store.invalidatePath(key);
   }
@@ -1203,6 +1254,7 @@ void noteSetInformation(std::wstring_view handlePath, std::wstring_view rootPath
 
 void noteDosPath(const wchar_t* dosPath, bool tree)
 {
+  readcache::bumpWriteGeneration();
   if (!g || !enabled() || !dosPath || !*dosPath)
     return;
   std::wstring nt;

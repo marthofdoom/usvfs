@@ -1162,8 +1162,7 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle,
     unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
         = makeObjectAttributes(redir, ObjectAttributes);
 
-    if (usvfs::metacache::enabled() &&
-        usvfs::metacache::isWriteIntent(DesiredAccess, FILE_OPEN)) {
+    if (usvfs::metacache::isWriteIntent(DesiredAccess, FILE_OPEN)) {
       // opened for writing/deleting: forget and never cache the file (both its
       // virtual and its real path) and its directory
       usvfs::metacache::noteWrite(static_cast<LPCWSTR>(fullName));
@@ -1232,11 +1231,12 @@ NTSTATUS ntdll_mess_NtCreateFile(
 
   // creates made from inside other hooks (profile strings, createPath, ...)
   // count as well, so this precedes the early return below
-  if (usvfs::metacache::enabled() && ObjectAttributes &&
+  if (ObjectAttributes &&
       usvfs::metacache::isWriteIntent(DesiredAccess, CreateDisposition)) {
     try {
-      usvfs::metacache::noteWrite(
-          static_cast<LPCWSTR>(CreateUnicodeString(ObjectAttributes)));
+      UnicodeString early = CreateUnicodeString(ObjectAttributes);
+      if (!isDeviceFile(static_cast<LPCWSTR>(early)))
+        usvfs::metacache::noteWrite(static_cast<LPCWSTR>(early));
     } catch (const std::exception&) {
     }
   }
@@ -1302,8 +1302,7 @@ NTSTATUS ntdll_mess_NtCreateFile(
     unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes
       = makeObjectAttributes(redir, ObjectAttributes);
 
-    if (usvfs::metacache::enabled() &&
-        usvfs::metacache::isWriteIntent(DesiredAccess, originalDisposition)) {
+    if (usvfs::metacache::isWriteIntent(DesiredAccess, originalDisposition)) {
       usvfs::metacache::noteWrite(inPathW);
       usvfs::metacache::noteWrite(static_cast<LPCWSTR>(redir.path));
     }
@@ -1342,8 +1341,7 @@ NTSTATUS ntdll_mess_NtCreateFile(
     }
   } else {
     // make the original call to set up the proper errors and return statuses
-    if (usvfs::metacache::enabled() &&
-        usvfs::metacache::isWriteIntent(DesiredAccess, originalDisposition))
+    if (usvfs::metacache::isWriteIntent(DesiredAccess, originalDisposition))
       usvfs::metacache::noteWrite(inPathW);
 
     PRE_REALCALL
@@ -1628,27 +1626,29 @@ NTSTATUS WINAPI usvfs::hook_NtSetInformationFile(
   HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
   ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
-  if (usvfs::metacache::enabled() &&
-      usvfs::metacache::isMutatingClass(FileInformationClass)) {
-    // before the call: nothing may be cached from now on
-    try {
-      UnicodeString handlePath = ntdllHandleTracker.lookup(FileHandle);
-      std::wstring root;
-      if (FileInformationClass != FilePositionInformation && FileInformation &&
-          Length >= sizeof(HANDLE) * 2) {
-        // rename/link information may name a root directory handle
-        HANDLE rootHandle = nullptr;
-        const size_t rootOffset = sizeof(HANDLE);  // after the flags (padded)
-        if (usvfs::readcache::guardedCopy(
-                &rootHandle, static_cast<const char*>(FileInformation) + rootOffset,
-                sizeof(rootHandle)) && rootHandle != nullptr) {
-          root = std::wstring(static_cast<LPCWSTR>(ntdllHandleTracker.lookup(rootHandle)));
+  if (usvfs::metacache::isMutatingClass(FileInformationClass)) {
+    // cached file information (of both caches) is stale from now on
+    usvfs::readcache::bumpWriteGeneration();
+
+    if (usvfs::metacache::enabled() && ::GetFileType(FileHandle) == FILE_TYPE_DISK) {
+      try {
+        UnicodeString handlePath = ntdllHandleTracker.lookup(FileHandle);
+        std::wstring root;
+        if (FileInformation && Length >= sizeof(HANDLE) * 2) {
+          // rename/link information may name a root directory handle
+          HANDLE rootHandle = nullptr;
+          const size_t rootOffset = sizeof(HANDLE);  // after the flags (padded)
+          if (usvfs::readcache::guardedCopy(
+                  &rootHandle, static_cast<const char*>(FileInformation) + rootOffset,
+                  sizeof(rootHandle)) && rootHandle != nullptr) {
+            root = std::wstring(static_cast<LPCWSTR>(ntdllHandleTracker.lookup(rootHandle)));
+          }
         }
+        usvfs::metacache::noteSetInformation(
+            std::wstring(static_cast<LPCWSTR>(handlePath)), root, FileInformationClass,
+            FileInformation, Length);
+      } catch (const std::exception&) {
       }
-      usvfs::metacache::noteSetInformation(
-          std::wstring(static_cast<LPCWSTR>(handlePath)), root, FileInformationClass,
-          FileInformation, Length);
-    } catch (const std::exception&) {
     }
   }
 

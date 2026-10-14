@@ -217,6 +217,7 @@ struct HandleState
   std::atomic<int> mode{kHandleNone};
   uint64_t shadowPos = 0;  // guarded by m
   FileSnapshot snap;       // set during classification, immutable afterwards
+  uint64_t snapGeneration = 0;  // g_writeGeneration when it was taken
   std::shared_ptr<CacheEntry> entry;
 
   // layer 3 (big reads); splitOk/key are set during classification, the rest is
@@ -281,6 +282,7 @@ struct Stats
   // NtQueryInformationFile on eligible handles, per information class
   std::atomic<uint64_t> infoServed[80]{};
   std::atomic<uint64_t> infoPassed[80]{};
+  std::atomic<uint64_t> infoServedSplit[80]{};  // served on read-only handles that are not cacheable
   std::atomic<uint64_t> fills{0};
   std::atomic<uint64_t> fillBytes{0};
   std::atomic<uint64_t> evictions{0};      // entries dropped
@@ -468,6 +470,13 @@ constexpr int kMaxWorkerHandles = 256;
 // bookkeeping (handle tracker, directory cursors) forgets it too
 void (*g_forgetCallback)(HANDLE) = nullptr;
 
+// number of writes this process has made so far; handles classified before the
+// latest one no longer get file information from their snapshot
+std::atomic<uint64_t> g_writeGeneration{0};
+
+// true while a read cache function runs its own queries: they must see the system
+thread_local bool t_inShim = false;
+
 // set once a request has started doing I/O; after that it must not be re-issued
 thread_local bool t_ioStarted = false;
 
@@ -613,8 +622,14 @@ void logSummary(const char* prefix)
     if (sv || pa)
       infos += std::format(" {}={}/{}", i, sv, pa);
   }
-  logger->info("{} NtQueryInformationFile on eligible handles (class=served/passed):{}",
-               prefix, infos);
+  std::string splitInfos;
+  for (int i = 0; i < 80; ++i) {
+    if (ld(s.infoServedSplit[i]))
+      splitInfos += std::format(" {}={}", i, ld(s.infoServedSplit[i]));
+  }
+  logger->info("{} NtQueryInformationFile on eligible handles (class=served/passed):{} | "
+               "served on read-only uncacheable handles:{}",
+               prefix, infos, splitInfos);
   logger->info("{} by file size:{}", prefix, buckets);
   logger->info(
       "{} layer 2: asyncFills={} asyncFillFailures={} syncFallbacks={} "
@@ -638,7 +653,7 @@ void logSummary(const char* prefix)
       ld(b.fallbacks));
 }
 
-void sweepIdleWindows();
+void sweepScheduled();
 
 void maybeLog()
 {
@@ -648,7 +663,7 @@ void maybeLog()
     uint64_t lastSweep = g->lastSweepTick.load(std::memory_order_relaxed);
     if (t - lastSweep >= 10000 &&
         g->lastSweepTick.compare_exchange_strong(lastSweep, t))
-      sweepIdleWindows();
+      sweepScheduled();
   }
 
   const uint64_t now  = GetTickCount64();
@@ -1071,6 +1086,7 @@ void workerMain()
 {
   // keep every usvfs hook out of the way on this thread
   HookCallContext blockHooks(MutExHookGroup::ALL_GROUPS);
+  t_inShim = true;
 
   Pool& pool = g->pool;
   for (;;) {
@@ -1433,6 +1449,16 @@ void sweepIdleWindows()
   }
 }
 
+// The sweep takes handle locks with try_lock, which must not be done on a mutex
+// the calling thread owns (it may be inside a read): run it on a worker.
+void sweepScheduled()
+{
+  try {
+    submitTask([] { sweepIdleWindows(); });
+  } catch (...) {
+  }
+}
+
 void raTask(const std::shared_ptr<RaWindow>& w, const std::shared_ptr<WFile>& wf)
 {
   w->started.store(true, std::memory_order_release);
@@ -1588,7 +1614,8 @@ bool trySplit(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
   if (!ensureWFile(hs, h))
     return fail();
 
-  // current end of file, so that the result matches the unsplit call
+  // current end of file (a real query: t_inShim keeps the hook from answering
+  // it out of the snapshot), so that the result matches the unsplit call
   FILE_STANDARD_INFORMATION si;
   std::memset(&si, 0, sizeof(si));
   IO_STATUS_BLOCK qiosb;
@@ -1748,6 +1775,7 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
 void classify(HandleState& hs, HANDLE h, bool eventOrApc, ULONG length)
 {
   Eligibility r = Eligibility::QueryFailed;
+  hs.snapGeneration = g_writeGeneration.load(std::memory_order_acquire);
   const uint64_t t0 = nowUs();
   const uint64_t fill0 = t_syncFillUs;
   try {
@@ -2008,6 +2036,11 @@ void notePassthrough()
   g->stats.passthroughs.fetch_add(pending, std::memory_order_relaxed);
   pending = 0;
   maybeLog();
+}
+
+void bumpWriteGeneration()
+{
+  g_writeGeneration.fetch_add(1, std::memory_order_acq_rel);
 }
 
 bool guardedCopy(void* dst, const void* src, size_t length)
@@ -2320,6 +2353,11 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
   // The hook re-issues the request if we throw, which is only right as long as
   // we haven't read anything yet.
   t_ioStarted = false;
+  struct ShimScope
+  {
+    ShimScope() { t_inShim = true; }
+    ~ShimScope() { t_inShim = false; }
+  } shimScope;
   try {
     return readImpl(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                     Buffer, Length, ByteOffset, Key);
@@ -2339,7 +2377,7 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
 bool tryServeInfo(HANDLE h, PIO_STATUS_BLOCK iosb, PVOID info, ULONG length,
                   FILE_INFORMATION_CLASS cls, NTSTATUS& status)
 {
-  if (!g || !enabled() || h == nullptr)
+  if (!g || !enabled() || h == nullptr || t_inShim)
     return false;
 
   std::shared_lock<std::shared_mutex> lock(g->handlesLock);
@@ -2348,16 +2386,24 @@ bool tryServeInfo(HANDLE h, PIO_STATUS_BLOCK iosb, PVOID info, ULONG length,
     return false;
   const HandleState& hs = *it->second;
   const int mode = hs.mode.load(std::memory_order_acquire);
-  if (mode != kHandleProbation && mode != kHandleServed)
+  // read-only synchronous regular files: eligible ones, and those that only
+  // failed the cache's size/first-read rules (BSAs, big plugins)
+  const bool splitOnly =
+      mode == kHandleIneligible && hs.splitOk.load(std::memory_order_acquire);
+  if (mode != kHandleProbation && mode != kHandleServed && !splitOnly)
     return false;
 
   const int c = static_cast<int>(cls);
   const bool counted = c >= 0 && c < 80;
   auto passed = [&]() {
-    if (counted)
+    if (counted && !splitOnly)
       g->stats.infoPassed[c].fetch_add(1, std::memory_order_relaxed);
     return false;
   };
+
+  // this process wrote something since the snapshot was taken
+  if (hs.snapGeneration != g_writeGeneration.load(std::memory_order_acquire))
+    return passed();
 
   const FileSnapshot& f = hs.snap;
   union
@@ -2424,6 +2470,8 @@ bool tryServeInfo(HANDLE h, PIO_STATUS_BLOCK iosb, PVOID info, ULONG length,
     break;
   case FilePositionInformation:
     // answered from the shadow position by queryInformation() on served handles
+    if (splitOnly)
+      return false;
     if (mode == kHandleServed && counted)
       g->stats.infoServed[c].fetch_add(1, std::memory_order_relaxed);
     else
@@ -2442,8 +2490,10 @@ bool tryServeInfo(HANDLE h, PIO_STATUS_BLOCK iosb, PVOID info, ULONG length,
   } else {
     status = STATUS_SUCCESS;
   }
-  if (counted)
-    g->stats.infoServed[c].fetch_add(1, std::memory_order_relaxed);
+  if (counted) {
+    (splitOnly ? g->stats.infoServedSplit : g->stats.infoServed)[c].fetch_add(
+        1, std::memory_order_relaxed);
+  }
   return true;
 }
 

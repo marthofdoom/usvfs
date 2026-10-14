@@ -63,6 +63,11 @@ Peek peek(HANDLE handle, ULONG length);
 // counts a read that was passed to the real function without further ado
 void notePassthrough();
 
+// to be called for every write, create, delete, rename or attribute change made by
+// this process: file information snapshots of handles classified before it are
+// no longer served
+void bumpWriteGeneration();
+
 // registers a function that is told about every handle the cache closes itself
 void setForgetCallback(void (*callback)(HANDLE));
 
