@@ -30,6 +30,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <shared_mutex>
 #include <unordered_map>
 
 // Directory enumeration
@@ -339,10 +340,42 @@ void diag(std::atomic<int>& counter, F&& f)
   }
 }
 
+struct FrontEntry
+{
+  uint64_t gen = 0;
+  FrontResult result;
+};
+
+struct FrontState
+{
+  std::shared_mutex mutex;
+  std::unordered_map<std::wstring, FrontEntry> entries;  // key + kind char
+  std::atomic<uint64_t> hits{0};
+  std::atomic<uint64_t> misses{0};
+  static constexpr size_t kMaxEntries = 400000;
+};
+
+FrontState* gFront = nullptr;  // allocated in init() when enabled, never freed
+
+std::wstring frontCwd(const wchar_t* name)
+{
+  std::wstring cwd;
+  if (logic::frontIsDriveAbs(name) || name[0] == 0)
+    return cwd;
+  wchar_t buf[MAX_PATH + 1];
+  const DWORD n = GetCurrentDirectoryW(MAX_PATH, buf);
+  if (n > 0 && n < MAX_PATH)
+    cwd.assign(buf, n);
+  return cwd;
+}
+
 uint64_t activity()
 {
   const logic::StoreStats s = g->store.stats();
-  return s.attrHits + s.attrMisses + s.attrNegativeHits + s.invalidations +
+  return (gFront ? gFront->hits.load(std::memory_order_relaxed) +
+                       gFront->misses.load(std::memory_order_relaxed)
+                 : 0) +
+         s.attrHits + s.attrMisses + s.attrNegativeHits + s.invalidations +
          g->dirReplayed.load(std::memory_order_relaxed) +
          g->dirRecorded.load(std::memory_order_relaxed) +
          g->prewarmFiles.load(std::memory_order_relaxed);
@@ -365,12 +398,14 @@ void logSummary(const char* prefix)
   logger->info(
       "{}: attr hits={} negativeHits={} misses={} | dir enumerations replayed={} "
       "(calls {}) recorded={} uncached={} listingsDerived={} classes[{} ] | "
-      "invalidations={} evictions={} | entries attr={} listings={} memory={}B{}",
+      "invalidations={} evictions={} | entries attr={} listings={} memory={}B{} | front hits={} misses={}",
       prefix, s.attrHits, s.attrNegativeHits, s.attrMisses, ld(g->dirReplayed),
       ld(g->dirReplayCalls), ld(g->dirRecorded), ld(g->dirRealOnly), s.listingDerived,
       classes, s.invalidations, s.evictions, g->store.attrCount(),
       g->store.listingCount(), g->store.bytes(),
-      g->store.overflowed() ? " (switched off: too many written paths)" : "");
+      g->store.overflowed() ? " (switched off: too many written paths)" : "",
+      gFront ? gFront->hits.load(std::memory_order_relaxed) : 0,
+      gFront ? gFront->misses.load(std::memory_order_relaxed) : 0);
 }
 
 void maybeLog()
@@ -887,6 +922,9 @@ void init()
   g->lastLogTick.store(GetTickCount64());
   if (enabled)
     registerOverwrite();
+  const char* fr = env("USVFS_METACACHE_FRONT", buf, sizeof(buf));
+  if (enabled && (fr ? readcache::logic::parseFlag(fr, true) : true))
+    gFront = new FrontState();
 
   const char* pw = env("USVFS_METACACHE_PREWARM", buf, sizeof(buf));
   g->prewarm = pw ? readcache::logic::parseFlag(pw, false) : isGameProcess();
@@ -915,7 +953,8 @@ void init()
 
   if (auto logger = spdlog::get("usvfs")) {
     if (enabled) {
-      logger->info("metacache: enabled, cap {} MiB, pre-warm {}", mb,
+      logger->info("metacache: enabled, cap {} MiB, front {}, pre-warm {}", mb,
+                   gFront ? "on" : "off",
                    g->prewarm ? std::format("on ({} threads)", g->prewarmThreads)
                               : std::string("off"));
     } else {
@@ -961,6 +1000,74 @@ std::wstring makeKey(std::wstring_view ntPath)
   if (tmp.back() == L'\\' || tmp.back() == L'/')
     return std::wstring();
   return logic::normalizePath(tmp);
+}
+
+bool frontLookup(bool ex, const wchar_t* name, FrontResult& out, FrontTicket& ticket)
+{
+  ticket.key.clear();
+  FrontState* f = gFront;
+  if (!f || !g || !enabled() || !name)
+    return false;
+  std::wstring key = logic::frontKey(name, frontCwd(name));
+  if (key.empty())
+    return false;
+  key.push_back(ex ? L'\x01' : L'\x02');
+  const uint64_t gen = g->store.generation();
+  tick();
+  {
+    std::shared_lock<std::shared_mutex> lock(f->mutex);
+    auto it = f->entries.find(key);
+    if (it != f->entries.end() && it->second.gen == gen) {
+      out = it->second.result;
+      f->hits.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+  }
+  f->misses.fetch_add(1, std::memory_order_relaxed);
+  ticket.key = std::move(key);
+  ticket.gen = gen;
+  return false;
+}
+
+void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
+                const wchar_t* reroutedName)
+{
+  FrontState* f = gFront;
+  if (!f || !g || !enabled() || ticket.key.empty())
+    return;
+  if (!result.ok && result.err != ERROR_FILE_NOT_FOUND && result.err != ERROR_PATH_NOT_FOUND)
+    return;
+  (void)ex;
+  if (ticket.key.size() < 3 || ticket.key[1] != L':')
+    return;
+  // virtual path (without the kind char) and the real path it resolved to must
+  // not be written/excluded
+  const std::wstring virtualNt =
+      makeKey(std::wstring(LR"(\??\)") + std::wstring(ticket.key, 0, ticket.key.size() - 1));
+  if (virtualNt.empty() || g->store.isVolatile(virtualNt))
+    return;
+  if (reroutedName && *reroutedName) {
+    const std::wstring_view rr(reroutedName);
+    if (!logic::frontIsDriveAbs(rr))
+      return;
+    const std::wstring realNt = makeKey(std::wstring(LR"(\??\)") + std::wstring(rr));
+    if (realNt.empty() || g->store.isVolatile(realNt))
+      return;
+  }
+  std::unique_lock<std::shared_mutex> lock(f->mutex);
+  if (g->store.generation() != ticket.gen)
+    return;  // something was invalidated meanwhile
+  if (f->entries.size() >= FrontState::kMaxEntries)
+    f->entries.clear();
+  FrontEntry& e = f->entries[ticket.key];
+  e.gen    = ticket.gen;
+  e.result = result;
+}
+
+void noteMappingChange()
+{
+  if (g && enabled())
+    g->store.bumpGeneration();
 }
 
 bool lookupBasic(const std::wstring& key, PFILE_BASIC_INFORMATION out, NTSTATUS& status)

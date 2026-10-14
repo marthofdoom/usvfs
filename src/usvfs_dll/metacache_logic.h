@@ -30,6 +30,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -65,6 +66,68 @@ inline std::wstring normalizePath(std::wstring_view path)
   while (out.size() > 1 && out.back() == L'\\' && !(out.size() >= 2 && out[out.size() - 2] == L':'))
     out.pop_back();
   return out;
+}
+
+// ---- front cache keys ----
+
+inline bool frontIsSep(wchar_t c) { return c == L'\\' || c == L'/'; }
+
+inline bool frontIsDriveAbs(std::wstring_view p)
+{
+  return p.size() >= 3 && ((p[0] >= L'a' && p[0] <= L'z') || (p[0] >= L'A' && p[0] <= L'Z')) &&
+         p[1] == L':' && frontIsSep(p[2]);
+}
+
+// Key of the front cache (virtual path exactly as the application passed it):
+// absolute drive path, folded and with unified separators. `cwd` is used for
+// relative names. Empty if the name is not safe to cache: anything that the
+// system would interpret (".", "..", trailing dot/space/separator, streams,
+// wildcards, device/UNC/\\?\ forms, drive-relative names, empty segments).
+inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd)
+{
+  if (path.empty() || path.size() > 32000)
+    return std::wstring();
+
+  std::wstring abs;
+  if (frontIsDriveAbs(path)) {
+    abs = std::wstring(path);
+  } else if (frontIsSep(path[0])) {
+    // rooted without drive: take the drive of the cwd; UNC / device forms out
+    if (path.size() < 2 || frontIsSep(path[1]) || !frontIsDriveAbs(cwd))
+      return std::wstring();
+    abs = std::wstring(cwd.substr(0, 2)) + std::wstring(path);
+  } else {
+    if (path.size() >= 2 && path[1] == L':')
+      return std::wstring();  // drive-relative
+    if (!frontIsDriveAbs(cwd))
+      return std::wstring();
+    while (cwd.size() > 3 && frontIsSep(cwd.back()))
+      cwd.remove_suffix(1);
+    abs = std::wstring(cwd);
+    if (!frontIsSep(abs.back()))
+      abs.push_back(L'\\');
+    abs.append(path);
+  }
+
+  // validate segments after "X:\"
+  size_t pos = 3;
+  while (pos < abs.size()) {
+    size_t end = pos;
+    while (end < abs.size() && !frontIsSep(abs[end]))
+      ++end;
+    const std::wstring_view seg(abs.data() + pos, end - pos);
+    if (seg.empty() || seg == L"." || seg == L".." || seg.back() == L'.' || seg.back() == L' ')
+      return std::wstring();
+    for (wchar_t c : seg) {
+      if (c < 32 || c == L':' || c == L'*' || c == L'?' || c == L'<' || c == L'>' ||
+          c == L'"' || c == L'|')
+        return std::wstring();
+    }
+    pos = end + 1;
+  }
+  if (abs.size() > 3 && frontIsSep(abs.back()))
+    return std::wstring();  // trailing separator (a segment ending there is empty above)
+  return normalizePath(abs);
 }
 
 // parent directory of a normalized path; empty if there is none
@@ -378,6 +441,13 @@ public:
 
   // a directory was renamed/removed: everything below it is stale too. Above
   // the size threshold the whole cache is dropped instead of scanning.
+  // a mapping of the virtual tree changed: results derived from it are stale
+  void bumpGeneration()
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    ++m_generation;
+  }
+
   void invalidateTree(const std::wstring& path)
   {
     std::lock_guard<std::mutex> lock(m_mutex);

@@ -33,6 +33,9 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 // Configuration (environment, read once in init()):
 //   USVFS_METACACHE=1|0                force on/off (default: on only in SkyrimSE.exe)
 //   USVFS_METACACHE_MB=128             memory cap
+//   USVFS_METACACHE_FRONT=1|0          front cache for GetFileAttributesW/ExW keyed
+//                                      by the virtual path (default: on with the
+//                                      metacache)
 //   USVFS_METACACHE_PREWARM=1|0        walk the virtual tree in the background
 //                                      (default: only in SkyrimSE.exe)
 //   USVFS_METACACHE_PREWARM_THREADS=4
@@ -86,6 +89,35 @@ NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE handle,
 
 // forget the enumeration state of a handle; call before closing it
 void onClose(HANDLE handle);
+
+// Front cache: the final results of GetFileAttributesW / GetFileAttributesExW
+// (GetFileExInfoStandard only) keyed by the virtual path as the application passed
+// it. Valid while the store generation is unchanged, so every invalidation
+// (noteWrite, noteDosPath, noteSetInformation) and every change of the usvfs
+// mappings (noteMappingChange) drops all entries.
+struct FrontTicket
+{
+  std::wstring key;  // empty: not cacheable
+  uint64_t gen = 0;
+};
+
+struct FrontResult
+{
+  bool ok = false;
+  DWORD err = 0;   // GetLastError of the call
+  DWORD attr = 0;  // GetFileAttributesW result (ok)
+  WIN32_FILE_ATTRIBUTE_DATA data = {};  // GetFileAttributesExW (ok)
+};
+
+// true if answered (`out` is filled); on a miss `ticket` is for frontStore()
+bool frontLookup(bool ex, const wchar_t* name, FrontResult& out, FrontTicket& ticket);
+// `reroutedName`: the real path the call was redirected to (nothing is cached
+// if that is excluded or written)
+void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
+                const wchar_t* reroutedName);
+
+// the usvfs mappings (redirection tree, delete / fake-directory trackers) changed
+void noteMappingChange();
 
 // invalidation
 bool isWriteIntent(ACCESS_MASK desiredAccess, ULONG createDisposition);

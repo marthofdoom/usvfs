@@ -7,22 +7,27 @@ inside the injected usvfs DLL (see `/mnt/gaming/modlists/Projects/Linux-Storage-
 `harness` adds a trace + replay tool so layers can be A/B'd in ~1-2 min without the game.
 
 ## Branches / tags
-- `async-read-prefetch`: the cache layers (owned by another agent; do not commit there from here).
-- `harness`: based on async-read-prefetch + trace/replay (this branch). Merge later; shared-file edits kept small.
+- `async-read-prefetch`: the working branch (cache layers + trace/replay; `harness` was fast-forwarded into it).
+- `harness`: old branch, same history up to the merge.
 - tag `v0.5.6.1-readcache.1`: earlier readcache release. Other tags: v0.5.7.x, wine-shortname-*.
 - CI: `.github/workflows/build.yml` (windows-2022, MSBuild, `vsbuild/usvfs.sln`); triggers on master,
   `async-read-prefetch*`, `harness`. Check runs with `gh run list -R marthofdoom/usvfs --branch harness`
   (plain `gh run list` in this dir points at the wrong remote). You cannot compile locally.
 
 ## Layers (env toggles read once at DLL init; full list in the headers)
+- Layers: L1 = readcache small-read cache + file-info/position snapshot answers (`USVFS_READCACHE`);
+  L2 = async fill (`USVFS_READCACHE_ASYNC`); L3 = big-read split + readahead (`USVFS_READCACHE_SPLIT`/`_RA`);
+  L4 = metacache (`USVFS_METACACHE`, `_PREWARM`).
 - L1-L3 `src/usvfs_dll/readcache.{h,cpp}` (+ `readcache_logic.h`): in-process whole-file cache for small
   NtReadFile on read-only sync disk handles. `USVFS_READCACHE=0` off, `_MB`, `_MAXFILE_MB`, `_ADMIT_READS`,
-  `_ASYNC` (background fill), `_SPLIT` (+`_SPLIT_MIN_KB/_CHUNK_KB`), `_RA` (+`_RA_MB`), `_THREADS`.
+  `_ASYNC`, `_SPLIT` (+`_SPLIT_MIN_KB/_CHUNK_KB`), `_RA` (+`_RA_MB`), `_THREADS`.
   Also serves file-information snapshots (tryServeInfo) and tracks file position (probation handles).
 - L4 `src/usvfs_dll/metacache.{h,cpp}` (+ `metacache_logic.h`): metadata/directory cache and virtual-tree
   prewarm. `USVFS_METACACHE=1|0` (default on only in SkyrimSE.exe!), `_MB`, `_PREWARM`, `_PREWARM_THREADS`,
   `_PREWARM_CLASSES`. Replay processes must set USVFS_METACACHE=1 explicitly to test it.
-- Exact L1/L2/L3 boundaries: read the headers; my example configs in harness.md are a guess, verify them.
+  Front cache (`USVFS_METACACHE_FRONT=0` off): GetFileAttributesW/ExW answers keyed by the virtual path as
+  passed (`logic::frontKey`), served in impl_* right after the active/interestingPath check; valid only while
+  the store generation is unchanged (any invalidation or `noteMappingChange()` from maptracker.h drops all).
 - Trace (harness): `src/usvfs_dll/trace.{h,cpp}`, `trace_format.h`. `USVFS_TRACE=<win path>`,
   `USVFS_TRACE_CRC=1`. Init logs one line to the usvfs log ("trace enabled/disabled: reason").
 
@@ -70,8 +75,8 @@ and `Tools/harness-cold.sh DIR...` (posix_fadvise DONTNEED for cold runs).
 - Trace reading is via a mapped view (not hooked reads) so it does not pollute the read cache.
 - Async-handle reads wait on an event; completion order is not reproduced. `--timing original` can fall
   behind but never runs ahead.
-- Observed (not a harness bug): GetFileAttributesExW costs ~80 us/call even with metacache hits (295k calls,
-  23.8 s baseline vs 22.8 s cached): time is inside usvfs's own kernel32 hook before our cache. Not fixed.
+- GetFileAttributesExW cost ~80 us/call even with metacache hits (295k calls, 23.8 s vs 22.8 s): time was in
+  usvfs's own kernel32 hook path; addressed by the front cache (re-measure with the replay harness).
 
 ## Wine/Proton facts that bit us
 - Wine reports FILE_DEVICE_DISK_FILE_SYSTEM; classification of "disk" handles must not assume FILE_DEVICE_DISK.

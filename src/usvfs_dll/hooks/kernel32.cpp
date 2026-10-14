@@ -1,4 +1,5 @@
 #include "../metacache.h"
+#include "../readcache.h"
 #include "kernel32.h"
 #include "kernel32_impl.h"
 #include "sharedids.h"
@@ -351,6 +352,18 @@ BOOL WINAPI usvfs::impl_GetFileAttributesExW(
     return res;
   }
 
+  // front cache: the final answer for this virtual path, before any usvfs work
+  usvfs::metacache::FrontTicket front;
+  if (fInfoLevelId == GetFileExInfoStandard && lpFileInformation) {
+    usvfs::metacache::FrontResult cached;
+    if (usvfs::metacache::frontLookup(true, lpFileName, cached, front) &&
+        (!cached.ok ||
+         usvfs::readcache::guardedCopy(lpFileInformation, &cached.data, sizeof(cached.data)))) {
+      callContext.updateLastError(cached.err);
+      return cached.ok ? TRUE : FALSE;
+    }
+  }
+
   fs::path canonicalFile = RerouteW::canonizePath(RerouteW::absolutePath(lpFileName));
 
   RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, canonicalFile.c_str());
@@ -388,6 +401,15 @@ BOOL WINAPI usvfs::impl_GetFileAttributesExW(
   if (fixedError != originalError)
     callContext.updateLastError(fixedError);
 
+  if (!front.key.empty()) {
+    usvfs::metacache::FrontResult result;
+    result.ok  = res != FALSE;
+    result.err = fixedError;
+    if (!result.ok || usvfs::readcache::guardedCopy(&result.data, lpFileInformation,
+                                                     sizeof(result.data)))
+      usvfs::metacache::frontStore(front, true, result, reroute.fileName());
+  }
+
   if (reroute.wasRerouted() || fixedError != originalError) {
     DWORD resAttrib;
     if (res && fInfoLevelId == GetFileExInfoStandard && lpFileInformation)
@@ -418,6 +440,16 @@ DWORD WINAPI usvfs::impl_GetFileAttributesW(LPCWSTR lpFileName)
     res = GetFileAttributesW(lpFileName);
     callContext.updateLastError();
     return res;
+  }
+
+  // front cache: the final answer for this virtual path, before any usvfs work
+  usvfs::metacache::FrontTicket front;
+  {
+    usvfs::metacache::FrontResult cached;
+    if (usvfs::metacache::frontLookup(false, lpFileName, cached, front)) {
+      callContext.updateLastError(cached.err);
+      return cached.ok ? cached.attr : INVALID_FILE_ATTRIBUTES;
+    }
   }
 
   fs::path canonicalFile = RerouteW::canonizePath(RerouteW::absolutePath(lpFileName));
@@ -456,6 +488,14 @@ DWORD WINAPI usvfs::impl_GetFileAttributesW(LPCWSTR lpFileName)
   }
   if (fixedError != originalError)
     callContext.updateLastError(fixedError);
+
+  if (!front.key.empty()) {
+    usvfs::metacache::FrontResult result;
+    result.ok   = res != INVALID_FILE_ATTRIBUTES;
+    result.err  = fixedError;
+    result.attr = res;
+    usvfs::metacache::frontStore(front, false, result, reroute.fileName());
+  }
 
   if (reroute.wasRerouted() || fixedError != originalError) {
     LOG_CALL()

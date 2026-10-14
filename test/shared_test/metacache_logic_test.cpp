@@ -345,3 +345,37 @@ TEST(MetaCacheStore, UsedAboveReportsMemoryShare)
   EXPECT_TRUE(s.usedAbove(10));
   EXPECT_FALSE(s.usedAbove(99));
 }
+
+// ---- front cache keys --------------------------------------------------------
+
+TEST(MetaCacheFront, AbsoluteAndRelative)
+{
+  EXPECT_EQ(LR"(C:\GAMES\DATA\A.ESP)", frontKey(LR"(c:/Games\data/a.esp)", L""));
+  EXPECT_EQ(LR"(C:\)", frontKey(LR"(C:\)", L""));
+  EXPECT_EQ(LR"(C:\GAME\DATA\A.ESP)", frontKey(LR"(Data\a.esp)", LR"(C:\Game)"));
+  EXPECT_EQ(LR"(C:\GAME\DATA\A.ESP)", frontKey(LR"(Data\a.esp)", LR"(C:\Game\)"));
+  EXPECT_EQ(LR"(C:\GAME\A.ESP)", frontKey(LR"(a.esp)", LR"(c:\game)"));
+  EXPECT_EQ(LR"(D:\X\Y)", frontKey(LR"(\x\y)", LR"(D:\Game)"));
+  // same file, different spelling: same key
+  EXPECT_EQ(frontKey(LR"(C:\Game\Data\a.esp)", L""), frontKey(LR"(data/A.ESP)", LR"(C:\game)"));
+}
+
+TEST(MetaCacheFront, Rejected)
+{
+  EXPECT_EQ(L"", frontKey(L"", LR"(C:\G)"));
+  EXPECT_EQ(L"", frontKey(L"a.esp", L""));                 // no cwd
+  EXPECT_EQ(L"", frontKey(L"a.esp", L"rel"));              // cwd not absolute
+  EXPECT_EQ(L"", frontKey(L"C:a.esp", LR"(C:\G)"));        // drive-relative
+  EXPECT_EQ(L"", frontKey(LR"(\\?\C:\a)", L""));
+  EXPECT_EQ(L"", frontKey(LR"(\\.\pipe\x)", LR"(C:\G)"));
+  EXPECT_EQ(L"", frontKey(LR"(\\srv\share\a)", LR"(C:\G)"));
+  EXPECT_EQ(L"", frontKey(LR"(C:\a\..\b)", L""));
+  EXPECT_EQ(L"", frontKey(LR"(C:\a\.\b)", L""));
+  EXPECT_EQ(L"", frontKey(LR"(C:\a\)", L""));              // trailing separator
+  EXPECT_EQ(L"", frontKey(LR"(C:\a.)", L""));
+  EXPECT_EQ(L"", frontKey(LR"(C:\a )", L""));
+  EXPECT_EQ(L"", frontKey(LR"(C:\a\\b)", L""));
+  EXPECT_EQ(L"", frontKey(LR"(C:\a\b:stream)", L""));
+  EXPECT_EQ(L"", frontKey(LR"(C:\a\*.esp)", L""));
+  EXPECT_EQ(L"", frontKey(LR"(C:\a?)", L""));
+}
