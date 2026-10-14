@@ -181,6 +181,45 @@ inline ReadPlan planRead(uint64_t fileSize, uint64_t shadowPos,
 }
 
 // ---------------------------------------------------------------------------
+// admission: only files that are actually read in small pieces get cached
+
+inline bool isSmallRead(uint64_t length)
+{
+  return length < kSmallReadLimit;
+}
+
+// `smallReads` includes the current read. A file that is already resident
+// (admitted through another handle) is served right away.
+inline bool shouldAdmit(uint32_t smallReads, uint32_t threshold, bool resident)
+{
+  return resident || smallReads >= threshold;
+}
+
+constexpr size_t kSizeBuckets = 4;
+
+// <64K, 64K-1M, 1-8M, 8M and up
+inline size_t sizeBucket(uint64_t fileSize)
+{
+  if (fileSize < (64ull << 10))
+    return 0;
+  if (fileSize < (1ull << 20))
+    return 1;
+  if (fileSize < (8ull << 20))
+    return 2;
+  return 3;
+}
+
+inline const char* sizeBucketName(size_t bucket)
+{
+  switch (bucket) {
+  case 0:  return "<64K";
+  case 1:  return "64K-1M";
+  case 2:  return "1-8M";
+  default: return "8M+";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // LRU budget
 
 struct EvictCandidate

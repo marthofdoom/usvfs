@@ -29,6 +29,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 //   USVFS_READCACHE=0              disable (hooks are plain passthrough)
 //   USVFS_READCACHE_MB=1024        LRU budget in MiB
 //   USVFS_READCACHE_MAXFILE_MB=64  largest cached file in MiB
+//   USVFS_READCACHE_ADMIT_READS=8  small reads of a file before it is cached
 //   USVFS_READCACHE_ASYNC=1        fill in background workers (default off)
 //   USVFS_READCACHE_THREADS=4      number of background workers
 
@@ -47,11 +48,13 @@ void init();
 // off. Must NOT be called from DllMain (it waits for the workers).
 void shutdown();
 
-enum class Peek { Unknown, Ineligible, Eligible };
+enum class Peek { Unknown, Passthrough, Serve };
 
 // cheap look at the classification of a handle (no reference counting, no
-// hook context); used to let ineligible handles bypass everything
-Peek peek(HANDLE handle);
+// hook context): Passthrough handles (ineligible, or still on probation and not
+// yet due for admission) bypass everything. Counts the read for probation
+// handles, so call it once per NtReadFile.
+Peek peek(HANDLE handle, ULONG length);
 
 // counts a read that was passed to the real function without further ado
 void notePassthrough();

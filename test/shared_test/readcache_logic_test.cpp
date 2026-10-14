@@ -255,6 +255,48 @@ TEST(ReadCacheLru, EvictionTargetLeavesHeadroom)
   EXPECT_EQ(2u, r.size());
 }
 
+// ---- admission -------------------------------------------------------------
+
+TEST(ReadCacheAdmission, SmallReadBoundary)
+{
+  EXPECT_TRUE(isSmallRead(1));
+  EXPECT_TRUE(isSmallRead(kSmallReadLimit - 1));
+  EXPECT_FALSE(isSmallRead(kSmallReadLimit));
+  EXPECT_FALSE(isSmallRead(8u << 20));
+}
+
+TEST(ReadCacheAdmission, AdmitsAtThreshold)
+{
+  EXPECT_FALSE(shouldAdmit(1, 8, false));
+  EXPECT_FALSE(shouldAdmit(7, 8, false));
+  EXPECT_TRUE(shouldAdmit(8, 8, false));
+  EXPECT_TRUE(shouldAdmit(100, 8, false));
+}
+
+TEST(ReadCacheAdmission, ResidentEntryAdmitsImmediately)
+{
+  EXPECT_TRUE(shouldAdmit(1, 8, true));
+}
+
+TEST(ReadCacheAdmission, ZeroOrOneThresholdAdmitsFirstRead)
+{
+  EXPECT_TRUE(shouldAdmit(1, 0, false));
+  EXPECT_TRUE(shouldAdmit(1, 1, false));
+}
+
+TEST(ReadCacheAdmission, SizeBuckets)
+{
+  EXPECT_EQ(0u, sizeBucket(0));
+  EXPECT_EQ(0u, sizeBucket(64 * 1024 - 1));
+  EXPECT_EQ(1u, sizeBucket(64 * 1024));
+  EXPECT_EQ(1u, sizeBucket((1u << 20) - 1));
+  EXPECT_EQ(2u, sizeBucket(1u << 20));
+  EXPECT_EQ(2u, sizeBucket((8u << 20) - 1));
+  EXPECT_EQ(3u, sizeBucket(8u << 20));
+  EXPECT_EQ(3u, sizeBucket(64ull << 20));
+  EXPECT_LT(sizeBucket(UINT64_MAX), kSizeBuckets);
+}
+
 // ---- configuration ---------------------------------------------------------
 
 TEST(ReadCacheConfig, ParseNumber)

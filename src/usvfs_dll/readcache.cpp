@@ -36,8 +36,10 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 //
 // Layer 1 (always on unless USVFS_READCACHE=0): the first NtReadFile on an
 // unknown handle classifies the handle (see logic::evaluateEligibility). An
-// eligible handle gets a CacheEntry that holds the whole file, loaded
-// synchronously with the real NtReadFile. Entries are shared between handles
+// eligible handle starts on probation: its reads pass through while the small
+// reads of the file are counted (per CacheEntry, so reopens accumulate). Once
+// USVFS_READCACHE_ADMIT_READS have been seen the file is admitted: its
+// CacheEntry holds the whole file, loaded synchronously with the real NtReadFile. Entries are shared between handles
 // by {file id, size, write time, change time}. All eligible
 // handles keep a "shadow" file pointer, because served reads do not move the
 // real one; the position queries/updates are patched accordingly and any read
@@ -175,6 +177,7 @@ struct CacheEntry
   // buffer under an exclusive try_lock and skips entries that are busy.
   std::shared_mutex dataLock;
   std::atomic<uint64_t> lastUse{0};     // tick of the last serve/fill (approximate LRU)
+  std::atomic<uint32_t> smallReads{0};  // small reads seen on any handle of this file
   std::atomic<bool> everFilled{false};  // distinguishes a refill from the first fill
   bool counted = false;                 // data is included in the store's total; store mutex
 
@@ -187,13 +190,32 @@ struct CacheEntry
   std::wstring ntPath;  // layer 2: name used by the worker to reopen the file
 };
 
+enum HandleMode : int
+{
+  kHandleNone = 0,   // not classified yet
+  kHandleIneligible, // pure passthrough
+  kHandleProbation,  // eligible; reads pass through (real pointer is authoritative)
+  kHandleServed      // admitted; reads are served from memory, shadowPos is authoritative
+};
+
 struct HandleState
 {
   std::mutex m;
-  std::atomic<bool> classified{false};
-  std::atomic<bool> eligible{false};
+  std::atomic<int> mode{kHandleNone};
   uint64_t shadowPos = 0;  // guarded by m
   std::shared_ptr<CacheEntry> entry;
+
+  bool served() const { return mode.load(std::memory_order_acquire) == kHandleServed; }
+};
+
+struct BucketStats
+{
+  std::atomic<uint64_t> admitted{0};
+  std::atomic<uint64_t> fills{0};  // including refills
+  std::atomic<uint64_t> fillBytes{0};
+  std::atomic<uint64_t> served{0};
+  std::atomic<uint64_t> bytesServed{0};
+  std::atomic<uint64_t> probationEnd{0};  // handles closed/left on probation
 };
 
 struct Stats
@@ -202,8 +224,7 @@ struct Stats
   std::atomic<uint64_t> eligible{0};
   std::atomic<uint64_t> ineligible{0};
   std::atomic<uint64_t> byReason[static_cast<int>(Eligibility::Count)]{};
-  std::atomic<uint64_t> served{0};
-  std::atomic<uint64_t> bytesServed{0};
+  BucketStats bucket[logic::kSizeBuckets];
   std::atomic<uint64_t> fills{0};
   std::atomic<uint64_t> fillBytes{0};
   std::atomic<uint64_t> evictions{0};      // entries dropped
@@ -353,6 +374,7 @@ struct Pool
 struct State
 {
   logic::Limits limits;
+  uint32_t admitReads = 8;
   bool async = false;
   int threads = 4;
 
@@ -375,11 +397,27 @@ State* g = nullptr;
 // statistics logging (off the hot path: only every 4096th event looks at the
 // clock)
 
+uint64_t servedTotal()
+{
+  uint64_t n = 0;
+  for (const BucketStats& b : g->stats.bucket)
+    n += b.served.load(std::memory_order_relaxed);
+  return n;
+}
+
+uint64_t bytesServedTotal()
+{
+  uint64_t n = 0;
+  for (const BucketStats& b : g->stats.bucket)
+    n += b.bytesServed.load(std::memory_order_relaxed);
+  return n;
+}
+
 uint64_t activity()
 {
   const Stats& s = g->stats;
   return s.classified.load(std::memory_order_relaxed) +
-         s.served.load(std::memory_order_relaxed) +
+         servedTotal() +
          s.passthroughs.load(std::memory_order_relaxed) +
          s.fills.load(std::memory_order_relaxed);
 }
@@ -413,12 +451,22 @@ void logSummary(const char* prefix)
       "dataEvictions={} entryEvictions={} entries={} resident={}B classifyFailures={} classifyUs={} (avg {}) "
       "fillUs={} (avg {})",
       prefix, ld(s.classified), ld(s.eligible), ld(s.ineligible), reasons,
-      ld(s.served), ld(s.bytesServed), ld(s.passthroughs), ld(s.fills),
+      servedTotal(), bytesServedTotal(), ld(s.passthroughs), ld(s.fills),
       ld(s.refills), ld(s.fillBytes), ld(s.dataEvictions), ld(s.evictions),
       g->store.entries(), g->store.used(),
       ld(s.failedClassifications), ld(s.classifyUs),
       ld(s.classified) ? ld(s.classifyUs) / ld(s.classified) : 0, ld(s.fillUs),
       ld(s.fills) ? ld(s.fillUs) / ld(s.fills) : 0);
+
+  std::string buckets;
+  for (size_t i = 0; i < logic::kSizeBuckets; ++i) {
+    const BucketStats& b = s.bucket[i];
+    buckets += std::format(
+        " [{}: admitted={} fills={} fillBytes={} served={} bytes={} probationEnd={}]",
+        logic::sizeBucketName(i), ld(b.admitted), ld(b.fills), ld(b.fillBytes),
+        ld(b.served), ld(b.bytesServed), ld(b.probationEnd));
+  }
+  logger->info("{} by file size:{}", prefix, buckets);
 }
 
 void maybeLog()
@@ -676,6 +724,9 @@ void countFill(CacheEntry& e)
     g->stats.fills.fetch_add(1, std::memory_order_relaxed);
   }
   g->stats.fillBytes.fetch_add(e.size, std::memory_order_relaxed);
+  BucketStats& b = g->stats.bucket[logic::sizeBucket(e.size)];
+  b.fills.fetch_add(1, std::memory_order_relaxed);
+  b.fillBytes.fetch_add(e.size, std::memory_order_relaxed);
   touch(e);
 }
 
@@ -957,25 +1008,8 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
   key.written = info.written;
   key.changed = info.changed;
 
-  std::shared_ptr<CacheEntry> entry =
-      g->store.acquire(key);
-
-  bool loaded = false;
-  if (g->async && entry->size > 0 && !g->stop.load(std::memory_order_relaxed)) {
-    loaded = queueFill(h, entry);
-  }
-  if (!loaded) {
-    loaded = fillSync(h, entry);
-    if (!loaded) {
-      // the fill moved the real file pointer: give the original request the
-      // position it expects
-      setRealPos(h, static_cast<uint64_t>(info.position < 0 ? 0 : info.position));
-      return Eligibility::FillFailed;
-    }
-  }
-
-  hs.entry     = std::move(entry);
-  hs.shadowPos = info.position < 0 ? 0 : static_cast<uint64_t>(info.position);
+  // no data is loaded yet: the handle starts on probation (see read())
+  hs.entry = g->store.acquire(key);
   return Eligibility::Eligible;
 }
 
@@ -1004,8 +1038,8 @@ void classify(HandleState& hs, HANDLE h, bool eventOrApc, ULONG length)
     s.ineligible.fetch_add(1, std::memory_order_relaxed);
     s.byReason[static_cast<int>(r)].fetch_add(1, std::memory_order_relaxed);
   }
-  hs.eligible.store(r == Eligibility::Eligible, std::memory_order_release);
-  hs.classified.store(true, std::memory_order_release);
+  hs.mode.store(r == Eligibility::Eligible ? kHandleProbation : kHandleIneligible,
+                std::memory_order_release);
   countEvent(s.classified);
 }
 
@@ -1041,6 +1075,39 @@ NTSTATUS realRead(HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc, PVOID ctx,
   return ::NtReadFile(h, ev, apc, ctx, iosb, buf, len, off, key);
 }
 
+// moves a handle from probation to served mode: loads the file (or queues
+// it) and takes over the file pointer. Caller holds hs.m. On failure the handle
+// becomes ineligible and the real pointer is as it was.
+bool admit(HandleState& hs, HANDLE h)
+{
+  CacheEntry& e = *hs.entry;
+  uint64_t pos  = 0;
+  bool ok       = getRealPos(h, pos);
+
+  if (ok) {
+    bool loaded = false;
+    if (g->async && e.size > 0 && !g->stop.load(std::memory_order_relaxed))
+      loaded = queueFill(h, hs.entry);
+    ok = loaded || fillSync(h, hs.entry);
+    if (!ok)
+      setRealPos(h, pos);  // the sync fill moved it
+  }
+
+  if (!ok) {
+    hs.mode.store(kHandleIneligible, std::memory_order_release);
+    hs.entry.reset();
+    g->stats.byReason[static_cast<int>(Eligibility::FillFailed)].fetch_add(
+        1, std::memory_order_relaxed);
+    return false;
+  }
+
+  hs.shadowPos = pos;
+  g->stats.bucket[logic::sizeBucket(e.size)].admitted.fetch_add(
+      1, std::memory_order_relaxed);
+  hs.mode.store(kHandleServed, std::memory_order_release);
+  return true;
+}
+
 // a request on an eligible handle that we don't serve: the real file pointer
 // has to match what the caller believes it to be. Caller holds hs.m.
 NTSTATUS syncedRead(HandleState& hs, HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc,
@@ -1048,7 +1115,7 @@ NTSTATUS syncedRead(HandleState& hs, HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc,
                     PLARGE_INTEGER off, PULONG key)
 {
   if (setRealPos(h, hs.shadowPos) < 0)
-    hs.eligible.store(false, std::memory_order_release);
+    hs.mode.store(kHandleIneligible, std::memory_order_release);
 
   const NTSTATUS res = realRead(h, ev, apc, ctx, iosb, buf, len, off, key);
 
@@ -1056,7 +1123,7 @@ NTSTATUS syncedRead(HandleState& hs, HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc,
   if (getRealPos(h, pos)) {
     hs.shadowPos = pos;
   } else {
-    hs.eligible.store(false, std::memory_order_release);
+    hs.mode.store(kHandleIneligible, std::memory_order_release);
   }
   return res;
 }
@@ -1066,7 +1133,7 @@ NTSTATUS syncedRead(HandleState& hs, HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc,
 // ---------------------------------------------------------------------------
 // public interface
 
-Peek peek(HANDLE h)
+Peek peek(HANDLE h, ULONG length)
 {
   if (!g)
     return Peek::Unknown;
@@ -1075,10 +1142,24 @@ Peek peek(HANDLE h)
   if (it == g->handles.end())
     return Peek::Unknown;
   const HandleState& hs = *it->second;
-  if (!hs.classified.load(std::memory_order_acquire))
+  switch (hs.mode.load(std::memory_order_acquire)) {
+  case kHandleServed:
+    return Peek::Serve;
+  case kHandleProbation: {
+    if (!logic::isSmallRead(length))
+      return Peek::Passthrough;
+    CacheEntry& e = *hs.entry;
+    const uint32_t count = e.smallReads.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int state      = e.state.load(std::memory_order_relaxed);
+    const bool resident  = state == kReady || state == kLoading;
+    return logic::shouldAdmit(count, g->admitReads, resident) ? Peek::Serve
+                                                              : Peek::Passthrough;
+  }
+  case kHandleIneligible:
+    return Peek::Passthrough;
+  default:
     return Peek::Unknown;
-  return hs.eligible.load(std::memory_order_acquire) ? Peek::Eligible
-                                                     : Peek::Ineligible;
+  }
 }
 
 void notePassthrough()
@@ -1112,6 +1193,9 @@ void init()
       logic::parseNumber(env("USVFS_READCACHE_MB", buf, sizeof(buf)), 1024) << 20;
   g->limits.maxFileBytes =
       logic::parseNumber(env("USVFS_READCACHE_MAXFILE_MB", buf, sizeof(buf)), 64) << 20;
+  g->admitReads = static_cast<uint32_t>(std::min<uint64_t>(
+      logic::parseNumber(env("USVFS_READCACHE_ADMIT_READS", buf, sizeof(buf)), 8),
+      1u << 20));
   g->async =
       logic::parseFlag(env("USVFS_READCACHE_ASYNC", buf, sizeof(buf)), false);
   g->threads = static_cast<int>(std::clamp<uint64_t>(
@@ -1120,8 +1204,9 @@ void init()
 
   if (auto logger = spdlog::get("usvfs")) {
     if (enabled) {
-      logger->info("readcache: enabled, budget {} MiB, max file {} MiB, {}",
+      logger->info("readcache: enabled, budget {} MiB, max file {} MiB, admit after {} small reads, {}",
                    g->limits.budgetBytes >> 20, g->limits.maxFileBytes >> 20,
+                   g->admitReads,
                    g->async ? std::format("async fill with {} threads", g->threads)
                             : std::string("synchronous fill"));
     } else {
@@ -1166,6 +1251,18 @@ void shutdown()
     g->pool.threads.clear();
   }
 
+  {
+    std::unique_lock<std::shared_mutex> lock(g->handlesLock);
+    for (auto& kv : g->handles) {
+      const HandleState& hs = *kv.second;
+      if (hs.mode.load(std::memory_order_acquire) == kHandleProbation && hs.entry) {
+        g->stats.bucket[logic::sizeBucket(hs.entry->size)].probationEnd.fetch_add(
+            1, std::memory_order_relaxed);
+      }
+    }
+    g->handles.clear();
+  }
+
   try {
     logSummary("readcache final");
   } catch (...) {
@@ -1183,7 +1280,15 @@ void onClose(HANDLE handle)
       return;
   }
   std::unique_lock<std::shared_mutex> lock(g->handlesLock);
-  g->handles.erase(handle);
+  auto it = g->handles.find(handle);
+  if (it == g->handles.end())
+    return;
+  const HandleState& hs = *it->second;
+  if (hs.mode.load(std::memory_order_acquire) == kHandleProbation && hs.entry) {
+    g->stats.bucket[logic::sizeBucket(hs.entry->size)].probationEnd.fetch_add(
+        1, std::memory_order_relaxed);
+  }
+  g->handles.erase(it);
 }
 
 NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
@@ -1201,6 +1306,7 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
 
   std::shared_ptr<HandleState> hs = lookup(FileHandle);
   std::unique_lock<std::mutex> lock;
+  bool justClassified = false;
 
   if (!hs) {
     auto fresh = std::make_shared<HandleState>();
@@ -1209,6 +1315,7 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
       hs   = fresh;
       lock = std::move(freshLock);
       classify(*hs, FileHandle, Event != nullptr || ApcRoutine != nullptr, Length);
+      justClassified = true;
     } else {
       freshLock.unlock();
     }
@@ -1216,18 +1323,45 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
 
   if (!lock.owns_lock()) {
     // fast path for handles we decided not to touch
-    if (hs->classified.load(std::memory_order_acquire) &&
-        !hs->eligible.load(std::memory_order_acquire))
+    if (hs->mode.load(std::memory_order_acquire) == kHandleIneligible)
       return passthrough();
     lock = std::unique_lock<std::mutex>(hs->m);
   }
 
-  if (!hs->eligible.load(std::memory_order_acquire)) {
+  if (hs->mode.load(std::memory_order_acquire) == kHandleIneligible) {
     lock.unlock();
     return passthrough();
   }
 
-  // ---- eligible handle, hs->m held ----
+  if (hs->mode.load(std::memory_order_acquire) == kHandleProbation) {
+    // the real file pointer is authoritative on probation
+    if (Event != nullptr || ApcRoutine != nullptr || Key != nullptr ||
+        IoStatusBlock == nullptr) {
+      lock.unlock();
+      return passthrough();
+    }
+    if (justClassified) {
+      // peek() counts the reads of every later call
+      bool admitNow = false;
+      if (logic::isSmallRead(Length)) {
+        CacheEntry& pe      = *hs->entry;
+        const uint32_t cnt  = pe.smallReads.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int pstate    = pe.state.load(std::memory_order_relaxed);
+        admitNow = logic::shouldAdmit(cnt, g->admitReads,
+                                      pstate == kReady || pstate == kLoading);
+      }
+      if (!admitNow) {
+        lock.unlock();
+        return passthrough();
+      }
+    }
+    if (!admit(*hs, FileHandle)) {
+      lock.unlock();
+      return passthrough();
+    }
+  }
+
+  // ---- admitted handle, hs->m held ----
 
   CacheEntry& e = *hs->entry;
 
@@ -1279,7 +1413,7 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
     // the fill failed or timed out: continue with the real file
     dataLock.unlock();
     const uint64_t shadow = hs->shadowPos;
-    hs->eligible.store(false, std::memory_order_release);
+    hs->mode.store(kHandleIneligible, std::memory_order_release);
     hs->entry.reset();
     g->stats.byReason[static_cast<int>(Eligibility::FillFailed)].fetch_add(
         1, std::memory_order_relaxed);
@@ -1295,9 +1429,10 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
   touch(e);
 
   hs->shadowPos = plan.newPos;
-  g->stats.bytesServed.fetch_add(plan.count, std::memory_order_relaxed);
-  g->stats.served.fetch_add(1, std::memory_order_relaxed);
-  countEvent(g->stats.served);
+  BucketStats& bs = g->stats.bucket[logic::sizeBucket(e.size)];
+  bs.bytesServed.fetch_add(plan.count, std::memory_order_relaxed);
+  bs.served.fetch_add(1, std::memory_order_relaxed);
+  countEvent(bs.served);
   return STATUS_SUCCESS;
 }
 
@@ -1312,7 +1447,7 @@ NTSTATUS queryInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
                                     Length, FileInformationClass);
 
   std::shared_ptr<HandleState> hs = lookup(FileHandle);
-  if (!hs || !hs->eligible.load(std::memory_order_acquire) ||
+  if (!hs || !hs->served() ||
       FileInformation == nullptr || IoStatusBlock == nullptr)
     return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
                                     Length, FileInformationClass);
@@ -1322,7 +1457,7 @@ NTSTATUS queryInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
       return ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
                                       Length, FileInformationClass);
     std::lock_guard<std::mutex> lock(hs->m);
-    if (hs->eligible.load(std::memory_order_acquire)) {
+    if (hs->served()) {
       if (!sehStoreInt64(FileInformation, static_cast<int64_t>(hs->shadowPos)) ||
           !sehStoreStatus(IoStatusBlock, STATUS_SUCCESS,
                           sizeof(FILE_POSITION_INFORMATION)))
@@ -1340,7 +1475,7 @@ NTSTATUS queryInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
   if ((res == STATUS_SUCCESS || res == STATUS_BUFFER_OVERFLOW) &&
       Length >= offsetof(FILE_ALL_INFORMATION, ModeInformation)) {
     std::lock_guard<std::mutex> lock(hs->m);
-    if (hs->eligible.load(std::memory_order_acquire)) {
+    if (hs->served()) {
       auto* all = static_cast<FILE_ALL_INFORMATION*>(FileInformation);
       sehStoreInt64(&all->PositionInformation.CurrentByteOffset,
                     static_cast<int64_t>(hs->shadowPos));
@@ -1358,7 +1493,7 @@ NTSTATUS setInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
                                   Length, FileInformationClass);
 
   std::shared_ptr<HandleState> hs = lookup(FileHandle);
-  if (!hs || !hs->eligible.load(std::memory_order_acquire) ||
+  if (!hs || !hs->served() ||
       FileInformation == nullptr || Length < sizeof(FILE_POSITION_INFORMATION))
     return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
                                   Length, FileInformationClass);
@@ -1373,7 +1508,7 @@ NTSTATUS setInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
   const NTSTATUS res = ::NtSetInformationFile(FileHandle, IoStatusBlock,
                                               FileInformation, Length,
                                               FileInformationClass);
-  if (res >= 0 && hs->eligible.load(std::memory_order_acquire)) {
+  if (res >= 0 && hs->served()) {
     if (readable && requested >= 0) {
       hs->shadowPos = static_cast<uint64_t>(requested);
     } else {
@@ -1382,7 +1517,7 @@ NTSTATUS setInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
       if (getRealPos(FileHandle, pos)) {
         hs->shadowPos = pos;
       } else {
-        hs->eligible.store(false, std::memory_order_release);
+        hs->mode.store(kHandleIneligible, std::memory_order_release);
       }
     }
   }
