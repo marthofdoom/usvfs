@@ -81,6 +81,18 @@ and `Tools/harness-cold.sh DIR...` (posix_fadvise DONTNEED for cold runs).
 - Response files: any `@<path>` argument is replaced by the args in that file (UTF-8/UTF-16 BOM, whitespace separated, `#` comment lines, `"..."` groups); expanded list is logged in the .log.
 - Safety: opens with write/delete/non-FILE_OPEN intent and non-position SetInformation are skipped.
 
+## Running the replay without MO2 (`--vfs`)
+- `USVFS_MAPPING_DUMP=<path>` (`src/usvfs_dll/mappingdump.h`, hooked into the exports in `usvfs.cpp`): the VFS-building
+  process logs usvfsConnectVFS/UpdateParameters params, VirtualLinkFile/DirectoryStatic (outermost call only, flags
+  kept), Blacklist/SkipSuffix/SkipDirectory/ForceLoadLibrary (Clear* drops earlier entries) and rewrites the text
+  manifest atomically (tmp + MoveFileEx) at every usvfsCreateProcessHooked. Format documented in the header.
+- Capture: add `USVFS_MAPPING_DUMP=Z:/mnt/gaming/modlists/Projects/Linux-Storage-DLL/logs/vfs-manifest.txt` to the Steam
+  launch options for one MO2 launch, start a program from MO2, then remove it.
+- `replay_x64.exe ... --vfs MANIFEST [--instance NAME] [--usvfs-dll PATH]`: loads usvfs_x64.dll (LoadLibrary), usvfsCreateVFS
+  with the captured params (instance name + `_replay` unless --instance), re-issues the calls, spawns each config child
+  via usvfsCreateProcessHooked, drains the usvfs log to `<out>.usvfs.log`. Without --vfs behaviour is unchanged.
+- Run: `Tools/replay-run.sh ARGSFILE` in Linux-Storage-DLL (see harness.md section 5). NOT yet run under Wine.
+
 ## Known fidelity limits
 - Only hooked ntdll/kernel32 calls: no NtWriteFile, mmap/sections, kernel32-only paths. Launch via
   GetFileAttributes*/FindFirst storm is replayed through the same hooks; ntdll calls made inside kernel32

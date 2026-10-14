@@ -58,6 +58,9 @@ struct Options {
   double fromSec = 0;
   double toSec = -1;     // < 0: to the end
   double limitSec = -1;  // < 0: none
+  std::wstring vfsPath;      // --vfs: mapping manifest written by USVFS_MAPPING_DUMP
+  std::wstring instanceName; // --instance
+  std::wstring usvfsDll;     // --usvfs-dll
   std::wstring outPath;
   std::wstring logPath;
   std::wstring childResult;  // set in child mode
@@ -1185,6 +1188,189 @@ std::vector<wchar_t> buildEnv(const Config& c, bool inherit)
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// --vfs: build our own usvfs instance (as MO2 does) from a USVFS_MAPPING_DUMP manifest and spawn the children
+// through usvfsCreateProcessHooked, so replay does not need to be started inside MO2's VFS.
+
+struct VfsApi {
+  HMODULE dll = nullptr;
+  bool ready = false;
+  void*(WINAPI* createParameters)() = nullptr;
+  void(WINAPI* freeParameters)(void*) = nullptr;
+  void(WINAPI* setInstanceName)(void*, const char*) = nullptr;
+  void(WINAPI* setDebugMode)(void*, BOOL) = nullptr;
+  void(WINAPI* setLogLevel)(void*, int) = nullptr;
+  void(WINAPI* setCrashDumpType)(void*, int) = nullptr;
+  void(WINAPI* setCrashDumpPath)(void*, const char*) = nullptr;
+  void(WINAPI* setProcessDelay)(void*, int) = nullptr;
+  void(WINAPI* initLogging)(bool) = nullptr;
+  BOOL(WINAPI* createVFS)(const void*) = nullptr;
+  void(WINAPI* disconnectVFS)() = nullptr;
+  void(WINAPI* clearMappings)() = nullptr;
+  BOOL(WINAPI* linkFile)(LPCWSTR, LPCWSTR, unsigned) = nullptr;
+  BOOL(WINAPI* linkDir)(LPCWSTR, LPCWSTR, unsigned) = nullptr;
+  void(WINAPI* blacklist)(LPWSTR) = nullptr;
+  void(WINAPI* skipSuffix)(LPWSTR) = nullptr;
+  void(WINAPI* skipDir)(LPWSTR) = nullptr;
+  void(WINAPI* forceLoad)(LPWSTR, LPWSTR) = nullptr;
+  BOOL(WINAPI* createProcess)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR,
+                              LPSTARTUPINFOW, LPPROCESS_INFORMATION) = nullptr;
+  bool(WINAPI* getLogMessages)(LPSTR, size_t, bool) = nullptr;
+  const char*(WINAPI* version)() = nullptr;
+};
+VfsApi g_vfs;
+std::atomic<bool> g_vfsLogStop{false};
+std::thread g_vfsLogThread;
+
+std::wstring fromUtf8(const std::string& s)
+{
+  if (s.empty()) return {};
+  const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+  std::wstring w((size_t)n, L'\0');
+  ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+  return w;
+}
+
+std::vector<std::string> splitManifestLine(const std::string& line)
+{
+  std::vector<std::string> f(1);
+  for (size_t i = 0; i < line.size(); ++i) {
+    const char c = line[i];
+    if (c == '\t') f.emplace_back();
+    else if (c == '\\' && i + 1 < line.size()) {
+      const char d = line[++i];
+      f.back() += d == 't' ? '\t' : d == 'n' ? '\n' : d == 'r' ? '\r' : d;
+    } else f.back() += c;
+  }
+  return f;
+}
+
+bool fileExists(const std::wstring& p) { return ::GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+bool setupVfs(const Options& o)
+{
+  // DLL: --usvfs-dll, else next to replay.exe, else the MO2 install used by the harness
+  std::vector<std::wstring> cands;
+  if (!o.usvfsDll.empty()) cands.push_back(o.usvfsDll);
+  else {
+    std::wstring self = selfPath();
+    const size_t sl = self.find_last_of(L"\\/");
+    cands.push_back((sl == std::wstring::npos ? std::wstring() : self.substr(0, sl + 1)) + L"usvfs_x64.dll");
+    cands.push_back(L"Z:\\mnt\\gaming\\modlists\\LoreRim\\usvfs_x64.dll");
+  }
+  std::wstring dllPath;
+  for (auto& c : cands) if (fileExists(c)) { dllPath = c; break; }
+  if (dllPath.empty()) { logf("--vfs: usvfs_x64.dll not found (tried %zu location(s); use --usvfs-dll)", cands.size()); return false; }
+  g_vfs.dll = ::LoadLibraryW(dllPath.c_str());
+  if (!g_vfs.dll) { logf("--vfs: LoadLibrary(%s) failed: %s", toUtf8(dllPath).c_str(), lastErrorText(::GetLastError()).c_str()); return false; }
+  bool ok = true;
+  auto sym = [&](auto& fn, const char* name) {
+    fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(::GetProcAddress(g_vfs.dll, name));
+    if (!fn) { logf("--vfs: export %s missing", name); ok = false; }
+  };
+  sym(g_vfs.createParameters, "usvfsCreateParameters"); sym(g_vfs.freeParameters, "usvfsFreeParameters");
+  sym(g_vfs.setInstanceName, "usvfsSetInstanceName"); sym(g_vfs.setDebugMode, "usvfsSetDebugMode");
+  sym(g_vfs.setLogLevel, "usvfsSetLogLevel"); sym(g_vfs.setCrashDumpType, "usvfsSetCrashDumpType");
+  sym(g_vfs.setCrashDumpPath, "usvfsSetCrashDumpPath"); sym(g_vfs.setProcessDelay, "usvfsSetProcessDelay");
+  sym(g_vfs.initLogging, "usvfsInitLogging"); sym(g_vfs.createVFS, "usvfsCreateVFS");
+  sym(g_vfs.disconnectVFS, "usvfsDisconnectVFS"); sym(g_vfs.clearMappings, "usvfsClearVirtualMappings");
+  sym(g_vfs.linkFile, "usvfsVirtualLinkFile"); sym(g_vfs.linkDir, "usvfsVirtualLinkDirectoryStatic");
+  sym(g_vfs.blacklist, "usvfsBlacklistExecutable"); sym(g_vfs.skipSuffix, "usvfsAddSkipFileSuffix");
+  sym(g_vfs.skipDir, "usvfsAddSkipDirectory"); sym(g_vfs.forceLoad, "usvfsForceLoadLibrary");
+  sym(g_vfs.createProcess, "usvfsCreateProcessHooked"); sym(g_vfs.getLogMessages, "usvfsGetLogMessages");
+  sym(g_vfs.version, "usvfsVersionString");
+  if (!ok) return false;
+  logf("--vfs: loaded %s (usvfs %s)", toUtf8(dllPath).c_str(), g_vfs.version());
+
+  std::ifstream f(o.vfsPath, std::ios::binary);
+  if (!f) { logf("--vfs: cannot read manifest %s", toUtf8(o.vfsPath).c_str()); return false; }
+  std::string line;
+  std::vector<std::vector<std::string>> rows;
+  bool header = false;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+    auto fld = splitManifestLine(line);
+    if (!header) {
+      if (fld[0] != "USVFSMAP" || fld.size() < 2 || fld[1] != "1") { logf("--vfs: %s is not a version 1 manifest", toUtf8(o.vfsPath).c_str()); return false; }
+      header = true;
+      continue;
+    }
+    rows.push_back(std::move(fld));
+  }
+  if (!header) { logf("--vfs: manifest is empty"); return false; }
+
+  // PARAMS (last wins)
+  std::string inst = "replay", dumpPath;
+  bool debug = false;
+  int logLevel = 1, dumpType = 0, delayMs = 0;
+  for (auto& r : rows)
+    if (r[0] == "PARAMS" && r.size() >= 7) {
+      inst = r[1]; debug = r[2] == "1"; logLevel = atoi(r[3].c_str()); dumpType = atoi(r[4].c_str());
+      dumpPath = r[5]; delayMs = atoi(r[6].c_str());
+    }
+  if (!o.instanceName.empty()) inst = toUtf8(o.instanceName);
+  else inst += "_replay";  // never collide with a live MO2 instance of the captured name
+  if (inst.size() > 60) inst.resize(60);
+  logf("--vfs: instance '%s', debug %d, log level %d, dump type %d, delay %d ms, %zu manifest entries", inst.c_str(), (int)debug,
+       logLevel, dumpType, delayMs, rows.size());
+
+  g_vfs.initLogging(false);
+  void* p = g_vfs.createParameters();
+  g_vfs.setInstanceName(p, inst.c_str());
+  g_vfs.setDebugMode(p, debug);
+  g_vfs.setLogLevel(p, logLevel);
+  g_vfs.setCrashDumpType(p, dumpType);
+  g_vfs.setCrashDumpPath(p, dumpPath.c_str());
+  g_vfs.setProcessDelay(p, delayMs);
+  if (!g_vfs.createVFS(p)) { logf("--vfs: usvfsCreateVFS failed"); g_vfs.freeParameters(p); return false; }
+  g_vfs.freeParameters(p);
+  g_vfs.ready = true;
+
+  // drain the usvfs shared-memory log (injected children log into it) to <out>.usvfs.log
+  const std::wstring usvfsLog = o.outPath + L".usvfs.log";
+  g_vfsLogThread = std::thread([usvfsLog] {
+    std::ofstream lf(usvfsLog, std::ios::binary | std::ios::trunc);
+    std::vector<char> buf(8192);
+    while (true) {
+      bool got = false;
+      while (g_vfs.getLogMessages(buf.data(), buf.size(), false)) { lf << buf.data() << "\n"; got = true; }
+      if (got) lf.flush();
+      if (g_vfsLogStop.load()) break;
+      ::Sleep(100);
+    }
+  });
+
+  // mapping calls in manifest order (skip suffixes / dirs / blacklist precede the links as in MO2)
+  size_t links = 0, failed = 0;
+  const uint64_t t0 = qpcNow();
+  auto wbuf = [](const std::string& s) { std::wstring w = fromUtf8(s); w.push_back(L'\0'); return w; };
+  for (auto& r : rows) {
+    const std::string& t = r[0];
+    if (t == "BLACKLIST" && r.size() >= 2) { auto w = wbuf(r[1]); g_vfs.blacklist(w.data()); }
+    else if (t == "SKIPSUFFIX" && r.size() >= 2) { auto w = wbuf(r[1]); g_vfs.skipSuffix(w.data()); }
+    else if (t == "SKIPDIR" && r.size() >= 2) { auto w = wbuf(r[1]); g_vfs.skipDir(w.data()); }
+    else if (t == "FORCELOAD" && r.size() >= 3) { auto a = wbuf(r[1]); auto b = wbuf(r[2]); g_vfs.forceLoad(a.data(), b.data()); }
+  }
+  for (auto& r : rows) {
+    if ((r[0] == "LINKFILE" || r[0] == "LINKDIR") && r.size() >= 4) {
+      const std::wstring src = fromUtf8(r[1]), dst = fromUtf8(r[2]);
+      const unsigned flags = (unsigned)strtoul(r[3].c_str(), nullptr, 10);
+      const BOOL ok = r[0] == "LINKFILE" ? g_vfs.linkFile(src.c_str(), dst.c_str(), flags) : g_vfs.linkDir(src.c_str(), dst.c_str(), flags);
+      ++links;
+      if (!ok && ++failed <= 20) logf("--vfs: %s failed (error %lu): %s -> %s", r[0].c_str(), ::GetLastError(), r[1].c_str(), r[2].c_str());
+    }
+  }
+  logf("--vfs: %zu link call(s) issued (%zu failed) in %.1f s", links, failed, ticksToUs(qpcNow() - t0) / 1e6);
+  return true;
+}
+
+void teardownVfs()
+{
+  if (g_vfsLogThread.joinable()) { g_vfsLogStop = true; g_vfsLogThread.join(); }
+  if (g_vfs.ready) g_vfs.disconnectVFS();
+}
+
 bool runConfig(const Options& o, const Config& c, size_t index, Result& res)
 {
   res.cfg = c;
@@ -1212,9 +1398,13 @@ bool runConfig(const Options& o, const Config& c, size_t index, Result& res)
   const uint64_t t0 = qpcNow();
   bool started = false;
   for (int attempt = 1; attempt <= 3 && !started; ++attempt) {
-    // normal CreateProcessW: the usvfs hooks inject the child
-    started = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT,
-                               env.data(), nullptr, &si, &pi) != 0;
+    // normal CreateProcessW: the usvfs hooks inject the child (or, with --vfs, our own VFS instance does)
+    if (g_vfs.ready)
+      started = g_vfs.createProcess(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, env.data(),
+                                    nullptr, &si, &pi) != 0;
+    else
+      started = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT,
+                                 env.data(), nullptr, &si, &pi) != 0;
     if (!started) {
       logf("CreateProcessW failed (attempt %d): %s; working set peak %.0f MB", attempt,
            lastErrorText(::GetLastError()).c_str(), peakWorkingSetMb());
@@ -1393,6 +1583,7 @@ void usage()
       "usage: replay.exe <trace> [--timing asap|original] [--verify] [--threads-as-recorded]\n"
       "                  [--single-thread] [--allow-writes] [--inherit-env] [--out results.json]\n"
       "                  [--from S] [--to S] [--limit-seconds N]\n"
+      "                  [--vfs MANIFEST [--instance NAME] [--usvfs-dll PATH]]\n"
       "                  [--config NAME KEY=VAL ...]...\n",
       stderr);
 }
@@ -1469,6 +1660,9 @@ int wmain(int argc, wchar_t** argv)
     else if (a == L"--allow-writes") o.allowWrites = true;
     else if (a == L"--inherit-env") o.inheritEnv = true;
     else if (a == L"--out") o.outPath = next();
+    else if (a == L"--vfs") o.vfsPath = next();
+    else if (a == L"--instance") o.instanceName = next();
+    else if (a == L"--usvfs-dll") o.usvfsDll = next();
     else if (a == L"--log") o.logPath = next();
     else if (a == L"--child") o.childResult = next();
     else if (a == L"--from") o.fromSec = _wtof(next().c_str());
@@ -1507,12 +1701,16 @@ int wmain(int argc, wchar_t** argv)
   }
   if (configs.empty()) configs.push_back(Config{"default", {}});
 
+  if (!o.vfsPath.empty()) {
+    if (!setupVfs(o)) { teardownVfs(); return 1; }
+  }
   std::vector<Result> results(configs.size());
   for (size_t i = 0; i < configs.size(); ++i) {
     logf("running config %zu/%zu: %s", i + 1, configs.size(), configs[i].name.c_str());
     runConfig(o, configs[i], i, results[i]);
   }
 
+  teardownVfs();
   const std::string json = writeJson(o, results);
   const std::string tab = table(results);
   { std::ofstream f(o.outPath, std::ios::binary | std::ios::trunc); f << json; }

@@ -23,6 +23,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "hookmanager.h"
 #include "maptracker.h"
 #include "readcache.h"
+#include "mappingdump.h"
 #include "usvfsparametersprivate.h"
 #include "redirectiontree.h"
 #include "loghelpers.h"
@@ -203,6 +204,9 @@ void SetLogLevel(LogLevel level)
 
 void WINAPI usvfsUpdateParameters(usvfsParameters* p)
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::setParams(p->instanceName, p->debugMode, (int)p->logLevel, (int)p->crashDumpsType,
+                              p->crashDumpsPath, p->delayProcessMs);
   spdlog::get("usvfs")->info(
     "updating parameters:\n"
     " . debugMode: {}\n"
@@ -446,6 +450,9 @@ BOOL WINAPI usvfsCreateVFS(const usvfsParameters* p)
 
 BOOL WINAPI usvfsConnectVFS(const usvfsParameters* params)
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::setParams(params->instanceName, params->debugMode, (int)params->logLevel,
+                              (int)params->crashDumpsType, params->crashDumpsPath, params->delayProcessMs);
   if (spdlog::get("usvfs").get() == nullptr) {
     // create temporary logger so we don't get null-pointer exceptions
     spdlog::create<spdlog::sinks::null_sink_mt>("usvfs");
@@ -566,6 +573,10 @@ BOOL WINAPI usvfsGetVFSProcessList2(size_t* count, DWORD** buffer)
 
 void WINAPI usvfsClearVirtualMappings()
 {
+  if (usvfs::mapdump::enabled()) {
+    usvfs::mapdump::clear("LINKFILE");
+    usvfs::mapdump::clear("LINKDIR");
+  }
   usvfs::MappingChangeGuard mappingChange;
   context->redirectionTable()->clear();
   context->inverseTable()->clear();
@@ -652,6 +663,8 @@ static bool fileNameInSkipDirectories(const std::string& directoryNameUtf8,
 BOOL WINAPI usvfsVirtualLinkFile(LPCWSTR source, LPCWSTR destination,
                             unsigned int flags)
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::add("LINKFILE", {usvfs::mapdump::utf8(source), usvfs::mapdump::utf8(destination), std::to_string(flags)});
   usvfs::MappingChangeGuard mappingChange;
   // TODO difference between winapi and ntdll api regarding system32 vs syswow64
   // (and other windows links?)
@@ -716,6 +729,9 @@ static usvfs::shared::TreeFlags convertRedirectionFlags(unsigned int flags)
 
 BOOL WINAPI usvfsVirtualLinkDirectoryStatic(LPCWSTR source, LPCWSTR destination, unsigned int flags)
 {
+  usvfs::mapdump::NestGuard nest;
+  if (nest.outer && usvfs::mapdump::enabled())
+    usvfs::mapdump::add("LINKDIR", {usvfs::mapdump::utf8(source), usvfs::mapdump::utf8(destination), std::to_string(flags)});
   usvfs::MappingChangeGuard mappingChange;
   // TODO change notification not yet implemented
   try {
@@ -825,6 +841,8 @@ BOOL WINAPI usvfsCreateProcessHooked(LPCWSTR lpApplicationName
                                 , LPSTARTUPINFOW lpStartupInfo
                                 , LPPROCESS_INFORMATION lpProcessInformation)
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::flush();
   BOOL susp = dwCreationFlags & CREATE_SUSPENDED;
   DWORD flags = dwCreationFlags | CREATE_SUSPENDED;
 
@@ -880,48 +898,64 @@ BOOL WINAPI usvfsCreateVFSDump(LPSTR buffer, size_t *size)
 
 VOID WINAPI usvfsBlacklistExecutable(LPWSTR executableName)
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::add("BLACKLIST", {usvfs::mapdump::utf8(executableName)});
   context->blacklistExecutable(executableName);
 }
 
 
 VOID WINAPI usvfsClearExecutableBlacklist()
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::clear("BLACKLIST");
   context->clearExecutableBlacklist();
 }
 
 
 VOID WINAPI usvfsAddSkipFileSuffix(LPWSTR fileSuffix)
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::add("SKIPSUFFIX", {usvfs::mapdump::utf8(fileSuffix)});
   context->addSkipFileSuffix(fileSuffix);
 }
 
 
 VOID WINAPI usvfsClearSkipFileSuffixes()
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::clear("SKIPSUFFIX");
   context->clearSkipFileSuffixes();
 }
 
 
 VOID WINAPI usvfsAddSkipDirectory(LPWSTR directory)
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::add("SKIPDIR", {usvfs::mapdump::utf8(directory)});
   context->addSkipDirectory(directory);
 }
 
 
 VOID WINAPI usvfsClearSkipDirectories()
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::clear("SKIPDIR");
   context->clearSkipDirectories();
 }
 
 
 VOID WINAPI usvfsForceLoadLibrary(LPWSTR processName, LPWSTR libraryPath)
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::add("FORCELOAD", {usvfs::mapdump::utf8(processName), usvfs::mapdump::utf8(libraryPath)});
   context->forceLoadLibrary(processName, libraryPath);
 }
 
 
 VOID WINAPI usvfsClearLibraryForceLoads()
 {
+  if (usvfs::mapdump::enabled())
+    usvfs::mapdump::clear("FORCELOAD");
   context->clearLibraryForceLoads();
 }
 
