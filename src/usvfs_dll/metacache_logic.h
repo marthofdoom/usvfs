@@ -40,14 +40,18 @@ namespace usvfs::metacache::logic
 // ---------------------------------------------------------------------------
 // paths
 
+// upper-casing of non-ASCII characters (RtlUpcaseUnicodeChar in the DLL); when
+// not set they are compared exactly, which can only cause misses
+inline wchar_t (*g_upcaseHook)(wchar_t) = nullptr;
+
 inline wchar_t foldChar(wchar_t c)
 {
-  // ASCII only: other characters are compared exactly, which can only cause
-  // misses, never wrong hits
   if (c >= L'a' && c <= L'z')
     return static_cast<wchar_t>(c - L'a' + L'A');
   if (c == L'/')
     return L'\\';
+  if (c >= 0x80 && g_upcaseHook)
+    return g_upcaseHook(c);
   return c;
 }
 
@@ -370,6 +374,19 @@ public:
     }
   }
 
+  // true if nothing under this path may be cached (volatile or excluded)
+  bool isBlockedPath(const std::wstring& path)
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_overflowed || isBlocked(path) || m_volatileDirs.count(path) != 0;
+  }
+
+  bool overflowed() const
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_overflowed;
+  }
+
   bool isVolatile(const std::wstring& path)
   {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -428,6 +445,7 @@ public:
 
 private:
   static constexpr size_t kTreeScanLimit = 200000;
+  static constexpr size_t kMaxVolatile   = 200000;
 
   struct Node
   {
@@ -463,6 +481,8 @@ private:
 
   bool isBlocked(const std::wstring& path) const
   {
+    if (m_overflowed)
+      return true;
     for (const std::wstring& prefix : m_noCache) {
       if (isUnderPrefix(path, prefix))
         return true;
@@ -508,9 +528,21 @@ private:
     const std::wstring parent = parentPath(path);
     if (!parent.empty()) {
       eraseDir(parent);
+      // a directory's own times/size change when an entry is added or removed
+      auto pa = m_attrs.find(parent);
+      if (pa != m_attrs.end())
+        eraseAttr(pa);
       m_volatileDirs.insert(parent);
+      m_volatilePaths.insert(parent);
     }
     m_volatilePaths.insert(path);
+
+    // The volatile sets cannot be forgotten without caching written paths again,
+    // so when they grow too large caching is switched off for good.
+    if (m_volatilePaths.size() + m_volatileDirs.size() > kMaxVolatile) {
+      clearLocked();
+      m_overflowed = true;
+    }
   }
 
   void evict()
@@ -559,6 +591,7 @@ private:
   std::unordered_set<std::wstring> m_volatilePaths;
   std::unordered_set<std::wstring> m_volatileDirs;
   std::vector<std::wstring> m_noCache;
+  bool m_overflowed = false;
   StoreStats m_stats;
 };
 

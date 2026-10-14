@@ -253,3 +253,50 @@ TEST(MetaCacheStore, ListingsKeyedByClassAndMask)
   EXPECT_TRUE(s.hasListing(L"\\D", 37, L"*"));
   EXPECT_FALSE(s.hasListing(L"\\D", 3, L"*"));
 }
+
+TEST(MetaCacheStore, ChildWriteInvalidatesParentDirectoryAttributes)
+{
+  Store s(1 << 20);
+  s.putAttr(L"\\D", existing());     // the directory itself
+  s.putAttr(L"\\D\\F", existing());
+  s.invalidatePath(L"\\D\\F");
+
+  Attr out;
+  EXPECT_FALSE(s.lookupAttr(L"\\D", true, out));  // its times changed
+  s.putAttr(L"\\D", existing());
+  EXPECT_FALSE(s.lookupAttr(L"\\D", true, out));  // and are not trusted again
+}
+
+TEST(MetaCacheStore, BlockedPathCoversVolatileExcludedAndParents)
+{
+  Store s(1 << 20);
+  EXPECT_FALSE(s.isBlockedPath(L"\\D"));
+  s.addNoCachePrefix(L"\\OVR");
+  EXPECT_TRUE(s.isBlockedPath(L"\\OVR\\X"));
+  s.invalidatePath(L"\\D\\F");
+  EXPECT_TRUE(s.isBlockedPath(L"\\D"));
+  EXPECT_TRUE(s.isBlockedPath(L"\\D\\F"));
+  EXPECT_FALSE(s.isBlockedPath(L"\\E"));
+}
+
+TEST(MetaCacheStore, TooManyWrittenPathsSwitchCachingOff)
+{
+  Store s(1 << 20);
+  s.putAttr(L"\\A", existing());
+  for (int i = 0; i < 110000; ++i)
+    s.invalidatePath(L"\\W\\" + std::to_wstring(i));
+  EXPECT_TRUE(s.overflowed());
+
+  Attr out;
+  EXPECT_FALSE(s.lookupAttr(L"\\A", true, out));
+  s.putAttr(L"\\B", existing());
+  EXPECT_FALSE(s.lookupAttr(L"\\B", true, out));
+}
+
+TEST(MetaCachePath, NonAsciiFoldingUsesTheHookWhenSet)
+{
+  EXPECT_NE(normalizePath(L"\xE9"), normalizePath(L"\xC9"));  // without a hook: exact
+  g_upcaseHook = [](wchar_t c) -> wchar_t { return c >= 0xE0 && c <= 0xFE ? c - 0x20 : c; };
+  EXPECT_EQ(normalizePath(L"\xE9"), normalizePath(L"\xC9"));
+  g_upcaseHook = nullptr;
+}

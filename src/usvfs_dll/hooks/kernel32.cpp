@@ -1,3 +1,4 @@
+#include "../metacache.h"
 #include "kernel32.h"
 #include "sharedids.h"
 
@@ -477,6 +478,8 @@ DWORD WINAPI usvfs::hook_SetFileAttributesW(
   HOOK_START_GROUP(MutExHookGroup::FILE_ATTRIBUTES)
   // Why is the usual if (!callContext.active()... check missing?
 
+  usvfs::metacache::noteDosPath(lpFileName, false);
+
   RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, lpFileName);
   PRE_REALCALL
   res = ::SetFileAttributesW(reroute.fileName(), dwFileAttributes);
@@ -499,6 +502,8 @@ BOOL WINAPI usvfs::hook_DeleteFileW(LPCWSTR lpFileName)
   // Why is the usual if (!callContext.active()... check missing?
 
   const std::wstring path = RerouteW::canonizePath(RerouteW::absolutePath(lpFileName)).wstring();
+
+  usvfs::metacache::noteDosPath(path.c_str(), false);
 
   RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, path.c_str());
 
@@ -569,6 +574,10 @@ BOOL WINAPI usvfs::hook_MoveFileW(LPCWSTR lpExistingFileName,
     callContext.updateLastError();
     return res;
   }
+
+  // virtual paths: listings and attributes are keyed by them
+  usvfs::metacache::noteDosPath(lpExistingFileName, true);
+  usvfs::metacache::noteDosPath(lpNewFileName, true);
 
   RerouteW readReroute;
   CreateRerouter writeReroute;
@@ -698,6 +707,10 @@ BOOL WINAPI usvfs::hook_MoveFileExW(LPCWSTR lpExistingFileName,
     return res;
   }
 
+  // virtual paths: listings and attributes are keyed by them
+  usvfs::metacache::noteDosPath(lpExistingFileName, true);
+  usvfs::metacache::noteDosPath(lpNewFileName, true);
+
   RerouteW readReroute;
   CreateRerouter writeReroute;
   bool callOriginal = true;
@@ -826,6 +839,10 @@ BOOL WINAPI usvfs::hook_MoveFileWithProgressW(LPCWSTR lpExistingFileName, LPCWST
     return res;
   }
 
+  // virtual paths: listings and attributes are keyed by them
+  usvfs::metacache::noteDosPath(lpExistingFileName, true);
+  usvfs::metacache::noteDosPath(lpNewFileName, true);
+
   RerouteW readReroute;
   usvfs::CreateRerouter writeReroute;
   bool callOriginal = true;
@@ -920,6 +937,8 @@ BOOL WINAPI usvfs::hook_CopyFileExW(LPCWSTR lpExistingFileName,
     callContext.updateLastError();
     return res;
   }
+
+  usvfs::metacache::noteDosPath(lpNewFileName, false);
 
   RerouteW readReroute;
   usvfs::CreateRerouter writeReroute;
@@ -1089,6 +1108,8 @@ DLLEXPORT BOOL WINAPI usvfs::hook_CreateDirectoryW(
   BOOL res = FALSE;
   HOOK_START
 
+  usvfs::metacache::noteDosPath(lpPathName, false);
+
   RerouteW reroute = RerouteW::createOrNew(READ_CONTEXT(), callContext, lpPathName);
 
   PRE_REALCALL
@@ -1114,6 +1135,8 @@ DLLEXPORT BOOL WINAPI usvfs::hook_RemoveDirectoryW(
 
   HOOK_START_GROUP(MutExHookGroup::DELETE_FILE)
   // Why is the usual if (!callContext.active()... check missing?
+
+  usvfs::metacache::noteDosPath(lpPathName, true);
 
   RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, lpPathName);
 
@@ -1358,6 +1381,8 @@ HRESULT WINAPI usvfs::hook_CopyFile2(PCWSTR pwszExistingFileName, PCWSTR pwszNew
     callContext.updateLastError();
     return res;
   }
+
+  usvfs::metacache::noteDosPath(pwszNewFileName, false);
 
   RerouteW readReroute;
   CreateRerouter writeReroute;

@@ -210,11 +210,12 @@ struct HandleState
 
   // layer 3 (big reads); splitOk/key are set during classification, the rest is
   // guarded by m
-  bool splitOk = false;
+  std::atomic<bool> splitOk{false};
   Key key;
   std::shared_ptr<WFile> wfile;
   logic::SeqState seq;
-  std::shared_ptr<RaWindow> window;
+  std::shared_ptr<RaWindow> window;   // current readahead window
+  std::shared_ptr<RaWindow> window2;  // the one after it
   uint32_t splitFailures = 0;
 
   ~HandleState();
@@ -403,7 +404,8 @@ struct Pool
 {
   std::mutex m;
   std::condition_variable cv;
-  std::deque<std::function<void()>> queue;
+  std::deque<std::function<void()>> queue;    // whole-file fills
+  std::deque<std::function<void()>> hiQueue;  // split helpers and readahead: served first
   std::vector<std::thread> threads;
   bool started = false;
   std::atomic<int> alive{0};
@@ -444,6 +446,13 @@ State* g = nullptr;
 
 constexpr int kMaxWorkerHandles = 256;
 
+// called for every handle we close ourselves, so that the hooks' own
+// bookkeeping (handle tracker, directory cursors) forgets it too
+void (*g_forgetCallback)(HANDLE) = nullptr;
+
+// set once a request has started doing I/O; after that it must not be re-issued
+thread_local bool t_ioStarted = false;
+
 // worker-owned handles to one file, opened by name (like layer 2) and shared
 // by all game handles of that file. The set lives as long as one of them does.
 struct WFile
@@ -452,6 +461,7 @@ struct WFile
   std::wstring path;
   std::mutex m;
   std::vector<HANDLE> idle;
+  std::atomic<uint64_t> lastUse{0};
 
   HANDLE acquire();  // null if no handle could be had
   void release(HANDLE h, bool good);
@@ -467,6 +477,7 @@ struct RaWindow
   std::atomic<uint64_t> loaded{0};
   std::atomic<int> state{0};  // 0 loading, 1 done, 2 failed/cancelled
   std::atomic<bool> cancel{false};
+  std::atomic<bool> started{false};  // a worker has picked the window up
   std::mutex m;
   std::condition_variable cv;
 
@@ -477,6 +488,8 @@ HandleState::~HandleState()
 {
   if (window)
     window->cancel.store(true, std::memory_order_relaxed);
+  if (window2)
+    window2->cancel.store(true, std::memory_order_relaxed);
 }
 
 // a big read split into chunks that the calling thread and workers share
@@ -1000,12 +1013,18 @@ void workerMain()
     {
       std::unique_lock<std::mutex> lock(pool.m);
       pool.cv.wait(lock, [&] {
-        return g->stop.load(std::memory_order_relaxed) || !pool.queue.empty();
+        return g->stop.load(std::memory_order_relaxed) || !pool.hiQueue.empty() ||
+               !pool.queue.empty();
       });
       if (g->stop.load(std::memory_order_relaxed))
         break;
-      task = std::move(pool.queue.front());
-      pool.queue.pop_front();
+      if (!pool.hiQueue.empty()) {
+        task = std::move(pool.hiQueue.front());
+        pool.hiQueue.pop_front();
+      } else {
+        task = std::move(pool.queue.front());
+        pool.queue.pop_front();
+      }
     }
 
     try {
@@ -1017,8 +1036,9 @@ void workerMain()
 }
 
 // runs a task on a worker thread (starting the pool on first use); false if
-// that is not possible
-bool submitTask(std::function<void()> task)
+// that is not possible. `high` tasks (the caller is waiting for them) go
+// before whole-file fills. May throw (allocation).
+bool submitTask(std::function<void()> task, bool high = false)
 {
   Pool& pool = g->pool;
   {
@@ -1040,7 +1060,7 @@ bool submitTask(std::function<void()> task)
         return false;
       }
     }
-    pool.queue.push_back(std::move(task));
+    (high ? pool.hiQueue : pool.queue).push_back(std::move(task));
   }
   pool.cv.notify_one();
   return true;
@@ -1095,6 +1115,19 @@ bool queueFill(HANDLE h, const std::shared_ptr<CacheEntry>& e)
 
 // ----- layer 3: worker-owned handles, split reads, readahead ----------------
 
+void closeRaw(HANDLE h)
+{
+  if (g_forgetCallback)
+    g_forgetCallback(h);
+  ::NtClose(h);
+}
+
+void closeWorkerHandle(HANDLE h)
+{
+  closeRaw(h);
+  g->workerHandles.fetch_sub(1);
+}
+
 HANDLE openByName(const std::wstring& path, const Key& key)
 {
   UNICODE_STRING name;
@@ -1123,12 +1156,50 @@ HANDLE openByName(const std::wstring& path, const Key& key)
   if (queryAttrs(file, info) == STATUS_SUCCESS && sameFile(info, key))
     return file;
 
-  ::NtClose(file);
+  closeRaw(file);
   return nullptr;
+}
+
+// closes the idle handles of the least recently used file; false if there were
+// none to close
+bool trimWorkerHandles()
+{
+  std::shared_ptr<WFile> victim;
+  uint64_t oldest = UINT64_MAX;
+  {
+    std::lock_guard<std::mutex> lock(g->wfilesLock);
+    for (auto& kv : g->wfiles) {
+      std::shared_ptr<WFile> wf = kv.second.lock();
+      if (!wf)
+        continue;
+      {
+        std::lock_guard<std::mutex> wl(wf->m);
+        if (wf->idle.empty())
+          continue;
+      }
+      const uint64_t use = wf->lastUse.load(std::memory_order_relaxed);
+      if (use < oldest) {
+        oldest = use;
+        victim = std::move(wf);
+      }
+    }
+  }
+  if (!victim)
+    return false;
+
+  std::vector<HANDLE> toClose;
+  {
+    std::lock_guard<std::mutex> lock(victim->m);
+    toClose.swap(victim->idle);
+  }
+  for (HANDLE h : toClose)
+    closeWorkerHandle(h);
+  return !toClose.empty();
 }
 
 HANDLE WFile::acquire()
 {
+  lastUse.store(GetTickCount64(), std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(m);
     if (!idle.empty()) {
@@ -1138,10 +1209,16 @@ HANDLE WFile::acquire()
     }
   }
   // each concurrent reader needs its own handle: reads on a synchronous handle
-  // are serialized by the system
+  // are serialized by the system. Over the cap, make room by closing the idle
+  // handles of the least recently used file.
   if (g->workerHandles.fetch_add(1) >= kMaxWorkerHandles) {
     g->workerHandles.fetch_sub(1);
-    return nullptr;
+    if (!trimWorkerHandles())
+      return nullptr;
+    if (g->workerHandles.fetch_add(1) >= kMaxWorkerHandles) {
+      g->workerHandles.fetch_sub(1);
+      return nullptr;
+    }
   }
   HANDLE h = openByName(path, key);
   if (!h)
@@ -1156,16 +1233,13 @@ void WFile::release(HANDLE h, bool good)
     idle.push_back(h);
     return;
   }
-  ::NtClose(h);
-  g->workerHandles.fetch_sub(1);
+  closeWorkerHandle(h);
 }
 
 WFile::~WFile()
 {
-  for (HANDLE h : idle) {
-    ::NtClose(h);
-    g->workerHandles.fetch_sub(1);
-  }
+  for (HANDLE h : idle)
+    closeWorkerHandle(h);
 }
 
 bool readInto(HANDLE h, uint64_t fileOffset, void* dst, uint64_t length)
@@ -1179,41 +1253,56 @@ bool readInto(HANDLE h, uint64_t fileOffset, void* dst, uint64_t length)
   return st == STATUS_SUCCESS && iosb.Information == length;
 }
 
-// takes chunks until none are left. `own` is the handle to read with.
+// takes chunks until none are left. `own` is the handle to read with. Never
+// throws, and every chunk it takes is counted as done, whatever happens: the
+// caller of the split waits for that before the user buffer may go away.
 void runChunks(SplitJob& job, HANDLE own, bool isCaller)
 {
-  HANDLE h = own;
+  HANDLE h  = own;
   bool good = true;
   for (;;) {
     const size_t i = job.next.fetch_add(1);
     if (i >= job.chunks.size())
       break;
 
-    if (!job.failed.load(std::memory_order_relaxed)) {
-      if (!h && !isCaller) {
-        h = job.wfile->acquire();
-        if (!h)
-          job.failed.store(true);
-      }
-      if (h) {
-        const logic::Chunk& c = job.chunks[i];
-        if (!readInto(h, c.offset, job.base + (c.offset - job.baseOffset), c.length)) {
-          job.failed.store(true);
-          if (!isCaller)
-            good = false;
+    try {
+      if (!job.failed.load(std::memory_order_relaxed)) {
+        if (!h && !isCaller) {
+          h = job.wfile->acquire();
+          if (!h)
+            job.failed.store(true);
+        }
+        if (h) {
+          const logic::Chunk& c = job.chunks[i];
+          if (!readInto(h, c.offset, job.base + (c.offset - job.baseOffset), c.length)) {
+            job.failed.store(true);
+            if (!isCaller)
+              good = false;
+          }
         }
       }
+    } catch (...) {
+      job.failed.store(true);
+      if (!isCaller)
+        good = false;
     }
 
     if (job.done.fetch_add(1) + 1 == job.chunks.size()) {
-      { std::lock_guard<std::mutex> lock(job.m); }
-      job.cv.notify_all();
+      try {
+        { std::lock_guard<std::mutex> lock(job.m); }
+        job.cv.notify_all();
+      } catch (...) {
+      }
     }
     if (!good)
       break;
   }
-  if (!isCaller && h)
-    job.wfile->release(h, good);
+  if (!isCaller && h) {
+    try {
+      job.wfile->release(h, good);
+    } catch (...) {
+    }
+  }
 }
 
 bool ensureWFile(HandleState& hs, HANDLE h)
@@ -1246,18 +1335,27 @@ bool ensureWFile(HandleState& hs, HANDLE h)
   return true;
 }
 
-void dropWindow(HandleState& hs)
+void dropWindow(std::shared_ptr<RaWindow>& w)
 {
-  if (hs.window) {
-    hs.window->cancel.store(true, std::memory_order_relaxed);
-    hs.window.reset();
+  if (w) {
+    w->cancel.store(true, std::memory_order_relaxed);
+    w.reset();
   }
+}
+
+void dropWindows(HandleState& hs)
+{
+  dropWindow(hs.window);
+  dropWindow(hs.window2);
 }
 
 void raTask(const std::shared_ptr<RaWindow>& w, const std::shared_ptr<WFile>& wf)
 {
-  bool ok     = false;
-  HANDLE h    = wf->acquire();
+  w->started.store(true, std::memory_order_release);
+  bool ok  = false;
+  HANDLE h = nullptr;
+  if (!w->cancel.load(std::memory_order_relaxed))
+    h = wf->acquire();
   if (h) {
     ok = true;
     uint64_t off = 0;
@@ -1284,77 +1382,78 @@ void raTask(const std::shared_ptr<RaWindow>& w, const std::shared_ptr<WFile>& wf
   w->cv.notify_all();
 }
 
-void issueWindow(HandleState& hs, HANDLE h, uint64_t lastEnd, uint64_t lastRead)
+// issues a readahead window starting at `start` into `slot`. May throw; the
+// memory reservation is always given back.
+void issueWindow(HandleState& hs, HANDLE h, uint64_t start, uint64_t lastRead,
+                 std::shared_ptr<RaWindow>& slot)
 {
   if (!ensureWFile(hs, h))
     return;
 
   const uint64_t used = g->raBytesInUse.load(std::memory_order_relaxed);
   const uint64_t left = g->raCapBytes > used ? g->raCapBytes - used : 0;
-  const logic::WindowPlan wp = logic::planWindow(lastEnd, lastRead, hs.key.size, left);
+  const logic::WindowPlan wp = logic::planWindow(start, lastRead, hs.key.size, left);
   if (wp.length == 0)
     return;
 
-  // reserve the memory (the RaWindow destructor gives it back)
+  auto w = std::make_shared<RaWindow>();  // length 0: nothing to give back yet
   if (g->raBytesInUse.fetch_add(wp.length) + wp.length > g->raCapBytes) {
     g->raBytesInUse.fetch_sub(wp.length);
     return;
   }
+  w->length = wp.length;  // from here the destructor returns the reservation
+  w->start  = wp.start;
+  w->buf.reset(new uint8_t[static_cast<size_t>(wp.length)]);
 
-  std::shared_ptr<RaWindow> w;
-  try {
-    w         = std::make_shared<RaWindow>();
-    w->start  = wp.start;
-    w->length = wp.length;
-    w->buf.reset(new uint8_t[static_cast<size_t>(wp.length)]);
-  } catch (...) {
-    return;  // w (if created) releases the reservation
-  }
-
-  dropWindow(hs);
-  hs.window = w;
   std::shared_ptr<WFile> wf = hs.wfile;
-  if (!submitTask([w, wf] { raTask(w, wf); })) {
-    hs.window.reset();
+  if (!submitTask([w, wf] { raTask(w, wf); }, true))
     return;
-  }
+  slot = w;
   g->stats.big.raWindows.fetch_add(1, std::memory_order_relaxed);
   g->stats.big.raBytes.fetch_add(wp.length, std::memory_order_relaxed);
 }
 
-// Serves a read completely inside the readahead window. On true, `status` is
-// the result of the request.
-bool serveFromWindow(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
-                     uint64_t offset, uint64_t total, bool explicitOff,
-                     NTSTATUS& status)
+// Serves a read completely inside the given window. On true, `status` is the
+// result of the request. A window no worker has started on yet, or one that
+// does not deliver within a short time, is dropped and the read goes the
+// normal way.
+bool serveFromWindow(HandleState& hs, std::shared_ptr<RaWindow>& slot, HANDLE h,
+                     PIO_STATUS_BLOCK iosb, PVOID buf, uint64_t offset,
+                     uint64_t total, bool explicitOff, NTSTATUS& status)
 {
-  RaWindow* w = hs.window.get();
+  RaWindow* w = slot.get();
   if (!w || !logic::windowCovers(w->start, w->length, offset, total))
     return false;
 
   const uint64_t need = offset + total - w->start;
   if (w->loaded.load(std::memory_order_acquire) < need) {
+    if (!w->started.load(std::memory_order_acquire)) {
+      // queued behind other work: don't wait for it
+      dropWindow(slot);
+      return false;
+    }
     BigStats& bs = g->stats.big;
     bs.raWaits.fetch_add(1, std::memory_order_relaxed);
     const uint64_t t0 = nowUs();
     {
       std::unique_lock<std::mutex> lock(w->m);
-      const auto deadline = chr::steady_clock::now() + chr::seconds(10);
+      const auto deadline = chr::steady_clock::now() + chr::milliseconds(100);
       while (w->loaded.load(std::memory_order_acquire) < need &&
              w->state.load(std::memory_order_acquire) != 2 &&
              !g->stop.load(std::memory_order_relaxed) &&
              chr::steady_clock::now() < deadline) {
-        w->cv.wait_for(lock, chr::milliseconds(20));
+        w->cv.wait_for(lock, chr::milliseconds(5));
       }
     }
     bs.raWaitUs.fetch_add(nowUs() - t0, std::memory_order_relaxed);
     if (w->loaded.load(std::memory_order_acquire) < need) {
-      dropWindow(hs);
+      dropWindow(slot);
       return false;
     }
   }
 
   // move the real pointer first: if that fails nothing has happened yet
+  t_ioStarted = true;
   if (setRealPos(h, offset + total) < 0)
     return false;
 
@@ -1374,7 +1473,9 @@ bool serveFromWindow(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf
 
 // Splits the request over the calling thread and the workers. Returns true if
 // the request was completed (status/total set); false means "do it the normal
-// way", with the real pointer where the original request expects it.
+// way", with the real pointer where the original request expects it. Throws
+// only before any chunk is dispatched; afterwards it always waits for every
+// chunk, so no worker writes into the buffer once this returns.
 bool trySplit(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
               ULONG len, uint64_t offset, bool explicitOff, NTSTATUS& status,
               uint64_t& total)
@@ -1382,8 +1483,9 @@ bool trySplit(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
   BigStats& bs = g->stats.big;
   auto fail = [&]() {
     bs.fallbacks.fetch_add(1, std::memory_order_relaxed);
-    if (++hs.splitFailures >= 3)
-      dropWindow(hs);
+    ++hs.splitFailures;
+    if (hs.splitFailures >= 3)
+      dropWindows(hs);
     return false;
   };
 
@@ -1412,18 +1514,24 @@ bool trySplit(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
   if (plan.action != logic::SplitAction::Split)
     return false;
 
-  auto job         = std::make_shared<SplitJob>();
-  job->wfile       = hs.wfile;
+  auto job          = std::make_shared<SplitJob>();
+  job->wfile        = hs.wfile;
   job->callerHandle = h;
-  job->base        = static_cast<uint8_t*>(buf);
-  job->baseOffset  = offset;
-  job->chunks      = std::move(plan.chunks);
+  job->base         = static_cast<uint8_t*>(buf);
+  job->baseOffset   = offset;
+  job->chunks       = std::move(plan.chunks);
+
+  t_ioStarted = true;
 
   const size_t helpers = std::min<size_t>(job->chunks.size() - 1,
                                           static_cast<size_t>(g->threads));
-  for (size_t i = 0; i < helpers; ++i) {
-    if (!submitTask([job] { runChunks(*job, nullptr, false); }))
-      break;
+  try {
+    for (size_t i = 0; i < helpers; ++i) {
+      if (!submitTask([job] { runChunks(*job, nullptr, false); }, true))
+        break;
+    }
+  } catch (...) {
+    // the helpers that did get queued are waited for below
   }
   runChunks(*job, h, true);
 
@@ -1451,7 +1559,7 @@ bool trySplit(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
   bs.splitsDone.fetch_add(1, std::memory_order_relaxed);
   bs.chunks.fetch_add(job->chunks.size(), std::memory_order_relaxed);
 
-  total = plan.total;
+  total  = plan.total;
   status = sehStoreStatus(iosb, STATUS_SUCCESS, static_cast<ULONG_PTR>(plan.total))
                ? STATUS_SUCCESS
                : STATUS_ACCESS_VIOLATION;
@@ -1518,7 +1626,8 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
 
   // big reads of any regular file may be split/read ahead, cacheable or not
   hs.key     = key;
-  hs.splitOk = logic::splitCapable(a) && a.endOfFile > 0 && a.endOfFile != UINT64_MAX;
+  hs.splitOk.store(logic::splitCapable(a) && a.endOfFile > 0 && a.endOfFile != UINT64_MAX,
+                   std::memory_order_release);
 
   if (Eligibility r = logic::evaluateEligibility(a, g->limits);
       r != Eligibility::Eligible)
@@ -1588,6 +1697,7 @@ NTSTATUS realRead(HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc, PVOID ctx,
                   PLARGE_INTEGER off, PULONG key)
 {
   notePassthrough();
+  t_ioStarted = true;
   return ::NtReadFile(h, ev, apc, ctx, iosb, buf, len, off, key);
 }
 
@@ -1617,6 +1727,7 @@ bool admit(HandleState& hs, HANDLE h)
     return false;
   }
 
+  dropWindows(hs);  // served mode takes over
   hs.shadowPos = pos;
   g->stats.bucket[logic::sizeBucket(e.size)].admitted.fetch_add(
       1, std::memory_order_relaxed);
@@ -1646,7 +1757,8 @@ NTSTATUS syncedRead(HandleState& hs, HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc,
 
 // Big read (>= kSmallReadLimit) on a handle that isn't served from the cache:
 // try readahead data, then a parallel split, else the plain call. Caller holds
-// hs.m; the request has no event/apc/key.
+// hs.m; the request has no event/apc/key. Once the real I/O has started nothing
+// in here can throw into the caller (the hook would re-issue the request).
 NTSTATUS bigRead(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
                  ULONG len, PLARGE_INTEGER off)
 {
@@ -1676,38 +1788,70 @@ NTSTATUS bigRead(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
   uint64_t total  = 0;
   bool done       = false;
 
-  if (g->raEnabled && hs.window &&
-      serveFromWindow(hs, h, iosb, buf, offset, len, explicitOff, status)) {
-    total = status >= 0 ? len : 0;
-    done  = true;
+  if (g->raEnabled) {
+    if (serveFromWindow(hs, hs.window, h, iosb, buf, offset, len, explicitOff, status) ||
+        serveFromWindow(hs, hs.window2, h, iosb, buf, offset, len, explicitOff, status)) {
+      total = status >= 0 ? len : 0;
+      done  = true;
+    }
   }
 
   if (!done) {
     if (!sequential)
-      dropWindow(hs);  // access pattern changed
-    if (g->splitEnabled && len >= g->splitMinBytes && hs.splitFailures < 3 &&
-        trySplit(hs, h, iosb, buf, len, offset, explicitOff, status, total))
-      done = true;
+      dropWindows(hs);  // access pattern changed
+    if (g->splitEnabled && len >= g->splitMinBytes && hs.splitFailures < 3) {
+      try {
+        done = trySplit(hs, h, iosb, buf, len, offset, explicitOff, status, total);
+      } catch (...) {
+        // thrown before anything was dispatched
+        done = false;
+      }
+    }
   }
 
   if (!done) {
     status = plain();
-    if (status == STATUS_SUCCESS)
-      total = iosb->Information;
+    if (status == STATUS_SUCCESS) {
+      ULONG_PTR info = 0;
+      total = readcache::guardedCopy(&info, &iosb->Information, sizeof(info)) ? info : 0;
+    }
   }
 
-  if (status == STATUS_SUCCESS && total > 0) {
-    logic::updateSequential(hs.seq, offset, total);
-    if (g->raEnabled && hs.splitFailures < 3 &&
-        hs.seq.run >= logic::kSequentialRunForReadahead &&
-        logic::needNewWindow(hs.window != nullptr,
-                             hs.window ? hs.window->start : 0,
-                             hs.window ? hs.window->length : 0, hs.seq.lastEnd,
-                             total))
-      issueWindow(hs, h, hs.seq.lastEnd, total);
-  } else {
+  // bookkeeping after the I/O: failures here only cost performance
+  try {
+    if (status == STATUS_SUCCESS && total > 0) {
+      logic::updateSequential(hs.seq, offset, total);
+      const uint64_t lastEnd = hs.seq.lastEnd;
+
+      // retire windows the stream has passed
+      for (int i = 0; i < 2; ++i) {
+        if (hs.window && lastEnd >= hs.window->start + hs.window->length) {
+          hs.window = std::move(hs.window2);
+          hs.window2.reset();
+        }
+      }
+      if (hs.window2 && lastEnd >= hs.window2->start + hs.window2->length)
+        dropWindow(hs.window2);
+
+      if (g->raEnabled && hs.splitFailures < 3 &&
+          hs.seq.run >= logic::kSequentialRunForReadahead) {
+        if (!hs.window) {
+          issueWindow(hs, h, lastEnd, total, hs.window);
+        } else if (logic::needNextWindow(true, hs.window->start, hs.window->length,
+                                         hs.window2 != nullptr, lastEnd)) {
+          issueWindow(hs, h, hs.window->start + hs.window->length, total, hs.window2);
+        }
+      }
+    } else {
+      hs.seq.valid = false;
+      dropWindows(hs);
+    }
+  } catch (...) {
     hs.seq.valid = false;
-    dropWindow(hs);
+    try {
+      dropWindows(hs);
+    } catch (...) {
+    }
   }
   return status;
 }
@@ -1726,7 +1870,7 @@ Peek peek(HANDLE h, ULONG length)
   if (it == g->handles.end())
     return Peek::Unknown;
   const HandleState& hs = *it->second;
-  const bool big = hs.splitOk && length >= logic::kSmallReadLimit &&
+  const bool big = hs.splitOk.load(std::memory_order_acquire) && length >= logic::kSmallReadLimit &&
                    (g->splitEnabled || g->raEnabled);
   switch (hs.mode.load(std::memory_order_acquire)) {
   case kHandleServed:
@@ -1762,6 +1906,11 @@ void notePassthrough()
 bool guardedCopy(void* dst, const void* src, size_t length)
 {
   return sehCopy(dst, src, length);
+}
+
+void setForgetCallback(void (*callback)(HANDLE))
+{
+  g_forgetCallback = callback;
 }
 
 bool inProtectedCopy()
@@ -1893,12 +2042,17 @@ void onClose(HANDLE handle)
     g->stats.bucket[logic::sizeBucket(hs.entry->size)].probationEnd.fetch_add(
         1, std::memory_order_relaxed);
   }
+  std::shared_ptr<HandleState> dying = std::move(it->second);
   g->handles.erase(it);
+  lock.unlock();
+  dying.reset();  // may close worker handles: not under the map lock
 }
 
-NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
-              PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
-              ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
+namespace
+{
+NTSTATUS readImpl(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
+                  PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+                  ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
 {
   auto passthrough = [&]() {
     return realRead(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
@@ -1927,7 +2081,7 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
   }
 
   // big reads on handles that are not served from memory (layer 3)
-  const bool bigCandidate = hs->splitOk && Length >= logic::kSmallReadLimit &&
+  const bool bigCandidate = hs->splitOk.load(std::memory_order_acquire) && Length >= logic::kSmallReadLimit &&
                             (g->splitEnabled || g->raEnabled) && Event == nullptr &&
                             ApcRoutine == nullptr && Key == nullptr &&
                             IoStatusBlock != nullptr && Buffer != nullptr;
@@ -2036,6 +2190,7 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
     return passthrough();
   }
 
+  t_ioStarted = true;
   if (!sehCopy(Buffer, e.data.get() + plan.offset, static_cast<size_t>(plan.count)) ||
       !sehStoreStatus(IoStatusBlock, STATUS_SUCCESS, static_cast<ULONG_PTR>(plan.count))) {
     return STATUS_ACCESS_VIOLATION;
@@ -2048,6 +2203,24 @@ NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
   bs.served.fetch_add(1, std::memory_order_relaxed);
   countEvent(bs.served);
   return STATUS_SUCCESS;
+}
+}  // namespace
+
+NTSTATUS read(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
+              PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+              ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
+{
+  // The hook re-issues the request if we throw, which is only right as long as
+  // we haven't read anything yet.
+  t_ioStarted = false;
+  try {
+    return readImpl(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                    Buffer, Length, ByteOffset, Key);
+  } catch (...) {
+    if (!t_ioStarted)
+      throw;
+    return STATUS_UNSUCCESSFUL;  // unreachable in practice: see bigRead
+  }
 }
 
 NTSTATUS queryInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,

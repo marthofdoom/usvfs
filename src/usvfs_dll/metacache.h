@@ -31,7 +31,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 // excluded from caching.
 //
 // Configuration (environment, read once in init()):
-//   USVFS_METACACHE=0                  disable
+//   USVFS_METACACHE=1|0                force on/off (default: on only in SkyrimSE.exe)
 //   USVFS_METACACHE_MB=128             memory cap
 //   USVFS_METACACHE_PREWARM=1|0        walk the virtual tree in the background
 //                                      (default: only in SkyrimSE.exe)
@@ -69,10 +69,15 @@ void storeFull(const std::wstring& key, NTSTATUS status,
 // replacement for the real NtQueryDirectoryFile (synchronous calls without
 // event/apc, RestartScan FALSE) used by usvfs's directory merging. `dirPath` is
 // the path the handle was opened with, empty if unknown.
+//
+// `resolveContent` maps the path above to the directory whose content the
+// handle really lists (after usvfs's redirection); nothing is cached for
+// excluded or written directories, on either side.
 NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE handle,
                         PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length,
                         FILE_INFORMATION_CLASS infoClass, BOOLEAN singleEntry,
-                        PUNICODE_STRING mask);
+                        PUNICODE_STRING mask,
+                        std::wstring (*resolveContent)(const std::wstring&));
 
 // forget the enumeration state of a handle; call before closing it
 void onClose(HANDLE handle);
@@ -80,6 +85,11 @@ void onClose(HANDLE handle);
 // invalidation
 bool isWriteIntent(ACCESS_MASK desiredAccess, ULONG createDisposition);
 void noteWrite(std::wstring_view ntPath);
+
+// like noteWrite, for a Win32 path as seen by the kernel32 hooks. `tree`: the
+// path may be a directory whose content goes along (remove, rename). Relative
+// paths clear the cache.
+void noteDosPath(const wchar_t* dosPath, bool tree);
 bool isMutatingClass(FILE_INFORMATION_CLASS infoClass);
 void noteSetInformation(std::wstring_view handlePath, std::wstring_view rootPath,
                         FILE_INFORMATION_CLASS infoClass, PVOID info, ULONG length);

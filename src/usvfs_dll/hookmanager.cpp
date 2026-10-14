@@ -61,6 +61,7 @@ HookManager::HookManager(const usvfsParameters& params, HMODULE module)
                              shared::string_cast<std::string>(winapi::ex::wide::getWindowsBuildLab(true)).c_str());
 
   readcache::init();
+  readcache::setForgetCallback(forgetWorkerHandle);
   metacache::init();
 
   initHooks();

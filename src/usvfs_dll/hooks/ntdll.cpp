@@ -107,6 +107,24 @@ private:
 
 HandleTracker ntdllHandleTracker;
 
+// Forgets everything we track about a handle that is about to be closed (or has
+// just been created, in case its previous incarnation was closed without us
+// noticing): handle values are reused immediately.
+void forgetHandleState(HANDLE h)
+{
+  usvfs::readcache::onClose(h);
+  usvfs::metacache::onClose(h);
+  ntdllHandleTracker.erase(h);
+}
+
+// closes a handle that a hook opened itself; the NtClose barrier would make
+// CloseHandle bypass hook_NtClose, so the bookkeeping is done here
+void closeInternalHandle(HANDLE h)
+{
+  forgetHandleState(h);
+  ::CloseHandle(h);
+}
+
 
 UnicodeString CreateUnicodeString(const OBJECT_ATTRIBUTES *objectAttributes)
 {
@@ -486,6 +504,20 @@ bool isDeviceFile(std::wstring_view name)
 }
 
 
+// the directory whose content an enumeration of `virtualDir` really returns
+std::wstring resolveDirectoryContent(const std::wstring& virtualDir)
+{
+  try {
+    usvfs::HookCallContext cc;
+    RedirectionInfo redir = applyReroute(
+        usvfs::HookContext::readAccess("resolveDirectoryContent"), cc,
+        UnicodeString(virtualDir.c_str()));
+    return std::wstring(static_cast<LPCWSTR>(redir.path));
+  } catch (const std::exception&) {
+    return std::wstring();
+  }
+}
+
 NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
                          const std::wstring &fakeName,
                          FILE_INFORMATION_CLASS FileInformationClass,
@@ -504,7 +536,7 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
       res = usvfs::metacache::queryDirectory(
           std::wstring(static_cast<LPCWSTR>(ntdllHandleTracker.lookup(hdl))), hdl,
           &status, buffer, bufferSize, FileInformationClass, returnSingleEntry,
-          FileName);
+          FileName, resolveDirectoryContent);
     } else {
       res = NtQueryDirectoryFile(hdl, event, apcRoutine, apcContext, &status,
                                  buffer, bufferSize, FileInformationClass,
@@ -1176,6 +1208,8 @@ NTSTATUS WINAPI usvfs::hook_NtOpenFile(PHANDLE FileHandle,
                                          ULONG ShareAccess, ULONG OpenOptions)
 {
   NTSTATUS res = ntdll_mess_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, OpenOptions);
+  if (res >= 0 && FileHandle)
+    forgetHandleState(*FileHandle);  // backstop against handle value reuse
   if (res >= 0 && ObjectAttributes && FileHandle && GetFileType(*FileHandle) == FILE_TYPE_DISK)
     ntdllHandleTracker.insert(*FileHandle, CreateUnicodeString(ObjectAttributes));
   return res;
@@ -1195,6 +1229,18 @@ NTSTATUS ntdll_mess_NtCreateFile(
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
   HOOK_START_GROUP(MutExHookGroup::OPEN_FILE)
+
+  // creates made from inside other hooks (profile strings, createPath, ...)
+  // count as well, so this precedes the early return below
+  if (usvfs::metacache::enabled() && ObjectAttributes &&
+      usvfs::metacache::isWriteIntent(DesiredAccess, CreateDisposition)) {
+    try {
+      usvfs::metacache::noteWrite(
+          static_cast<LPCWSTR>(CreateUnicodeString(ObjectAttributes)));
+    } catch (const std::exception&) {
+    }
+  }
+
   if (!callContext.active()) {
     return ::NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
                           IoStatusBlock, AllocationSize, FileAttributes,
@@ -1321,6 +1367,8 @@ NTSTATUS WINAPI usvfs::hook_NtCreateFile(
   ULONG EaLength)
 {
   NTSTATUS res = ntdll_mess_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+  if (res >= 0 && FileHandle)
+    forgetHandleState(*FileHandle);  // backstop against handle value reuse
   if (res >= 0 && ObjectAttributes && FileHandle && GetFileType(*FileHandle) == FILE_TYPE_DISK)
     ntdllHandleTracker.insert(*FileHandle, CreateUnicodeString(ObjectAttributes));
   return res;
@@ -1348,7 +1396,7 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
       auto iter = activeSearches.info.find(Handle);
       if (iter != activeSearches.info.end()) {
         if (iter->second.currentSearchHandle != INVALID_HANDLE_VALUE) {
-          ::CloseHandle(iter->second.currentSearchHandle);
+          closeInternalHandle(iter->second.currentSearchHandle);
         }
 
         activeSearches.info.erase(iter);
@@ -1402,7 +1450,9 @@ NTSTATUS WINAPI usvfs::hook_NtQueryAttributesFile(
       = makeObjectAttributes(redir, ObjectAttributes);
 
   std::wstring cacheKey;
-  if (usvfs::metacache::enabled()) {
+  // case-sensitive lookups would differ from our case-insensitive keys
+  if (usvfs::metacache::enabled() && ObjectAttributes &&
+      (ObjectAttributes->Attributes & 0x40 /* OBJ_CASE_INSENSITIVE */) != 0) {
     cacheKey = usvfs::metacache::makeKey(static_cast<LPCWSTR>(redir.path));
     if (!cacheKey.empty() &&
         usvfs::metacache::lookupBasic(cacheKey, FileInformation, res))
@@ -1455,7 +1505,9 @@ NTSTATUS WINAPI usvfs::hook_NtQueryFullAttributesFile(
       = makeObjectAttributes(redir, ObjectAttributes);
 
   std::wstring cacheKey;
-  if (usvfs::metacache::enabled()) {
+  // case-sensitive lookups would differ from our case-insensitive keys
+  if (usvfs::metacache::enabled() && ObjectAttributes &&
+      (ObjectAttributes->Attributes & 0x40 /* OBJ_CASE_INSENSITIVE */) != 0) {
     cacheKey = usvfs::metacache::makeKey(static_cast<LPCWSTR>(redir.path));
     if (!cacheKey.empty() &&
         usvfs::metacache::lookupFull(cacheKey, FileInformation, res))
@@ -1479,6 +1531,13 @@ NTSTATUS WINAPI usvfs::hook_NtQueryFullAttributesFile(
   HOOK_END
 
   return res;
+}
+
+void usvfs::forgetWorkerHandle(HANDLE handle)
+{
+  // not readcache::onClose: this runs while that holds its handle map lock
+  ntdllHandleTracker.erase(handle);
+  usvfs::metacache::onClose(handle);
 }
 
 NTSTATUS WINAPI usvfs::hook_NtReadFile(

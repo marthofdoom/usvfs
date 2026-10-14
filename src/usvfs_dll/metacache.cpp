@@ -248,6 +248,26 @@ private:
   std::atomic<int> m_alive{0};
 };
 
+uint64_t nowUs()
+{
+  static const LONGLONG freq = [] {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return f.QuadPart > 0 ? f.QuadPart : 1;
+  }();
+  LARGE_INTEGER c;
+  QueryPerformanceCounter(&c);
+  return static_cast<uint64_t>(c.QuadPart * 1000000 / freq);
+}
+
+wchar_t upcaseNt(wchar_t c)
+{
+  using Fn = WCHAR(NTAPI*)(WCHAR);
+  static const Fn fn = reinterpret_cast<Fn>(
+      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlUpcaseUnicodeChar"));
+  return fn ? static_cast<wchar_t>(fn(c)) : c;
+}
+
 struct State
 {
   explicit State(uint64_t cap) : store(cap) {}
@@ -273,6 +293,10 @@ struct State
   std::atomic<uint64_t> prewarmDirs{0};
   std::atomic<uint64_t> prewarmFiles{0};
   std::atomic<uint64_t> prewarmListings{0};
+  std::atomic<uint64_t> prewarmLockWaitUs{0};  // time spent waiting for the context lock
+  std::atomic<uint64_t> prewarmLockWaits{0};
+  std::atomic<int> prewarmLimit{4};            // concurrently working pre-warm jobs
+  std::atomic<int> prewarmRunning{0};
   std::atomic<uint64_t> prewarmStart{0};
   std::atomic<bool> prewarmDone{false};
   std::atomic<bool> prewarmCapped{false};
@@ -311,11 +335,12 @@ void logSummary(const char* prefix)
   logger->info(
       "{}: attr hits={} negativeHits={} misses={} | dir enumerations replayed={} "
       "(calls {}) recorded={} uncached={} listingsDerived={} classes[{} ] | "
-      "invalidations={} evictions={} | entries attr={} listings={} memory={}B",
+      "invalidations={} evictions={} | entries attr={} listings={} memory={}B{}",
       prefix, s.attrHits, s.attrNegativeHits, s.attrMisses, ld(g->dirReplayed),
       ld(g->dirReplayCalls), ld(g->dirRecorded), ld(g->dirRealOnly), s.listingDerived,
       classes, s.invalidations, s.evictions, g->store.attrCount(),
-      g->store.listingCount(), g->store.bytes());
+      g->store.listingCount(), g->store.bytes(),
+      g->store.overflowed() ? " (switched off: too many written paths)" : "");
 }
 
 void maybeLog()
@@ -572,7 +597,19 @@ bool listChildren(const std::string& vpath, std::vector<Child>& out)
 {
   using NodePtr = RedirectionTree::NodePtrT;
 
+  const uint64_t waitStart = nowUs();
   HookContext::ConstPtr context = HookContext::readAccess("metacache prewarm");
+  const uint64_t waited = nowUs() - waitStart;
+  g->prewarmLockWaitUs.fetch_add(waited, std::memory_order_relaxed);
+  const uint64_t waits = g->prewarmLockWaits.fetch_add(1, std::memory_order_relaxed) + 1;
+  // contention with the game threads: back off to two concurrent jobs
+  if (waits >= 200 && g->prewarmLimit.load() > 2 &&
+      g->prewarmLockWaitUs.load() / waits > 1000) {
+    g->prewarmLimit.store(2);
+    if (auto logger = spdlog::get("usvfs"))
+      logger->info("metacache: pre-warm limited to 2 jobs (avg lock wait {} us)",
+                   g->prewarmLockWaitUs.load() / waits);
+  }
   const RedirectionTreeContainer& table = context->redirectionTable();
 
   std::vector<NodePtr> nodes;
@@ -608,8 +645,10 @@ void finishPrewarmJob()
     const uint64_t ms = GetTickCount64() - g->prewarmStart.load();
     if (auto logger = spdlog::get("usvfs")) {
       logger->info(
-          "metacache: pre-warm finished in {} ms: {} directories, {} files, {} listings{}",
+          "metacache: pre-warm finished in {} ms: {} directories, {} files, {} listings, "
+          "context lock wait {} us in {} acquisitions{}",
           ms, g->prewarmDirs.load(), g->prewarmFiles.load(), g->prewarmListings.load(),
+          g->prewarmLockWaitUs.load(), g->prewarmLockWaits.load(),
           g->prewarmCapped.load() ? " (stopped at the memory cap)" : "");
     }
   }
@@ -617,6 +656,12 @@ void finishPrewarmJob()
 
 void prewarmDirectory(const std::string& vpath, const std::string& link)
 {
+  // at most prewarmLimit jobs work at the same time
+  while (g->prewarmRunning.fetch_add(1) >= g->prewarmLimit.load() && !g->pool.stopping()) {
+    g->prewarmRunning.fetch_sub(1);
+    Sleep(1);
+  }
+
   if (!g->pool.stopping() && !g->prewarmCapped.load()) {
     std::vector<Child> kids;
     if (listChildren(vpath, kids)) {
@@ -650,6 +695,7 @@ void prewarmDirectory(const std::string& vpath, const std::string& link)
       }
     }
   }
+  g->prewarmRunning.fetch_sub(1);
   finishPrewarmJob();
 }
 
@@ -666,6 +712,39 @@ bool isGameProcess()
   return logic::normalizePath(p) == L"SKYRIMSE.EXE";
 }
 
+// The overwrite folder (create target) receives everything the game writes:
+// never cache anything in it. It is found along the path of the game directory.
+void registerOverwrite()
+{
+  try {
+    wchar_t path[MAX_PATH * 2] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
+    if (n == 0 || n >= MAX_PATH * 2)
+      return;
+    std::wstring dir(path, n);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+      return;
+    dir.resize(slash);
+
+    HookContext::ConstPtr context = HookContext::readAccess("metacache overwrite");
+    const RedirectionTreeContainer& table = context->redirectionTable();
+
+    for (const std::wstring& candidate : {dir + L"\\Data", dir}) {
+      std::string utf8 = shared::string_cast<std::string>(candidate, shared::CodePage::UTF8);
+      std::replace(utf8.begin(), utf8.end(), '\\', '/');
+      table->visitPath(boost::filesystem::path(utf8), [&](const RedirectionTree::NodePtrT& node) {
+        if (node->hasFlag(shared::FLAG_CREATETARGET)) {
+          const std::string link = node->data().linkTarget.c_str();
+          if (!link.empty())
+            g->store.addNoCachePrefix(makeKey(toNtPath(link)));
+        }
+      });
+    }
+  } catch (const std::exception&) {
+  }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -679,17 +758,26 @@ void init()
   };
   char buf[128];
 
-  const bool enabled = readcache::logic::parseFlag(env("USVFS_METACACHE", buf, sizeof(buf)), true);
+  logic::g_upcaseHook = upcaseNt;
+
+  // other processes (MO2's tools, the editors) may change files behind our back
+  // while the game process is the one that is known to run on a frozen modlist
+  const char* forced = env("USVFS_METACACHE", buf, sizeof(buf));
+  const bool enabled =
+      forced ? readcache::logic::parseFlag(forced, false) : isGameProcess();
   const uint64_t mb =
       readcache::logic::parseNumber(env("USVFS_METACACHE_MB", buf, sizeof(buf)), 128);
   g = new State(mb << 20);
   g->lastLogTick.store(GetTickCount64());
+  if (enabled)
+    registerOverwrite();
 
   const char* pw = env("USVFS_METACACHE_PREWARM", buf, sizeof(buf));
   g->prewarm = pw ? readcache::logic::parseFlag(pw, false) : isGameProcess();
   g->prewarmThreads = static_cast<int>(std::clamp<uint64_t>(
       readcache::logic::parseNumber(env("USVFS_METACACHE_PREWARM_THREADS", buf, sizeof(buf)), 4),
       1, 16));
+  g->prewarmLimit.store(g->prewarmThreads);
 
   if (const char* cl = env("USVFS_METACACHE_PREWARM_CLASSES", buf, sizeof(buf))) {
     std::vector<int> classes;
@@ -715,7 +803,7 @@ void init()
                    g->prewarm ? std::format("on ({} threads)", g->prewarmThreads)
                               : std::string("off"));
     } else {
-      logger->info("metacache: disabled by USVFS_METACACHE");
+      logger->info("metacache: off (default outside the game process; USVFS_METACACHE=1 forces it)");
     }
   }
   g_enabled.store(enabled, std::memory_order_release);
@@ -752,6 +840,9 @@ std::wstring makeKey(std::wstring_view ntPath)
   if (tmp.compare(0, 4, LR"(\\?\)") == 0)
     tmp[1] = L'?';
   if (tmp.compare(0, 4, LR"(\??\)") != 0)
+    return std::wstring();
+  // a trailing separator changes what the system does with the name
+  if (tmp.back() == L'\\' || tmp.back() == L'/')
     return std::wstring();
   return logic::normalizePath(tmp);
 }
@@ -806,7 +897,12 @@ void storeBasic(const std::wstring& key, NTSTATUS status, const FILE_BASIC_INFOR
 {
   if (!g || !cacheableStatus(status))
     return;
-  g->store.putAttr(key, toAttr(status, info));
+  FILE_BASIC_INFORMATION copy;
+  std::memset(&copy, 0, sizeof(copy));
+  if (status == STATUS_SUCCESS &&
+      (!info || !readcache::guardedCopy(&copy, info, sizeof(copy))))
+    return;
+  g->store.putAttr(key, toAttr(status, &copy));
 }
 
 void storeFull(const std::wstring& key, NTSTATUS status,
@@ -814,12 +910,18 @@ void storeFull(const std::wstring& key, NTSTATUS status,
 {
   if (!g || !cacheableStatus(status))
     return;
-  g->store.putAttr(key, toAttr(status, info));
+  FILE_NETWORK_OPEN_INFORMATION copy;
+  std::memset(&copy, 0, sizeof(copy));
+  if (status == STATUS_SUCCESS &&
+      (!info || !readcache::guardedCopy(&copy, info, sizeof(copy))))
+    return;
+  g->store.putAttr(key, toAttr(status, &copy));
 }
 
 NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK iosb,
                         PVOID buffer, ULONG length, FILE_INFORMATION_CLASS cls,
-                        BOOLEAN single, PUNICODE_STRING mask)
+                        BOOLEAN single, PUNICODE_STRING mask,
+                        std::wstring (*resolveContent)(const std::wstring&))
 {
   if (!g || !enabled() || h == nullptr || h == INVALID_HANDLE_VALUE ||
       iosb == nullptr || buffer == nullptr || !classSupported(cls))
@@ -839,7 +941,15 @@ NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK 
     if (static_cast<int>(cls) < 40)
       g->dirClassCount[static_cast<int>(cls)].fetch_add(1, std::memory_order_relaxed);
 
-    if (c->dir.empty() || !logic::isCacheableMask(maskView) || g->store.isVolatile(c->dir)) {
+    // the directory that is really listed must be cacheable as well
+    bool contentOk = true;
+    if (!c->dir.empty() && resolveContent) {
+      const std::wstring content = makeKey(resolveContent(dirPath));
+      contentOk = !content.empty() && !g->store.isBlockedPath(content);
+    }
+
+    if (c->dir.empty() || !contentOk || !logic::isCacheableMask(maskView) ||
+        g->store.isBlockedPath(c->dir)) {
       c->mode = Cursor::kReal;
       g->dirRealOnly.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -957,37 +1067,82 @@ void noteSetInformation(std::wstring_view handlePath, std::wstring_view rootPath
     return;
 
   const int c = static_cast<int>(cls);
+  const bool structural = c == 10 || c == 11 || c == 13 || c == 64 || c == 65 || c == 72;
 
   // the handle's own path; rename/delete of a directory takes everything below
   // it along, attribute/size changes only concern the file itself
-  if (!handlePath.empty()) {
-    const std::wstring key = makeKey(handlePath);
-    if (!key.empty()) {
-      const bool structural = c == 10 || c == 11 || c == 13 || c == 64 || c == 65 || c == 72;
-      if (structural) {
-        g->store.invalidateTree(key);
-      } else {
-        g->store.invalidatePath(key);
-      }
-    }
+  const std::wstring key = makeKey(handlePath);
+  if (key.empty()) {
+    // we don't know what this handle is: forget everything
+    g->store.clear();
+  } else if (structural) {
+    g->store.invalidateTree(key);
+  } else {
+    g->store.invalidatePath(key);
   }
 
-  if ((c == 10 || c == 11 || c == 65 || c == 72) && info &&
-      length >= offsetof(RenameInfo, FileName)) {
+  if ((c == 10 || c == 11 || c == 65 || c == 72)) {
     // rename / link: the target appears
-    RenameInfo hdr;
-    if (!readcache::guardedCopy(&hdr, info, offsetof(RenameInfo, FileName)))
+    if (!info || length < offsetof(RenameInfo, FileName)) {
+      g->store.clear();
       return;
+    }
+    RenameInfo hdr;
+    if (!readcache::guardedCopy(&hdr, info, offsetof(RenameInfo, FileName))) {
+      g->store.clear();
+      return;
+    }
     const size_t bytes = std::min<size_t>(hdr.FileNameLength, length - offsetof(RenameInfo, FileName));
     std::wstring name(bytes / sizeof(WCHAR), L'\0');
     if (!readcache::guardedCopy(name.data(),
                                 static_cast<const char*>(info) + offsetof(RenameInfo, FileName),
-                                bytes))
+                                bytes)) {
+      g->store.clear();
       return;
-    std::wstring full = hdr.RootDirectory ? std::wstring(rootPath) + L"\\" + name : name;
-    const std::wstring key = makeKey(full);
-    if (!key.empty())
-      g->store.invalidateTree(key);
+    }
+    std::wstring full;
+    if (hdr.RootDirectory) {
+      if (rootPath.empty()) {
+        g->store.clear();  // relative to a handle we know nothing about
+        return;
+      }
+      full = std::wstring(rootPath) + L"\\" + name;
+    } else {
+      full = name;
+    }
+    const std::wstring targetKey = makeKey(full);
+    if (targetKey.empty()) {
+      g->store.clear();  // a bare relative name or an unusual prefix
+    } else {
+      g->store.invalidateTree(targetKey);
+    }
+  }
+}
+
+void noteDosPath(const wchar_t* dosPath, bool tree)
+{
+  if (!g || !enabled() || !dosPath || !*dosPath)
+    return;
+  std::wstring nt;
+  const std::wstring_view p(dosPath);
+  if (p.size() >= 4 && p.compare(0, 4, LR"(\\?\)") == 0) {
+    nt = std::wstring(p);
+    nt[1] = L'?';
+  } else if (p.size() >= 3 && p[1] == L':' && (p[2] == L'\\' || p[2] == L'/')) {
+    nt = LR"(\??\)" + std::wstring(p);
+  } else {
+    g->store.clear();  // relative or unusual: can't tell which entries it touches
+    return;
+  }
+  const std::wstring key = makeKey(nt);
+  if (key.empty()) {
+    g->store.clear();
+    return;
+  }
+  if (tree) {
+    g->store.invalidateTree(key);
+  } else {
+    g->store.invalidatePath(key);
   }
 }
 

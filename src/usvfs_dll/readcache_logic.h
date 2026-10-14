@@ -355,6 +355,14 @@ inline bool windowCovers(uint64_t winStart, uint64_t winLength, uint64_t offset,
   return total > 0 && offset >= winStart && offset + total <= winStart + winLength;
 }
 
+// the next window (directly behind the current one) is due once the reader is
+// half way through the current one
+inline bool needNextWindow(bool hasCurrent, uint64_t curStart, uint64_t curLength,
+                           bool hasNext, uint64_t lastEnd)
+{
+  return hasCurrent && !hasNext && lastEnd >= curStart + curLength / 2;
+}
+
 // a new window is due if there is none, or the current one can't satisfy
 // another read of the size just done
 inline bool needNewWindow(bool hasWindow, uint64_t winStart, uint64_t winLength,

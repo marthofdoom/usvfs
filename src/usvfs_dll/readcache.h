@@ -63,6 +63,9 @@ Peek peek(HANDLE handle, ULONG length);
 // counts a read that was passed to the real function without further ado
 void notePassthrough();
 
+// registers a function that is told about every handle the cache closes itself
+void setForgetCallback(void (*callback)(HANDLE));
+
 // memcpy that returns false instead of faulting on an invalid address
 bool guardedCopy(void* dst, const void* src, size_t length);
 

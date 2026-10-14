@@ -416,6 +416,15 @@ TEST(ReadCacheReadahead, CoverageAndRenewal)
   EXPECT_TRUE(needNewWindow(true, 100, 100, 50, 10));     // behind the window
 }
 
+TEST(ReadCacheReadahead, NextWindowWhenHalfConsumed)
+{
+  EXPECT_FALSE(needNextWindow(false, 0, 100, false, 90));
+  EXPECT_FALSE(needNextWindow(true, 100, 100, false, 149));
+  EXPECT_TRUE(needNextWindow(true, 100, 100, false, 150));
+  EXPECT_TRUE(needNextWindow(true, 100, 100, false, 200));
+  EXPECT_FALSE(needNextWindow(true, 100, 100, true, 200));  // already queued
+}
+
 TEST(ReadCacheReadahead, BigBuckets)
 {
   EXPECT_EQ(0u, bigBucket(64 * 1024));

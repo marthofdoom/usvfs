@@ -61,6 +61,9 @@ DLLEXPORT NTSTATUS WINAPI hook_NtCreateFile(PHANDLE FileHandle,
 
 DLLEXPORT NTSTATUS WINAPI hook_NtClose(HANDLE Handle);
 
+// bookkeeping for a handle opened/closed by the read cache's worker threads
+void forgetWorkerHandle(HANDLE handle);
+
 // the read cache hooks are deliberately not exported
 NTSTATUS WINAPI hook_NtReadFile(HANDLE FileHandle,
                                 HANDLE Event,
