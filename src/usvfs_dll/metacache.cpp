@@ -357,6 +357,48 @@ struct FrontState
 
 FrontState* gFront = nullptr;  // allocated in init() when enabled, never freed
 
+// ---- enumeration front cache ----
+
+struct EnumListing
+{
+  bool failed = false;
+  DWORD err   = 0;
+  std::vector<WIN32_FIND_DATAW> entries;
+  size_t bytes() const { return sizeof(*this) + entries.capacity() * sizeof(WIN32_FIND_DATAW) + 128; }
+};
+
+struct EnumSearch
+{
+  // replay
+  std::shared_ptr<const EnumListing> replay;
+  size_t next = 0;
+  // recording
+  std::wstring key;
+  std::wstring dirNt;
+  uint64_t gen = 0;
+  std::shared_ptr<EnumListing> building;
+};
+
+struct EnumState
+{
+  std::mutex mutex;
+  struct Stored
+  {
+    uint64_t gen = 0;
+    std::shared_ptr<const EnumListing> listing;
+  };
+  std::unordered_map<std::wstring, Stored> listings;
+  std::unordered_map<HANDLE, std::shared_ptr<EnumSearch>> searches;
+  size_t bytes    = 0;
+  size_t maxBytes = 0;
+  std::atomic<uint64_t> hits{0};
+  std::atomic<uint64_t> misses{0};
+  std::atomic<uint64_t> records{0};
+  static constexpr size_t kMaxEntries = 50000;  // per listing
+};
+
+EnumState* gEnum = nullptr;  // allocated in init() when enabled, never freed
+
 std::wstring frontCwd(const wchar_t* name)
 {
   std::wstring cwd;
@@ -372,7 +414,10 @@ std::wstring frontCwd(const wchar_t* name)
 uint64_t activity()
 {
   const logic::StoreStats s = g->store.stats();
-  return (gFront ? gFront->hits.load(std::memory_order_relaxed) +
+  return (gEnum ? gEnum->hits.load(std::memory_order_relaxed) +
+                       gEnum->misses.load(std::memory_order_relaxed)
+                 : 0) +
+         (gFront ? gFront->hits.load(std::memory_order_relaxed) +
                        gFront->misses.load(std::memory_order_relaxed)
                  : 0) +
          s.attrHits + s.attrMisses + s.attrNegativeHits + s.invalidations +
@@ -398,14 +443,18 @@ void logSummary(const char* prefix)
   logger->info(
       "{}: attr hits={} negativeHits={} misses={} | dir enumerations replayed={} "
       "(calls {}) recorded={} uncached={} listingsDerived={} classes[{} ] | "
-      "invalidations={} evictions={} | entries attr={} listings={} memory={}B{} | front hits={} misses={}",
+      "invalidations={} evictions={} | entries attr={} listings={} memory={}B{} | front hits={} misses={} | enum front hits={} misses={} records={} memory={}B",
       prefix, s.attrHits, s.attrNegativeHits, s.attrMisses, ld(g->dirReplayed),
       ld(g->dirReplayCalls), ld(g->dirRecorded), ld(g->dirRealOnly), s.listingDerived,
       classes, s.invalidations, s.evictions, g->store.attrCount(),
       g->store.listingCount(), g->store.bytes(),
       g->store.overflowed() ? " (switched off: too many written paths)" : "",
       gFront ? gFront->hits.load(std::memory_order_relaxed) : 0,
-      gFront ? gFront->misses.load(std::memory_order_relaxed) : 0);
+      gFront ? gFront->misses.load(std::memory_order_relaxed) : 0,
+      gEnum ? gEnum->hits.load(std::memory_order_relaxed) : 0,
+      gEnum ? gEnum->misses.load(std::memory_order_relaxed) : 0,
+      gEnum ? gEnum->records.load(std::memory_order_relaxed) : 0,
+      gEnum ? gEnum->bytes : 0);
 }
 
 void maybeLog()
@@ -955,10 +1004,16 @@ void init()
     g->prewarmClasses = classes;
   }
 
+  const char* fe = env("USVFS_METACACHE_FRONT_ENUM", buf, sizeof(buf));
+  if (enabled && (fe ? readcache::logic::parseFlag(fe, true) : true)) {
+    gEnum           = new EnumState();
+    gEnum->maxBytes = static_cast<size_t>(mb << 20) / 2;
+  }
+
   if (auto logger = spdlog::get("usvfs")) {
     if (enabled) {
-      logger->info("metacache: enabled, cap {} MiB, front {}, pre-warm {}", mb,
-                   gFront ? "on" : "off",
+      logger->info("metacache: enabled, cap {} MiB, front {}, enum front {}, pre-warm {}", mb,
+                   gFront ? "on" : "off", gEnum ? "on" : "off",
                    g->prewarm ? std::format("on ({} threads)", g->prewarmThreads)
                               : std::string("off"));
     } else {
@@ -1072,6 +1127,185 @@ void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
   FrontEntry& e = f->entries[ticket.key];
   e.gen    = ticket.gen;
   e.result = result;
+}
+
+bool enumFrontEnabled()
+{
+  return gEnum != nullptr && enabled();
+}
+
+static void enumPublish(const std::wstring& key, const std::wstring& dirNt, uint64_t gen,
+                        std::shared_ptr<EnumListing> listing)
+{
+  EnumState* e = gEnum;
+  if (!e || !g || !enabled() || dirNt.empty() || g->store.isBlockedPath(dirNt))
+    return;
+  std::lock_guard<std::mutex> lock(e->mutex);
+  if (g->store.generation() != gen)
+    return;
+  const size_t add = listing->bytes() + key.size() * sizeof(wchar_t) + 96;
+  if (e->bytes + add > e->maxBytes) {
+    e->listings.clear();
+    e->bytes = 0;
+    if (add > e->maxBytes)
+      return;
+  }
+  auto it = e->listings.find(key);
+  if (it != e->listings.end())
+    e->bytes -= std::min(e->bytes, it->second.listing->bytes() + key.size() * sizeof(wchar_t) + 96);
+  e->listings[key] = EnumState::Stored{gen, std::move(listing)};
+  e->bytes += add;
+  e->records.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, DWORD flags,
+               void* data, HANDLE& res, DWORD& err, EnumTicket& ticket)
+{
+  ticket.key.clear();
+  EnumState* e = gEnum;
+  if (!e || !g || !enabled() || !name || !data || filter != nullptr || searchOp != 0)
+    return false;
+  std::wstring dirKey;
+  std::wstring key =
+      logic::frontEnumKey(name, frontCwd(name), infoLevel, flags, &dirKey);
+  if (key.empty())
+    return false;
+  const uint64_t gen = g->store.generation();
+  tick();
+  {
+    std::lock_guard<std::mutex> lock(e->mutex);
+    auto it = e->listings.find(key);
+    if (it != e->listings.end() && it->second.gen == gen) {
+      const std::shared_ptr<const EnumListing>& l = it->second.listing;
+      if (l->failed) {
+        res = INVALID_HANDLE_VALUE;
+        err = l->err;
+        e->hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+      }
+      if (!l->entries.empty() &&
+          readcache::guardedCopy(data, &l->entries[0], sizeof(WIN32_FIND_DATAW))) {
+        auto s    = std::make_shared<EnumSearch>();
+        s->replay = l;
+        s->next   = 1;
+        res       = s.get();
+        e->searches[res] = std::move(s);
+        err              = 0;
+        e->hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+      }
+    }
+  }
+  e->misses.fetch_add(1, std::memory_order_relaxed);
+  ticket.key   = std::move(key);
+  ticket.dirNt = makeKey(std::wstring(LR"(\??\)") + dirKey);
+  ticket.gen   = gen;
+  return false;
+}
+
+void enumRecordFirst(const EnumTicket& ticket, const wchar_t* canonicalName, int infoLevel,
+                     DWORD flags, HANDLE res, DWORD err, const WIN32_FIND_DATAW* first)
+{
+  EnumState* e = gEnum;
+  if (!e || !g || !enabled() || ticket.key.empty() || ticket.dirNt.empty() || !canonicalName)
+    return;
+  // the key used the cwd at lookup time, the call resolved the name by itself
+  if (logic::frontEnumKey(canonicalName, std::wstring_view(), infoLevel, flags) != ticket.key)
+    return;
+  if (res == INVALID_HANDLE_VALUE) {
+    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+      return;
+    auto l    = std::make_shared<EnumListing>();
+    l->failed = true;
+    l->err    = err;
+    enumPublish(ticket.key, ticket.dirNt, ticket.gen, std::move(l));
+    return;
+  }
+  if (!res || !first)
+    return;
+  auto s      = std::make_shared<EnumSearch>();
+  s->key      = ticket.key;
+  s->dirNt    = ticket.dirNt;
+  s->gen      = ticket.gen;
+  s->building = std::make_shared<EnumListing>();
+  WIN32_FIND_DATAW fd;
+  if (!readcache::guardedCopy(&fd, first, sizeof(fd)))
+    return;
+  s->building->entries.push_back(fd);
+  std::lock_guard<std::mutex> lock(e->mutex);
+  e->searches[res] = std::move(s);
+}
+
+bool enumNext(HANDLE h, WIN32_FIND_DATAW* data, BOOL& result, DWORD& err)
+{
+  EnumState* e = gEnum;
+  if (!e || !data)
+    return false;
+  std::lock_guard<std::mutex> lock(e->mutex);
+  auto it = e->searches.find(h);
+  if (it == e->searches.end() || !it->second->replay)
+    return false;
+  EnumSearch& s = *it->second;
+  if (s.next < s.replay->entries.size()) {
+    if (!readcache::guardedCopy(data, &s.replay->entries[s.next], sizeof(WIN32_FIND_DATAW))) {
+      result = FALSE;
+      err    = ERROR_INVALID_PARAMETER;
+      return true;
+    }
+    ++s.next;
+    result = TRUE;
+    err    = 0;
+  } else {
+    result = FALSE;
+    err    = ERROR_NO_MORE_FILES;
+  }
+  return true;
+}
+
+void enumAfterNext(HANDLE h, BOOL result, DWORD err, const WIN32_FIND_DATAW* data)
+{
+  EnumState* e = gEnum;
+  if (!e)
+    return;
+  std::shared_ptr<EnumSearch> done;
+  {
+    std::lock_guard<std::mutex> lock(e->mutex);
+    auto it = e->searches.find(h);
+    if (it == e->searches.end() || it->second->replay || !it->second->building)
+      return;
+    EnumSearch& s = *it->second;
+    if (result) {
+      WIN32_FIND_DATAW fd;
+      if (!data || s.building->entries.size() >= EnumState::kMaxEntries ||
+          !readcache::guardedCopy(&fd, data, sizeof(fd))) {
+        e->searches.erase(it);  // abandoned
+        return;
+      }
+      s.building->entries.push_back(fd);
+      return;
+    }
+    if (err == ERROR_NO_MORE_FILES)
+      done = it->second;
+    e->searches.erase(it);
+  }
+  if (done) {
+    done->building->entries.shrink_to_fit();
+    enumPublish(done->key, done->dirNt, done->gen, done->building);
+  }
+}
+
+bool enumClose(HANDLE h)
+{
+  EnumState* e = gEnum;
+  if (!e)
+    return false;
+  std::lock_guard<std::mutex> lock(e->mutex);
+  auto it = e->searches.find(h);
+  if (it == e->searches.end())
+    return false;
+  const bool synthetic = static_cast<bool>(it->second->replay);
+  e->searches.erase(it);
+  return synthetic;
 }
 
 void noteMappingChange()

@@ -102,14 +102,14 @@ BOOL WINAPI hook_SetCurrentDirectoryW(LPCWSTR lpPathName)
   return res;
 }
 
-// trace-only hooks (see kernel32_impl.h); the real function is reached through
-// the hook barrier, as in every other hook
+// FindNext/FindClose hooks (see kernel32_impl.h), installed for tracing and for the
+// enumeration front cache; the real function is reached through the hook barrier
 
 BOOL WINAPI hook_FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)
 {
   trace::Scope ts;
   ts.keepLastError();
-  const BOOL res = ::FindNextFileW(hFindFile, lpFindFileData);
+  const BOOL res = impl_FindNextFileW(hFindFile, lpFindFileData);
   TRACE_END(recFindNext(ts, hFindFile, res));
   return res;
 }
@@ -118,7 +118,7 @@ BOOL WINAPI hook_FindClose(HANDLE hFindFile)
 {
   trace::Scope ts;
   ts.keepLastError();
-  const BOOL res = ::FindClose(hFindFile);
+  const BOOL res = impl_FindClose(hFindFile);
   TRACE_END(recFindClose(ts, hFindFile, res));
   return res;
 }

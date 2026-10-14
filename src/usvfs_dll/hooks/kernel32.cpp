@@ -1362,6 +1362,20 @@ HANDLE WINAPI usvfs::impl_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVEL
     }
   }
 
+  // enumeration front cache: a recorded listing of this virtual directory and mask
+  usvfs::metacache::EnumTicket enumTicket;
+  if (lpFindFileData) {
+    DWORD cachedErr = 0;
+    HANDLE cachedRes = INVALID_HANDLE_VALUE;
+    if (usvfs::metacache::enumFirst(lpFileName, static_cast<int>(fInfoLevelId),
+                                    static_cast<int>(fSearchOp), lpSearchFilter,
+                                    dwAdditionalFlags, lpFindFileData, cachedRes, cachedErr,
+                                    enumTicket)) {
+      callContext.updateLastError(cachedErr);
+      return cachedRes;
+    }
+  }
+
   fs::path finalPath;
   RerouteW reroute;
   fs::path originalPath;
@@ -1394,6 +1408,13 @@ HANDLE WINAPI usvfs::impl_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVEL
         res = ::FindFirstFileExW(finalPath.c_str(), fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
       POST_REALCALL
     }
+  }
+
+  if (!enumTicket.key.empty()) {
+    const DWORD findErr = callContext.lastError();
+    usvfs::metacache::enumRecordFirst(
+        enumTicket, originalPath.c_str(), static_cast<int>(fInfoLevelId), dwAdditionalFlags,
+        res, findErr, static_cast<const WIN32_FIND_DATAW*>(lpFindFileData));
   }
 
   if (res != INVALID_HANDLE_VALUE) {
@@ -1713,4 +1734,32 @@ VOID WINAPI usvfs::hook_ExitProcess(UINT exitCode)
   //  POST_REALCALL
 
   HOOK_END
+}
+
+// FindNextFileW / FindClose: replayed searches (enumeration front cache) are
+// answered here, searches being recorded are watched; everything else is untouched
+BOOL WINAPI usvfs::impl_FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)
+{
+  if (!usvfs::metacache::enumFrontEnabled())
+    return ::FindNextFileW(hFindFile, lpFindFileData);
+  BOOL result = FALSE;
+  DWORD err   = 0;
+  if (usvfs::metacache::enumNext(hFindFile, lpFindFileData, result, err)) {
+    ::SetLastError(err);
+    return result;
+  }
+  result = ::FindNextFileW(hFindFile, lpFindFileData);
+  err    = ::GetLastError();
+  usvfs::metacache::enumAfterNext(hFindFile, result, err, lpFindFileData);
+  ::SetLastError(err);
+  return result;
+}
+
+BOOL WINAPI usvfs::impl_FindClose(HANDLE hFindFile)
+{
+  if (usvfs::metacache::enumFrontEnabled() && usvfs::metacache::enumClose(hFindFile)) {
+    ::SetLastError(ERROR_SUCCESS);
+    return TRUE;
+  }
+  return ::FindClose(hFindFile);
 }

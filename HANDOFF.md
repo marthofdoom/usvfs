@@ -30,6 +30,10 @@ inside the injected usvfs DLL (see `/mnt/gaming/modlists/Projects/Linux-Storage-
   the store generation is unchanged (any invalidation or `noteMappingChange()` from maptracker.h and the
   exported usvfs mutators drops all). Negative GetFileAttributes answers now rely on the frozen-modlist
   assumption too: tree edits by other processes are not seen.
+  Enumeration front cache (`USVFS_METACACHE_FRONT_ENUM=0` off): FindFirstFileExW/FindNextFileW/FindClose;
+  listings recorded from what the app iterated (published at ERROR_NO_MORE_FILES, or FindFirst not-found),
+  replayed verbatim with a synthetic handle (heap object registered in metacache.cpp, freed by FindClose).
+  FindNextFileW/FindClose are now hooked whenever it is on (hooks/kernel32.cpp impl_FindNextFileW/_FindClose).
 - Trace (harness): `src/usvfs_dll/trace.{h,cpp}`, `trace_format.h`. `USVFS_TRACE=<win path>`,
   `USVFS_TRACE_CRC=1`. Init logs one line to the usvfs log ("trace enabled/disabled: reason").
 

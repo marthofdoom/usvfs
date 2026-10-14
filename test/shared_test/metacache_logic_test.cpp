@@ -379,3 +379,35 @@ TEST(MetaCacheFront, Rejected)
   EXPECT_EQ(L"", frontKey(LR"(C:\a\*.esp)", L""));
   EXPECT_EQ(L"", frontKey(LR"(C:\a?)", L""));
 }
+
+TEST(MetaCacheFront, EnumKey)
+{
+  std::wstring dir;
+  const std::wstring k = frontEnumKey(LR"(c:/Game\Data\*.ESP)", L"", 0, 0, &dir);
+  EXPECT_EQ(LR"(C:\GAME\DATA)", dir);
+  EXPECT_EQ(std::wstring(LR"(C:\GAME\DATA)") + L"\x03" + L"00" + L"\x03" + L"*.ESP", k);
+  // relative directory and bare mask use the cwd
+  EXPECT_EQ(k, frontEnumKey(LR"(Data\*.esp)", LR"(C:\Game)", 0, 0));
+  EXPECT_EQ(k, frontEnumKey(L"*.esp", LR"(C:\Game\Data)", 0, 0));
+  EXPECT_EQ(k, frontEnumKey(L"*.esp", LR"(C:\Game\Data\)", 0, 0));
+  // search parameters are part of the key
+  EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 1, 0));
+  EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esp)", L"", 0, 2));
+  EXPECT_NE(k, frontEnumKey(LR"(C:\Game\Data\*.esm)", L"", 0, 0));
+  // drive root
+  EXPECT_FALSE(frontEnumKey(LR"(C:\*)", L"", 0, 0).empty());
+  EXPECT_EQ(L"", frontEnumKey(L"C:*", LR"(C:\G)", 0, 0));
+}
+
+TEST(MetaCacheFront, EnumKeyRejected)
+{
+  EXPECT_EQ(L"", frontEnumKey(L"", LR"(C:\G)", 0, 0));
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\)", L"", 0, 0));            // empty mask
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\*)", L"", 2, 0));          // info level
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\*)", L"", 0, 1));          // case-sensitive flag
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\a:b)", L"", 0, 0));        // stream in mask
+  EXPECT_EQ(L"", frontEnumKey(LR"(C:\G\..\*)", L"", 0, 0));       // dot-dot in directory
+  EXPECT_EQ(L"", frontEnumKey(LR"(\\?\C:\G\*)", L"", 0, 0));
+  EXPECT_EQ(L"", frontEnumKey(L"*", L"", 0, 0));                  // no cwd
+  EXPECT_EQ(L"", frontEnumKey(LR"(\*)", LR"(C:\G)", 0, 0));       // rooted without drive
+}

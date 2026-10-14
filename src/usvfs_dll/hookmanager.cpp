@@ -281,8 +281,8 @@ void HookManager::initHooks()
   installHook(kbaseMod, k32Mod, "GetFullPathNameW", hook_GetFullPathNameW);
 
   installHook(kbaseMod, k32Mod, "FindFirstFileExW", hook_FindFirstFileExW);
-  if (trace::enabled()) {
-    // harness trace only: record the app's FindNext/FindClose calls
+  if (trace::enabled() || metacache::enumFrontEnabled()) {
+    // harness trace / enumeration front cache: see the app's FindNext/FindClose calls
     installHook(kbaseMod, k32Mod, "FindNextFileW", hook_FindNextFileW);
     installHook(kbaseMod, k32Mod, "FindClose", hook_FindClose);
   }

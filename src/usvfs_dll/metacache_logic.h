@@ -130,6 +130,55 @@ inline std::wstring frontKey(std::wstring_view path, std::wstring_view cwd)
   return normalizePath(abs);
 }
 
+// Key of an enumeration front-cache entry for FindFirstFileExW(path, ...): the
+// directory (frontKey rules) plus the folded mask and the search parameters.
+// Empty if the search is not cacheable. `cwd` is used for a bare mask and for
+// relative directories.
+inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, int infoLevel,
+                                 unsigned long flags, std::wstring* dirKeyOut = nullptr)
+{
+  if (path.empty() || (infoLevel != 0 && infoLevel != 1) || (flags != 0 && flags != 2))
+    return std::wstring();
+  const size_t pos = path.find_last_of(L"\\/");
+  std::wstring dir;
+  std::wstring_view mask;
+  if (pos == std::wstring_view::npos) {
+    if (path.size() >= 2 && path[1] == L':')
+      return std::wstring();  // drive-relative
+    if (!frontIsDriveAbs(cwd))
+      return std::wstring();
+    dir  = std::wstring(cwd);
+    mask = path;
+  } else {
+    dir  = std::wstring(path.substr(0, pos));
+    mask = path.substr(pos + 1);
+    if (dir.size() == 2 && dir[1] == L':')
+      dir.push_back(L'\\');
+  }
+  // the directory of a bare mask is the cwd: it may carry a trailing separator
+  while (dir.size() > 3 && frontIsSep(dir.back()) && pos == std::wstring_view::npos)
+    dir.pop_back();
+  if (mask.empty() || mask.size() > 255)
+    return std::wstring();
+  for (wchar_t c : mask) {
+    if (c < 32 || c == L':')
+      return std::wstring();
+  }
+  const std::wstring dirKey = frontKey(dir, cwd);
+  if (dirKey.empty())
+    return std::wstring();
+  if (dirKeyOut)
+    *dirKeyOut = dirKey;
+  std::wstring key = dirKey;
+  key.push_back(L'\x03');
+  key.push_back(static_cast<wchar_t>(L'0' + infoLevel));
+  key.push_back(static_cast<wchar_t>(L'0' + flags));
+  key.push_back(L'\x03');
+  for (wchar_t c : mask)
+    key.push_back(foldChar(c));
+  return key;
+}
+
 // parent directory of a normalized path; empty if there is none
 inline std::wstring parentPath(const std::wstring& normalized)
 {

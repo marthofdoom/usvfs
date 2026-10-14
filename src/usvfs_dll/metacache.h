@@ -33,6 +33,8 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 // Configuration (environment, read once in init()):
 //   USVFS_METACACHE=1|0                force on/off (default: on only in SkyrimSE.exe)
 //   USVFS_METACACHE_MB=128             memory cap
+//   USVFS_METACACHE_FRONT_ENUM=1|0     enumeration front cache (default: on with the
+//                                      metacache; memory: half of USVFS_METACACHE_MB)
 //   USVFS_METACACHE_FRONT=1|0          front cache for GetFileAttributesW/ExW keyed
 //                                      by the virtual path (default: on with the
 //                                      metacache)
@@ -116,6 +118,34 @@ bool frontLookup(bool ex, const wchar_t* name, FrontResult& out, FrontTicket& ti
 // resolved the name to; must match the ticket key (cwd changed meanwhile otherwise)
 void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
                 const wchar_t* reroutedName, const wchar_t* canonicalName);
+
+// Enumeration front cache (FindFirstFileExW / FindNextFileW / FindClose). A listing
+// is recorded from what the application iterated (published only when it reached
+// ERROR_NO_MORE_FILES, or when FindFirstFileExW failed with a not-found error) and
+// replayed verbatim for the same {virtual directory, mask, info level, flags}.
+// Valid while the store generation is unchanged. Replayed searches get a
+// synthetic handle: the address of a heap object that is registered here and
+// freed by FindClose. It can't collide with a live real handle (those are kernel
+// handles or other heap objects); any other API that is handed it just fails
+// with an invalid-handle error. USVFS_METACACHE_FRONT_ENUM=0 disables it.
+struct EnumTicket
+{
+  std::wstring key;    // empty: not cacheable
+  std::wstring dirNt;  // store key of the virtual directory
+  uint64_t gen = 0;
+};
+
+bool enumFrontEnabled();
+// true if answered from a listing (res/err are the results; `data` is filled)
+bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, DWORD flags,
+               void* data, HANDLE& res, DWORD& err, EnumTicket& ticket);
+// after the real FindFirstFileExW; `first`: its data (if it succeeded)
+void enumRecordFirst(const EnumTicket& ticket, const wchar_t* canonicalName, int infoLevel,
+                     DWORD flags, HANDLE res, DWORD err, const WIN32_FIND_DATAW* first);
+bool enumNext(HANDLE h, WIN32_FIND_DATAW* data, BOOL& result, DWORD& err);
+void enumAfterNext(HANDLE h, BOOL result, DWORD err, const WIN32_FIND_DATAW* data);
+// true if `h` was a replayed search (now freed; the caller returns TRUE)
+bool enumClose(HANDLE h);
 
 // the usvfs mappings (redirection tree, delete / fake-directory trackers) changed
 void noteMappingChange();
