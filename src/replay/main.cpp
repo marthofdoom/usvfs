@@ -417,6 +417,7 @@ struct ThreadStats {
   uint32_t tid = 0;
   uint64_t ops = 0, busyTicks = 0, startTicks = 0, endTicks = 0;
   uint64_t skipped = 0, unmapped = 0, verifyChecked = 0, verifyMismatch = 0;
+  uint64_t vmFailed = 0, vmData = 0, vmLen = 0;  // mismatch split: failed read / same length, other data / other length
   OpStat op[kOpCount];
   std::vector<std::string> samples;
 };
@@ -883,17 +884,28 @@ private:
       }
       t1 = qpcNow();
       note(ts, r, st, "read");
-      if (m_o.verify && r.hasCrc && st >= 0) {
+      if (m_o.verify && r.hasCrc) {
         ++ts.verifyChecked;
-        const uint32_t crc = crc32Update(0, buf.data(), iosb.Information);
-        if (crc != r.crc || iosb.Information != r.info) {
+        const bool failed = st < 0;
+        const uint32_t crc = failed ? 0 : crc32Update(0, buf.data(), iosb.Information);
+        if (failed || crc != r.crc || iosb.Information != r.info) {
           ++ts.verifyMismatch;
-          if (m_verifySamples.fetch_add(1) < 20) {
-            char b[200];
-            std::snprintf(b, sizeof(b), "verify tid %u ts +%.2fs: len %llu off %lld recorded crc %08x/%llu got %08x/%llu",
-                          r.tid, (double)(r.ts - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, (unsigned long long)r.a,
-                          (long long)r.off, r.crc, (unsigned long long)r.info, crc, (unsigned long long)iosb.Information);
-            ts.samples.push_back(b);
+          if (failed) ++ts.vmFailed;
+          else if (iosb.Information != r.info) ++ts.vmLen;
+          else ++ts.vmData;
+          if (m_verifyLogged.fetch_add(1) < 100) {
+            const wchar_t* path = self >= 0 ? str(m_ix.creates[self].str) : nullptr;
+            std::string p = path ? toUtf8(path) : std::string();
+            if (p.size() > 220) p.resize(220);
+            char b[640];
+            std::snprintf(b, sizeof(b),
+                          "verify mismatch %s tid %u ts +%.2fs: path '%s' off %lld len %llu info recorded %llu got %llu "
+                          "status recorded 0x%08x got 0x%08x crc recorded %08x got %08x",
+                          opName(r.op), r.tid, (double)(r.ts - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, p.c_str(),
+                          (long long)(r.b ? r.off : -1), (unsigned long long)r.a, (unsigned long long)r.info,
+                          (unsigned long long)iosb.Information, r.status, (uint32_t)st, r.crc, crc);
+            if (m_verifySamples.fetch_add(1) < 20) ts.samples.push_back(b);
+            logf("%s", b);
           }
         }
       }
@@ -1076,7 +1088,7 @@ private:
   const Options& m_o;
   std::unique_ptr<Inst[]> m_insts;
   std::unique_ptr<Inst[]> m_finds;
-  std::atomic<int> m_diffSamples{0}, m_verifySamples{0};
+  std::atomic<int> m_diffSamples{0}, m_verifySamples{0}, m_verifyLogged{0};
   std::unique_ptr<std::atomic<uint64_t>[]> m_progress;
   size_t m_nProgress = 0;
   uint64_t m_fromTs = 0, m_toTs = ~0ull, m_start = 0, m_planned = 0;
@@ -1130,12 +1142,15 @@ int runChild(const Options& o)
   monitor.join();
 
   OpStat total[kOpCount];
-  uint64_t skipped = 0, unmapped = 0, vc = 0, vm = 0;
+  uint64_t skipped = 0, unmapped = 0, vc = 0, vm = 0, vmF = 0, vmD = 0, vmL = 0;
   for (auto& s : stats) {
     skipped += s.skipped;
     unmapped += s.unmapped;
     vc += s.verifyChecked;
     vm += s.verifyMismatch;
+    vmF += s.vmFailed;
+    vmD += s.vmData;
+    vmL += s.vmLen;
     for (int i = 0; i < kOpCount; ++i) {
       total[i].count += s.op[i].count;
       total[i].ticks += s.op[i].ticks;
@@ -1172,9 +1187,10 @@ int runChild(const Options& o)
       << (uint64_t)ticksToUs(s.endTicks - s.startTicks) << "\n";
   for (auto& s : stats)
     for (auto& x : s.samples) f << "sample " << x << "\n";
-  logf("child done: wall %.1f ms, skipped %llu, unmapped %llu, status diffs %llu, verify mismatches %llu, %.0f MB peak working set",
+  logf("child done: wall %.1f ms, skipped %llu, unmapped %llu, status diffs %llu, verify mismatches %llu (failed read %llu, other data %llu, other length %llu), %.0f MB peak working set",
        ticksToUs(wall) / 1000.0, (unsigned long long)skipped, (unsigned long long)unmapped, (unsigned long long)diffs,
-       (unsigned long long)vm, peakWorkingSetMb());
+       (unsigned long long)vm, (unsigned long long)vmF, (unsigned long long)vmD, (unsigned long long)vmL,
+       peakWorkingSetMb());
   return 0;
 }
 
