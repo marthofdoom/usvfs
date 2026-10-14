@@ -2,58 +2,122 @@ name: Build USVFS
 
 on:
   push:
-    branches:
-      - master
-      - "async-read-prefetch*"
-      - harness
+    branches: [master, dev/cmake]
+    tags:
+      - "*"
   pull_request:
     types: [opened, synchronize, reopened]
 
-# fork: 0.5.7.2 is built with CMake + vcpkg (no Azure binary cache); x64 only
 env:
-  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
+  VCPKG_BINARY_SOURCES: clear;x-azblob,${{ vars.AZ_BLOB_VCPKG_URL }},${{ secrets.AZ_BLOB_SAS }},readwrite
 
 jobs:
   build:
-    name: Build and test USVFS (x64 Release)
-    runs-on: windows-2022
+    name: Build USVFS
     strategy:
       matrix:
-        arch: [x64]
-        config: [Release]
+        arch: [x86, x64]
+        config: [Debug, Release]
+    runs-on: windows-2022
     steps:
+      # set VCPKG Root
       - name: "Set environmental variables"
         shell: bash
         run: |
           echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
 
+      # checkout USVFS and vcpkg
       - uses: actions/checkout@v4
 
-      - uses: actions/cache@v4
+      # configure
+      - run: cmake --preset vs2022-windows-${{ matrix.arch }} -B build_${{ matrix.arch }} "-DCMAKE_INSTALL_PREFIX=install/${{ matrix.config }}"
+
+      # build
+      - run: cmake --build build_${{ matrix.arch }} --config ${{ matrix.config }} --target INSTALL
+
+      # package install
+      - uses: actions/upload-artifact@master
         with:
-          path: vcpkg-cache
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-${{ runner.os }}-
+          name: usvfs_${{ matrix.config }}_${{ matrix.arch }}
+          path: ./install/${{ matrix.config }}
 
-      - run: cmake --preset vs2022-windows-${{ matrix.arch }} -B build_${{ matrix.arch }}
+      # package test/dlls/etc. for tests
 
-      # builds everything including the tests (preset enables BUILD_TESTING)
-      - run: cmake --build build_${{ matrix.arch }} --config ${{ matrix.config }}
-
-      # fork: the Release DLL is what gets installed for testing
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@master
         with:
-          name: usvfs-release_${{ matrix.arch }}
-          path: |
-            ./lib
-            ./bin
-
-      # harness: file-API trace replayer
-      - uses: actions/upload-artifact@v4
+          name: usvfs-libs_${{ matrix.config }}_${{ matrix.arch }}
+          path: ./lib
+      - uses: actions/upload-artifact@master
         with:
-          name: replay_${{ matrix.arch }}
-          path: ./bin/replay_${{ matrix.arch }}.exe
+          name: usvfs-bins_${{ matrix.config }}_${{ matrix.arch }}
+          path: ./bin
+      - uses: actions/upload-artifact@master
+        with:
+          name: usvfs-tests_${{ matrix.config }}_${{ matrix.arch }}
+          path: ./test/bin
 
+  # merge x86 / x64 artifacts for tests (root bin/lib and test folder)
+  merge-artifacts-for-tests:
+    runs-on: ubuntu-latest
+    name: Merge Test Artifacts
+    needs: build
+    strategy:
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - name: Merge USVFS libs
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: usvfs-libs_${{ matrix.config }}
+          pattern: usvfs-libs_${{ matrix.config }}_*
+      - name: Merge USVFS bins
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: usvfs-bins_${{ matrix.config }}
+          pattern: usvfs-bins_${{ matrix.config }}_*
+      - name: Merge USVFS tests
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: usvfs-tests_${{ matrix.config }}
+          pattern: usvfs-tests_${{ matrix.config }}_*
+
+  # merge x86 / x64 artifacts (install folder)
+  merge-artifacts-for-release:
+    runs-on: ubuntu-latest
+    name: Merge Install Artifacts
+    needs: build
+    strategy:
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - name: Merge USVFS install
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: usvfs_${{ matrix.config }}
+          pattern: usvfs_${{ matrix.config }}_*
+
+  test:
+    name: Test USVFS
+    needs: merge-artifacts-for-tests
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        config: [Debug, Release]
+        arch: [x86, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@master
+        with:
+          name: usvfs-libs_${{ matrix.config }}
+          path: ./lib
+      - uses: actions/download-artifact@master
+        with:
+          name: usvfs-bins_${{ matrix.config }}
+          path: ./bin
+      - uses: actions/download-artifact@master
+        with:
+          name: usvfs-tests_${{ matrix.config }}
+          path: ./test/bin
       - run: ./test/bin/shared_test_${{ matrix.arch }}.exe
         if: always()
       - run: ./test/bin/testinject_bin_${{ matrix.arch }}.exe
@@ -64,17 +128,46 @@ jobs:
         if: always()
       - run: ./test/bin/tvfs_test_${{ matrix.arch }}.exe
         if: always()
-      # the fork only builds x64: skip the scenarios that spawn x86 binaries
-      - run: ./test/bin/usvfs_test_runner_${{ matrix.arch }}.exe --gtest_filter=-UsvfsTest.basic_x86:UsvfsTest.basic_ops32_x64:UsvfsTest.basic_ops64_x86
+      - run: ./test/bin/usvfs_test_runner_${{ matrix.arch }}.exe
         if: always()
       - run: ./test/bin/usvfs_global_test_runner_${{ matrix.arch }}.exe
         if: always()
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: tests-outputs_${{ matrix.arch }}
+          name: tests-outputs_${{ matrix.config }}_${{ matrix.arch }}
           path: ./test/temp
           if-no-files-found: ignore
           retention-days: 7
           overwrite: true
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [merge-artifacts-for-release, test]
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      # USVFS does not use different names for debug and release so we are going to
+      # retrieve both install artifacts and put them under install/ and install/debug/
+
+      - name: Download Release Artifact
+        uses: actions/download-artifact@master
+        with:
+          name: usvfs_Release
+          path: ./install
+
+      - name: Download Debug Artifact
+        uses: actions/download-artifact@master
+        with:
+          name: usvfs_Debug
+          path: ./install/debug
+
+      - name: Create USVFS Base archive
+        run: 7z a usvfs_${{ github.ref_name }}.7z ./install/*
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create --draft=false --notes="Release ${{ github.ref_name }}" "${{ github.ref_name }}" ./usvfs_${{ github.ref_name }}.7z
