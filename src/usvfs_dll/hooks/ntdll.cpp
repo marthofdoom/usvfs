@@ -1209,6 +1209,9 @@ NTSTATUS WINAPI usvfs::hook_NtOpenFile(PHANDLE FileHandle,
   NTSTATUS res = ntdll_mess_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, OpenOptions);
   if (res >= 0 && FileHandle)
     forgetHandleState(*FileHandle);  // backstop against handle value reuse
+  if (res >= 0 && FileHandle && usvfs::metacache::isWriteIntent(DesiredAccess, 1 /* FILE_OPEN */) &&
+      GetFileType(*FileHandle) == FILE_TYPE_DISK)
+    usvfs::readcache::noteFileWritten(*FileHandle);
   if (res >= 0 && ObjectAttributes && FileHandle && GetFileType(*FileHandle) == FILE_TYPE_DISK)
     ntdllHandleTracker.insert(*FileHandle, CreateUnicodeString(ObjectAttributes));
   return res;
@@ -1367,6 +1370,9 @@ NTSTATUS WINAPI usvfs::hook_NtCreateFile(
   NTSTATUS res = ntdll_mess_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
   if (res >= 0 && FileHandle)
     forgetHandleState(*FileHandle);  // backstop against handle value reuse
+  if (res >= 0 && FileHandle && usvfs::metacache::isWriteIntent(DesiredAccess, CreateDisposition) &&
+      GetFileType(*FileHandle) == FILE_TYPE_DISK)
+    usvfs::readcache::noteFileWritten(*FileHandle);
   if (res >= 0 && ObjectAttributes && FileHandle && GetFileType(*FileHandle) == FILE_TYPE_DISK)
     ntdllHandleTracker.insert(*FileHandle, CreateUnicodeString(ObjectAttributes));
   return res;
@@ -1555,10 +1561,20 @@ NTSTATUS WINAPI usvfs::hook_NtReadFile(
 
   // hot path: handles we don't (yet) serve go straight to the real function
   // (we are inside the hook, so the trampoline barrier routes this call to it)
-  if (usvfs::readcache::peek(FileHandle, Length) == usvfs::readcache::Peek::Passthrough) {
+  const usvfs::readcache::Peek peeked = usvfs::readcache::peek(FileHandle, Length);
+  if (peeked == usvfs::readcache::Peek::Passthrough) {
     usvfs::readcache::notePassthrough();
     return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                         Buffer, Length, ByteOffset, Key);
+  }
+  if (peeked == usvfs::readcache::Peek::PassthroughTracked) {
+    // probation handle: the system serves the read, we follow the file pointer
+    usvfs::readcache::notePassthrough();
+    const NTSTATUS res = ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                      IoStatusBlock, Buffer, Length, ByteOffset, Key);
+    usvfs::readcache::afterProbationRead(FileHandle, Event, ApcRoutine, IoStatusBlock,
+                                         ByteOffset, res);
+    return res;
   }
 
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
@@ -1627,8 +1643,9 @@ NTSTATUS WINAPI usvfs::hook_NtSetInformationFile(
   ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
   if (usvfs::metacache::isMutatingClass(FileInformationClass)) {
-    // cached file information (of both caches) is stale from now on
-    usvfs::readcache::bumpWriteGeneration();
+    // cached file information of this file is stale from now on
+    if (::GetFileType(FileHandle) == FILE_TYPE_DISK)
+      usvfs::readcache::noteFileWritten(FileHandle);
 
     if (usvfs::metacache::enabled() && ::GetFileType(FileHandle) == FILE_TYPE_DISK) {
       try {

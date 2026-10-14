@@ -294,6 +294,11 @@ struct State
   std::atomic<uint64_t> prewarmDirs{0};
   std::atomic<uint64_t> prewarmFiles{0};
   std::atomic<uint64_t> prewarmListings{0};
+  std::atomic<uint64_t> prewarmAttrStored{0};
+  std::atomic<uint64_t> prewarmListingBytes{0};
+  std::atomic<int> diagDirLookups{0};
+  std::atomic<int> diagPrewarmStores{0};
+  std::atomic<int> diagAttrMisses{0};
   std::atomic<uint64_t> prewarmLockWaitUs{0};  // time spent waiting for the context lock
   std::atomic<uint64_t> prewarmLockWaits{0};
   std::atomic<int> prewarmLimit{4};            // concurrently working pre-warm jobs
@@ -313,6 +318,26 @@ struct State
 
 // intentionally leaked (detached threads may outlive static destruction)
 State* g = nullptr;
+
+std::string narrow(const std::wstring& w)
+{
+  try {
+    return shared::string_cast<std::string>(w.c_str(), shared::CodePage::UTF8);
+  } catch (const std::exception&) {
+    return std::string("?");
+  }
+}
+
+// the first few lookups and stores are logged so that keys of the game's queries
+// and of the pre-warm can be compared
+template <typename F>
+void diag(std::atomic<int>& counter, F&& f)
+{
+  if (counter.fetch_add(1, std::memory_order_relaxed) < 20) {
+    if (auto logger = spdlog::get("usvfs"))
+      f(*logger);
+  }
+}
 
 uint64_t activity()
 {
@@ -516,7 +541,8 @@ struct Child
   std::string name;
   bool dir   = false;
   bool dummy = false;
-  std::string link;  // real target, empty if none
+  bool file  = false;  // see listChildren
+  std::string link;    // real target, empty if none
 };
 
 std::wstring toNtPath(const std::string& utf8Path)
@@ -569,14 +595,17 @@ void prewarmAttr(const std::wstring& realNtPath)
   FILE_NETWORK_OPEN_INFORMATION info;
   std::memset(&info, 0, sizeof(info));
   const NTSTATUS st = ::NtQueryFullAttributesFile(&attrs, &info);
-  if (cacheableStatus(st))
+  if (cacheableStatus(st)) {
     g->store.putAttr(key, toAttr(st, &info));
+    g->prewarmAttrStored.fetch_add(1, std::memory_order_relaxed);
+  }
   g->prewarmFiles.fetch_add(1, std::memory_order_relaxed);
 }
 
 void prewarmListing(const std::wstring& virtualKey, const std::wstring& realNtPath, int cls)
 {
-  if (g->store.hasListing(virtualKey, cls, L"*"))
+  // listings are the big items: leave most of the memory to what the game fills
+  if (g->store.usedAbove(60) || g->store.hasListing(virtualKey, cls, L"*"))
     return;
   const uint64_t generation = g->store.generation();
   HANDLE h = openDirectory(realNtPath);
@@ -607,6 +636,11 @@ void prewarmListing(const std::wstring& virtualKey, const std::wstring& realNtPa
   if (complete) {
     g->store.putListing(virtualKey, cls, L"*", listing, false, generation);
     g->prewarmListings.fetch_add(1, std::memory_order_relaxed);
+    g->prewarmListingBytes.fetch_add(listing->bytes, std::memory_order_relaxed);
+    diag(g->diagPrewarmStores, [&](spdlog::logger& l) {
+      l.info("metacache diag: pre-warm stored listing key='{}' class={} entries={}",
+             narrow(virtualKey), cls, listing->records.size());
+    });
   }
 }
 
@@ -639,6 +673,13 @@ bool listChildren(const std::string& vpath, std::vector<Child>& out)
       c.dir   = n->isDirectory();
       c.dummy = n->hasFlag(shared::FLAG_DUMMY);
       c.link  = n->data().linkTarget.c_str();
+      // File nodes carry FLAG_DIRECTORY as well (usvfsVirtualLinkDirectoryStatic
+      // passes `true` as the flags of addFile), so isDirectory() is no use. A
+      // directory link ends in a separator or is a dummy; a file link does not.
+      const bool linkEndsInSeparator =
+          !c.link.empty() && (c.link.back() == '\\' || c.link.back() == '/');
+      c.file = !c.dummy && !c.link.empty() && !linkEndsInSeparator;
+      c.dir  = !c.file;
       if (n->hasFlag(shared::FLAG_CREATETARGET) && !c.link.empty()) {
         // the overwrite folder: never cache anything in it
         g->store.addNoCachePrefix(makeKey(toNtPath(c.link)));
@@ -668,9 +709,11 @@ void finishPrewarmJob()
     if (auto logger = spdlog::get("usvfs")) {
       logger->info(
           "metacache: pre-warm finished in {} ms: {} directories, {} files, {} listings, "
+          "stored {} attribute entries and {} listings ({} listing bytes), cache now {} B, "
           "context lock wait {} us in {} acquisitions{}",
           ms, g->prewarmDirs.load(), g->prewarmFiles.load(), g->prewarmListings.load(),
-          g->prewarmLockWaitUs.load(), g->prewarmLockWaits.load(),
+          g->prewarmAttrStored.load(), g->prewarmListings.load(), g->prewarmListingBytes.load(),
+          g->store.bytes(), g->prewarmLockWaitUs.load(), g->prewarmLockWaits.load(),
           g->prewarmCapped.load() ? " (stopped at the memory cap)" : "");
     }
   }
@@ -717,11 +760,14 @@ void prewarmDirectory(const std::string& vpath, const std::string& link)
       g->prewarmDirs.fetch_add(1, std::memory_order_relaxed);
 
       // listing of this directory: what a game-side enumeration of it sees
-      if (!vpath.empty()) {
+      if (!vpath.empty() && !kids.empty()) {
+        std::string realDir = link.empty() ? vpath : link;
+        while (realDir.size() > 3 && (realDir.back() == '\\' || realDir.back() == '/'))
+          realDir.pop_back();
         const std::wstring virtualKey = makeKey(toNtPath(vpath));
         if (!virtualKey.empty()) {
           for (int cls : g->prewarmClasses)
-            prewarmListing(virtualKey, toNtPath(link.empty() ? vpath : link), cls);
+            prewarmListing(virtualKey, toNtPath(realDir), cls);
         }
       }
 
@@ -923,8 +969,12 @@ bool lookupBasic(const std::wstring& key, PFILE_BASIC_INFORMATION out, NTSTATUS&
     return false;
   tick();
   logic::Attr a;
-  if (!g->store.lookupAttr(key, false, a))
+  if (!g->store.lookupAttr(key, false, a)) {
+    diag(g->diagAttrMisses, [&](spdlog::logger& l) {
+      l.info("metacache diag: attribute miss key='{}'", narrow(key));
+    });
     return false;
+  }
   status = a.status;
   if (status == STATUS_SUCCESS) {
     FILE_BASIC_INFORMATION b;
@@ -945,8 +995,12 @@ bool lookupFull(const std::wstring& key, PFILE_NETWORK_OPEN_INFORMATION out, NTS
     return false;
   tick();
   logic::Attr a;
-  if (!g->store.lookupAttr(key, true, a))
+  if (!g->store.lookupAttr(key, true, a)) {
+    diag(g->diagAttrMisses, [&](spdlog::logger& l) {
+      l.info("metacache diag: attribute miss key='{}' (full)", narrow(key));
+    });
     return false;
+  }
   status = a.status;
   if (status == STATUS_SUCCESS) {
     FILE_NETWORK_OPEN_INFORMATION n;
@@ -1044,6 +1098,13 @@ NTSTATUS queryDirectory(const std::wstring& dirPath, HANDLE h, PIO_STATUS_BLOCK 
       }
     }
 
+    diag(g->diagDirLookups, [&](spdlog::logger& l) {
+      l.info("metacache diag: directory query key='{}' class={} mask='{}' -> {}",
+             narrow(c->dir), static_cast<int>(cls), narrow(c->mask),
+             c->mode == Cursor::kReplay ? "replay"
+                                        : c->mode == Cursor::kRecord ? "record" : "real");
+    });
+
     std::lock_guard<std::mutex> lock(g->cursorsLock);
     g->cursors[h] = c;
   }
@@ -1093,10 +1154,7 @@ bool isWriteIntent(ACCESS_MASK access, ULONG disposition)
   constexpr ACCESS_MASK kWriteBits =
       FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
       DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED;
-  const bool write = disposition != 1 /* FILE_OPEN */ || (access & kWriteBits) != 0;
-  if (write)
-    readcache::bumpWriteGeneration();  // snapshots of file information are stale
-  return write;
+  return disposition != 1 /* FILE_OPEN */ || (access & kWriteBits) != 0;
 }
 
 // Which names are files we cache? Device paths, pipes, mailslots and other
@@ -1254,7 +1312,6 @@ void noteSetInformation(std::wstring_view handlePath, std::wstring_view rootPath
 
 void noteDosPath(const wchar_t* dosPath, bool tree)
 {
-  readcache::bumpWriteGeneration();
   if (!g || !enabled() || !dosPath || !*dosPath)
     return;
   std::wstring nt;

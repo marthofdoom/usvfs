@@ -453,6 +453,13 @@ public:
     return m_bytes;
   }
 
+  // true if more than `percent` of the memory cap is in use
+  bool usedAbove(unsigned percent) const
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_bytes > m_cap / 100 * percent;
+  }
+
   bool nearlyFull() const
   {
     std::lock_guard<std::mutex> lock(m_mutex);

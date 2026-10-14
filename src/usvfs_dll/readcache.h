@@ -52,7 +52,7 @@ void init();
 // off. Must NOT be called from DllMain (it waits for the workers).
 void shutdown();
 
-enum class Peek { Unknown, Passthrough, Serve, Big };
+enum class Peek { Unknown, Passthrough, PassthroughTracked, Serve, Big };
 
 // cheap look at the classification of a handle (no reference counting, no
 // hook context): Passthrough handles (ineligible, or still on probation and not
@@ -60,12 +60,18 @@ enum class Peek { Unknown, Passthrough, Serve, Big };
 // handles, so call it once per NtReadFile.
 Peek peek(HANDLE handle, ULONG length);
 
+// after a read of a PassthroughTracked handle went to the system: keeps the
+// tracked file position of the (probation) handle up to date
+void afterProbationRead(HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc,
+                        PIO_STATUS_BLOCK iosb, PLARGE_INTEGER byteOffset, NTSTATUS status);
+
 // counts a read that was passed to the real function without further ado
 void notePassthrough();
 
-// to be called for every write, create, delete, rename or attribute change made by
-// this process: file information snapshots of handles classified before it are
-// no longer served
+// called after a handle was opened for writing/deleting or is about to be
+// modified: file information snapshots of that file are no longer served. If the
+// file can't be identified, the snapshots of every file are dropped.
+void noteFileWritten(HANDLE handle);
 void bumpWriteGeneration();
 
 // registers a function that is told about every handle the cache closes itself

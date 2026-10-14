@@ -217,7 +217,17 @@ struct HandleState
   std::atomic<int> mode{kHandleNone};
   uint64_t shadowPos = 0;  // guarded by m
   FileSnapshot snap;       // set during classification, immutable afterwards
-  uint64_t snapGeneration = 0;  // g_writeGeneration when it was taken
+  // file information snapshots are only served while nothing this process wrote
+  // touched the file (per-file generation) or could not be attributed (global)
+  size_t snapSlot          = 0;
+  uint64_t snapFileGen     = 0;
+  uint64_t snapGlobalGen   = 0;
+  // position of a probation handle, tracked from the reads and seeks we see
+  std::atomic<uint64_t> probPos{0};
+  std::atomic<bool> probKnown{false};
+  // readahead: windows dropped without having served anything
+  uint32_t raUnused   = 0;
+  bool raDisabled     = false;
   std::shared_ptr<CacheEntry> entry;
 
   // layer 3 (big reads); splitOk/key are set during classification, the rest is
@@ -262,6 +272,8 @@ struct BigStats
   std::atomic<uint64_t> raWasted{0};   // bytes read ahead and never used
   std::atomic<uint64_t> raDropped{0};  // windows dropped (any reason)
   std::atomic<uint64_t> raSpinHits{0}; // waits that ended during the spin
+  std::atomic<uint64_t> raHandlesDisabled{0};  // handles that stopped using readahead
+  std::atomic<uint64_t> raBackoffs{0};         // times readahead was switched off globally
 };
 
 struct Stats
@@ -282,7 +294,10 @@ struct Stats
   // NtQueryInformationFile on eligible handles, per information class
   std::atomic<uint64_t> infoServed[80]{};
   std::atomic<uint64_t> infoPassed[80]{};
-  std::atomic<uint64_t> infoServedSplit[80]{};  // served on read-only handles that are not cacheable
+  std::atomic<uint64_t> infoServedSplit[80]{};
+  std::atomic<uint64_t> infoServedProbationPos{0};  // FilePositionInformation on probation handles
+  std::atomic<uint64_t> infoPassedProbationPos{0};
+  std::atomic<uint64_t> fileGenFallbacks{0};        // writes whose file id was unknown (global bump)  // served on read-only handles that are not cacheable
   std::atomic<uint64_t> fills{0};
   std::atomic<uint64_t> fillBytes{0};
   std::atomic<uint64_t> evictions{0};      // entries dropped
@@ -459,6 +474,11 @@ struct State
   std::atomic<uint64_t> lastLogTick{0};
   std::atomic<uint64_t> lastLogActivity{0};
   std::atomic<uint64_t> lastSweepTick{0};
+
+  // readahead back-off when too much of it is wasted
+  std::atomic<uint64_t> raBackoffUntil{0};
+  std::atomic<uint64_t> raBaseIssued{0};
+  std::atomic<uint64_t> raBaseWasted{0};
 };
 
 // intentionally leaked: detached workers may outlive the static destructors
@@ -473,6 +493,16 @@ void (*g_forgetCallback)(HANDLE) = nullptr;
 // number of writes this process has made so far; handles classified before the
 // latest one no longer get file information from their snapshot
 std::atomic<uint64_t> g_writeGeneration{0};
+
+// per-file counterpart: bumped when a file is opened for writing / modified.
+// Indexed by a hash of the file id; a collision only costs a spurious miss.
+constexpr size_t kFileGenSlots = 1 << 16;
+std::atomic<uint64_t> g_fileGen[kFileGenSlots];
+
+size_t fileGenSlot(int64_t fileId)
+{
+  return static_cast<size_t>((static_cast<uint64_t>(fileId) * 0x9E3779B97F4A7C15ull) >> 48);
+}
 
 // true while a read cache function runs its own queries: they must see the system
 thread_local bool t_inShim = false;
@@ -628,8 +658,10 @@ void logSummary(const char* prefix)
       splitInfos += std::format(" {}={}", i, ld(s.infoServedSplit[i]));
   }
   logger->info("{} NtQueryInformationFile on eligible handles (class=served/passed):{} | "
-               "served on read-only uncacheable handles:{}",
-               prefix, infos, splitInfos);
+               "position on probation handles served/passed={}/{} | "
+               "served on read-only uncacheable handles:{} | unattributed writes={}",
+               prefix, infos, ld(s.infoServedProbationPos), ld(s.infoPassedProbationPos),
+               splitInfos, ld(s.fileGenFallbacks));
   logger->info("{} by file size:{}", prefix, buckets);
   logger->info(
       "{} layer 2: asyncFills={} asyncFillFailures={} syncFallbacks={} "
@@ -646,10 +678,11 @@ void logSummary(const char* prefix)
   logger->info(
       "{} big reads:{} splits done={} failed={} chunks={} | readahead windows={} "
       "bytes={} served={} servedBytes={} waits={} waitUs={} spinHits={} wastedBytes={} "
-      "droppedWindows={} | fallbacks={}",
+      "droppedWindows={} disabledHandles={} backoffs={} | fallbacks={}",
       prefix, bigs, ld(b.splitsDone), ld(b.splitsFailed), ld(b.chunks),
       ld(b.raWindows), ld(b.raBytes), ld(b.raServed), ld(b.raServedBytes),
       ld(b.raWaits), ld(b.raWaitUs), ld(b.raSpinHits), ld(b.raWasted), ld(b.raDropped),
+      ld(b.raHandlesDisabled), ld(b.raBackoffs),
       ld(b.fallbacks));
 }
 
@@ -1416,10 +1449,17 @@ bool ensureWFile(HandleState& hs, HANDLE h)
   return true;
 }
 
-void dropWindow(std::shared_ptr<RaWindow>& w)
+// a window that is thrown away without ever having served a read counts against
+// the handle: after two of those it stops using readahead
+void dropWindow(HandleState& hs, std::shared_ptr<RaWindow>& w)
 {
   if (w) {
     g->stats.big.raDropped.fetch_add(1, std::memory_order_relaxed);
+    if (w->usedBytes.load(std::memory_order_relaxed) == 0 && ++hs.raUnused >= 2 &&
+        !hs.raDisabled) {
+      hs.raDisabled = true;
+      g->stats.big.raHandlesDisabled.fetch_add(1, std::memory_order_relaxed);
+    }
     w->cancel.store(true, std::memory_order_relaxed);
     w.reset();
   }
@@ -1427,8 +1467,33 @@ void dropWindow(std::shared_ptr<RaWindow>& w)
 
 void dropWindows(HandleState& hs)
 {
-  dropWindow(hs.window);
-  dropWindow(hs.window2);
+  dropWindow(hs, hs.window);
+  dropWindow(hs, hs.window2);
+}
+
+// Readahead is switched off for a while if too much of what it read was never
+// used (checked over the bytes issued since the last verdict).
+bool readaheadAllowed()
+{
+  const uint64_t now = GetTickCount64();
+  if (now < g->raBackoffUntil.load(std::memory_order_relaxed))
+    return false;
+
+  const uint64_t issued = g->stats.big.raBytes.load(std::memory_order_relaxed) -
+                          g->raBaseIssued.load(std::memory_order_relaxed);
+  const uint64_t wasted = g->stats.big.raWasted.load(std::memory_order_relaxed) -
+                          g->raBaseWasted.load(std::memory_order_relaxed);
+  if (issued >= (128ull << 20)) {
+    const bool bad = wasted * 100 > issued * 30;
+    g->raBaseIssued.store(g->stats.big.raBytes.load(std::memory_order_relaxed));
+    g->raBaseWasted.store(g->stats.big.raWasted.load(std::memory_order_relaxed));
+    if (bad) {
+      g->raBackoffUntil.store(now + 10000, std::memory_order_relaxed);
+      g->stats.big.raBackoffs.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+  }
+  return true;
 }
 
 // drops readahead windows nobody has read from for a while
@@ -1444,7 +1509,7 @@ void sweepIdleWindows()
       continue;
     for (std::shared_ptr<RaWindow>* w : {&hs.window, &hs.window2}) {
       if (*w && now - (*w)->lastUse.load(std::memory_order_relaxed) > kIdleMs)
-        dropWindow(*w);
+        dropWindow(hs, *w);
     }
   }
 }
@@ -1497,6 +1562,8 @@ void raTask(const std::shared_ptr<RaWindow>& w, const std::shared_ptr<WFile>& wf
 void issueWindow(HandleState& hs, HANDLE h, uint64_t start, uint64_t lastRead,
                  std::shared_ptr<RaWindow>& slot)
 {
+  if (hs.raDisabled || !readaheadAllowed())
+    return;
   if (!ensureWFile(hs, h))
     return;
 
@@ -1540,7 +1607,7 @@ bool serveFromWindow(HandleState& hs, std::shared_ptr<RaWindow>& slot, HANDLE h,
   if (w->loaded.load(std::memory_order_acquire) < need) {
     if (!w->started.load(std::memory_order_acquire)) {
       // queued behind other work: don't wait for it
-      dropWindow(slot);
+      dropWindow(hs, slot);
       return false;
     }
     BigStats& bs = g->stats.big;
@@ -1567,7 +1634,7 @@ bool serveFromWindow(HandleState& hs, std::shared_ptr<RaWindow>& slot, HANDLE h,
     }
     bs.raWaitUs.fetch_add(nowUs() - t0, std::memory_order_relaxed);
     if (w->loaded.load(std::memory_order_acquire) < need) {
-      dropWindow(slot);
+      dropWindow(hs, slot);
       return false;
     }
   }
@@ -1760,6 +1827,12 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
   hs.snap.reparseTag = info.reparseTag;
   hs.snap.links = info.numberOfLinks;
   hs.snap.effectiveAccess = info.effectiveAccess;
+  hs.snapSlot      = fileGenSlot(info.fileId);
+  hs.snapFileGen   = g_fileGen[hs.snapSlot].load(std::memory_order_acquire);
+  hs.snapGlobalGen = g_writeGeneration.load(std::memory_order_acquire);
+  hs.probPos.store(info.position < 0 ? 0 : static_cast<uint64_t>(info.position),
+                   std::memory_order_relaxed);
+  hs.probKnown.store(info.position >= 0, std::memory_order_release);
   hs.splitOk.store(logic::splitCapable(a) && a.endOfFile > 0 && a.endOfFile != UINT64_MAX,
                    std::memory_order_release);
 
@@ -1775,7 +1848,6 @@ Eligibility classifyImpl(HandleState& hs, HANDLE h, bool eventOrApc, ULONG lengt
 void classify(HandleState& hs, HANDLE h, bool eventOrApc, ULONG length)
 {
   Eligibility r = Eligibility::QueryFailed;
-  hs.snapGeneration = g_writeGeneration.load(std::memory_order_acquire);
   const uint64_t t0 = nowUs();
   const uint64_t fill0 = t_syncFillUs;
   try {
@@ -1870,6 +1942,40 @@ bool admit(HandleState& hs, HANDLE h)
   return true;
 }
 
+// updates the tracked position of a probation handle after a read that went to
+// the system. Anything we can't account for makes the position unknown.
+void trackProbationRead(HandleState& hs, HANDLE ev, PIO_APC_ROUTINE apc,
+                        PIO_STATUS_BLOCK iosb, PLARGE_INTEGER off, NTSTATUS status)
+{
+  auto unknown = [&]() { hs.probKnown.store(false, std::memory_order_release); };
+  if (ev != nullptr || apc != nullptr || iosb == nullptr)
+    return unknown();
+
+  int64_t requested = -2;  // FILE_USE_FILE_POINTER_POSITION
+  if (off != nullptr && !sehCopy(&requested, off, sizeof(requested)))
+    return unknown();
+  const bool explicitOff = off != nullptr && requested != logic::kUseFilePointerPosition;
+  if (explicitOff && requested < 0)
+    return unknown();
+
+  if (status == STATUS_SUCCESS) {
+    ULONG_PTR info = 0;
+    if (!sehCopy(&info, &iosb->Information, sizeof(info)))
+      return unknown();
+    if (explicitOff) {
+      hs.probPos.store(static_cast<uint64_t>(requested) + info, std::memory_order_relaxed);
+      hs.probKnown.store(true, std::memory_order_release);
+    } else if (hs.probKnown.load(std::memory_order_acquire)) {
+      hs.probPos.store(hs.probPos.load(std::memory_order_relaxed) + info,
+                       std::memory_order_relaxed);
+    }
+    return;
+  }
+  if (status == STATUS_END_OF_FILE && !explicitOff)
+    return;  // the pointer stays where it was
+  unknown();
+}
+
 // a request on an eligible handle that we don't serve: the real file pointer
 // has to match what the caller believes it to be. Caller holds hs.m.
 NTSTATUS syncedRead(HandleState& hs, HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc,
@@ -1898,6 +2004,9 @@ NTSTATUS bigRead(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
                  ULONG len, PLARGE_INTEGER off)
 {
   BigStats& bs = g->stats.big;
+
+  // the pointer of a probation handle is only known again if this succeeds
+  hs.probKnown.store(false, std::memory_order_release);
 
   auto plain = [&]() {
     return realRead(h, nullptr, nullptr, nullptr, iosb, buf, len, off, nullptr);
@@ -1952,6 +2061,11 @@ NTSTATUS bigRead(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
     }
   }
 
+  if (status == STATUS_SUCCESS && total > 0) {
+    hs.probPos.store(offset + total, std::memory_order_relaxed);
+    hs.probKnown.store(true, std::memory_order_release);
+  }
+
   // bookkeeping after the I/O: failures here only cost performance
   try {
     if (status == STATUS_SUCCESS && total > 0) {
@@ -1961,14 +2075,15 @@ NTSTATUS bigRead(HandleState& hs, HANDLE h, PIO_STATUS_BLOCK iosb, PVOID buf,
       // retire windows the stream has passed
       for (int i = 0; i < 2; ++i) {
         if (hs.window && lastEnd >= hs.window->start + hs.window->length) {
+          dropWindow(hs, hs.window);  // counts as unused if it never served
           hs.window = std::move(hs.window2);
           hs.window2.reset();
         }
       }
       if (hs.window2 && lastEnd >= hs.window2->start + hs.window2->length)
-        dropWindow(hs.window2);
+        dropWindow(hs, hs.window2);
 
-      if (g->raEnabled && hs.splitFailures < 3 &&
+      if (g->raEnabled && !hs.raDisabled && hs.splitFailures < 3 &&
           hs.seq.run >= logic::kSequentialRunForReadahead) {
         if (!hs.window) {
           issueWindow(hs, h, lastEnd, total, hs.window);
@@ -2012,19 +2127,33 @@ Peek peek(HANDLE h, ULONG length)
     return Peek::Serve;
   case kHandleProbation: {
     if (!logic::isSmallRead(length))
-      return big ? Peek::Big : Peek::Passthrough;
+      return big ? Peek::Big : Peek::PassthroughTracked;
     CacheEntry& e = *hs.entry;
     const uint32_t count = e.smallReads.fetch_add(1, std::memory_order_relaxed) + 1;
     const int state      = e.state.load(std::memory_order_relaxed);
     const bool resident  = state == kReady || state == kLoading;
     return logic::shouldAdmit(count, g->admitReads, resident) ? Peek::Serve
-                                                              : Peek::Passthrough;
+                                                              : Peek::PassthroughTracked;
   }
   case kHandleIneligible:
     return big ? Peek::Big : Peek::Passthrough;
   default:
     return Peek::Unknown;
   }
+}
+
+void afterProbationRead(HANDLE h, HANDLE ev, PIO_APC_ROUTINE apc, PIO_STATUS_BLOCK iosb,
+                        PLARGE_INTEGER off, NTSTATUS status)
+{
+  if (!g)
+    return;
+  std::shared_lock<std::shared_mutex> lock(g->handlesLock);
+  auto it = g->handles.find(h);
+  if (it == g->handles.end())
+    return;
+  HandleState& hs = *it->second;
+  if (hs.mode.load(std::memory_order_acquire) == kHandleProbation)
+    trackProbationRead(hs, ev, apc, iosb, off, status);
 }
 
 void notePassthrough()
@@ -2036,6 +2165,28 @@ void notePassthrough()
   g->stats.passthroughs.fetch_add(pending, std::memory_order_relaxed);
   pending = 0;
   maybeLog();
+}
+
+void noteFileWritten(HANDLE handle)
+{
+  if (!g || handle == nullptr || handle == INVALID_HANDLE_VALUE)
+    return;
+  // the query must reach the system, not our snapshot
+  const bool wasInShim = t_inShim;
+  t_inShim = true;
+  FILE_INTERNAL_INFORMATION ii;
+  std::memset(&ii, 0, sizeof(ii));
+  IO_STATUS_BLOCK iosb;
+  std::memset(&iosb, 0, sizeof(iosb));
+  const NTSTATUS st = ::NtQueryInformationFile(handle, &iosb, &ii, sizeof(ii),
+                                               FileInternalInformation);
+  t_inShim = wasInShim;
+  if (st >= 0) {
+    g_fileGen[fileGenSlot(ii.IndexNumber.QuadPart)].fetch_add(1, std::memory_order_acq_rel);
+  } else {
+    g_writeGeneration.fetch_add(1, std::memory_order_acq_rel);
+    g->stats.fileGenFallbacks.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 void bumpWriteGeneration()
@@ -2243,11 +2394,15 @@ NTSTATUS readImpl(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
 
   if (hs->mode.load(std::memory_order_acquire) == kHandleProbation) {
     // the real file pointer is authoritative on probation
-    if (Event != nullptr || ApcRoutine != nullptr || Key != nullptr ||
-        IoStatusBlock == nullptr) {
+    auto trackedPassthrough = [&]() {
       lock.unlock();
-      return passthrough();
-    }
+      const NTSTATUS r = passthrough();
+      trackProbationRead(*hs, Event, ApcRoutine, IoStatusBlock, ByteOffset, r);
+      return r;
+    };
+    if (Event != nullptr || ApcRoutine != nullptr || Key != nullptr ||
+        IoStatusBlock == nullptr)
+      return trackedPassthrough();
     if (justClassified) {
       // peek() counts the reads of every later call
       bool admitNow = false;
@@ -2258,10 +2413,8 @@ NTSTATUS readImpl(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
         admitNow = logic::shouldAdmit(cnt, g->admitReads,
                                       pstate == kReady || pstate == kLoading);
       }
-      if (!admitNow) {
-        lock.unlock();
-        return passthrough();
-      }
+      if (!admitNow)
+        return trackedPassthrough();
     }
     if (!admit(*hs, FileHandle)) {
       lock.unlock();
@@ -2401,8 +2554,36 @@ bool tryServeInfo(HANDLE h, PIO_STATUS_BLOCK iosb, PVOID info, ULONG length,
     return false;
   };
 
-  // this process wrote something since the snapshot was taken
-  if (hs.snapGeneration != g_writeGeneration.load(std::memory_order_acquire))
+  // FilePositionInformation: probation handles answer from the tracked position;
+  // served handles are answered by queryInformation() (shadow position)
+  if (cls == FilePositionInformation) {
+    if (splitOnly)
+      return false;
+    if (mode == kHandleServed) {
+      g->stats.infoServed[14].fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    if (hs.probKnown.load(std::memory_order_acquire) && info && iosb &&
+        length >= sizeof(FILE_POSITION_INFORMATION)) {
+      FILE_POSITION_INFORMATION pos;
+      pos.CurrentByteOffset.QuadPart =
+          static_cast<LONGLONG>(hs.probPos.load(std::memory_order_acquire));
+      if (!sehCopy(info, &pos, sizeof(pos)) ||
+          !sehStoreStatus(iosb, STATUS_SUCCESS, sizeof(pos)))
+        status = STATUS_ACCESS_VIOLATION;
+      else
+        status = STATUS_SUCCESS;
+      g->stats.infoServedProbationPos.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    g->stats.infoPassedProbationPos.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  // this process modified the file (or something we couldn't attribute) since
+  // the snapshot was taken
+  if (hs.snapFileGen != g_fileGen[hs.snapSlot].load(std::memory_order_acquire) ||
+      hs.snapGlobalGen != g_writeGeneration.load(std::memory_order_acquire))
     return passed();
 
   const FileSnapshot& f = hs.snap;
@@ -2468,15 +2649,6 @@ bool tryServeInfo(HANDLE h, PIO_STATUS_BLOCK iosb, PVOID info, ULONG length,
     out.stat.EffectiveAccess         = f.effectiveAccess;
     size = sizeof(out.stat);
     break;
-  case FilePositionInformation:
-    // answered from the shadow position by queryInformation() on served handles
-    if (splitOnly)
-      return false;
-    if (mode == kHandleServed && counted)
-      g->stats.infoServed[c].fetch_add(1, std::memory_order_relaxed);
-    else
-      passed();
-    return false;
   default:
     return passed();
   }
@@ -2554,6 +2726,22 @@ NTSTATUS setInformation(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
                                   Length, FileInformationClass);
 
   std::shared_ptr<HandleState> hs = lookup(FileHandle);
+  if (hs && hs->mode.load(std::memory_order_acquire) == kHandleProbation &&
+      FileInformation != nullptr && Length >= sizeof(FILE_POSITION_INFORMATION)) {
+    // probation: the system keeps the pointer, we only follow it
+    int64_t requested = 0;
+    const bool readable = sehCopy(&requested, FileInformation, sizeof(requested));
+    const NTSTATUS res = ::NtSetInformationFile(FileHandle, IoStatusBlock,
+                                                FileInformation, Length,
+                                                FileInformationClass);
+    if (res >= 0 && readable && requested >= 0) {
+      hs->probPos.store(static_cast<uint64_t>(requested), std::memory_order_relaxed);
+      hs->probKnown.store(true, std::memory_order_release);
+    } else if (res >= 0) {
+      hs->probKnown.store(false, std::memory_order_release);
+    }
+    return res;
+  }
   if (!hs || !hs->served() ||
       FileInformation == nullptr || Length < sizeof(FILE_POSITION_INFORMATION))
     return ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,

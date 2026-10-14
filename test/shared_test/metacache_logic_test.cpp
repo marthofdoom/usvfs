@@ -333,3 +333,15 @@ TEST(MetaCacheListing, LiteralLookupByFoldedName)
   EXPECT_EQ(nullptr, l.findLiteral(normalizeMask(L"nothing")));
   ASSERT_NE(nullptr, l.findLiteral(normalizeMask(L"BAR.ESM")));
 }
+
+TEST(MetaCacheStore, UsedAboveReportsMemoryShare)
+{
+  Store s(10000);
+  EXPECT_FALSE(s.usedAbove(60));
+  auto l = std::make_shared<Listing>();
+  for (int i = 0; i < 60; ++i)
+    l->add(std::string(40, 'x'), L"NAME" + std::to_wstring(i));
+  s.putListing(L"\\D", 37, L"*", l);
+  EXPECT_TRUE(s.usedAbove(10));
+  EXPECT_FALSE(s.usedAbove(99));
+}
