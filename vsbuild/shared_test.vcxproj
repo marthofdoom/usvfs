@@ -265,6 +265,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\test\shared_test\main.cpp" />
+    <ClCompile Include="..\test\shared_test\readcache_logic_test.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="shared.vcxproj">
