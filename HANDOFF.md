@@ -135,7 +135,7 @@ and `Tools/harness-cold.sh DIR...` (posix_fadvise DONTNEED for cold runs).
   latency per op, busiest threads), `FILE.log` (progress every 5 s, CreateProcess errors, first 20 failing
   paths). Look at the .log first when something dies.
 - Handles: reused handle values are resolved by time (instance = latest create returned before the use);
-  find handles separately. Window mode re-opens handles open at window start (file positions restart at 0).
+  find handles separately. `--from S` fast-forwards: the prefix before S is replayed untimed as one timestamp-ordered stream with only state ops (opens, closes, file positions, cwd; search handles open at S re-created with their recorded FindNext count; reads only with `--ff-reads`); measurement starts at S. `--no-ff` = old window mode (re-opens handles open at S, positions restart at 0).
 - Response files: any `@<path>` argument is replaced by the args in that file (UTF-8/UTF-16 BOM, whitespace separated, `#` comment lines, `"..."` groups); expanded list is logged in the .log.
 - Safety: opens with write/delete/non-FILE_OPEN intent and non-position SetInformation are skipped.
 

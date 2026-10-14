@@ -4,7 +4,7 @@
 //
 //   replay.exe <trace> [--timing asap|original] [--verify] [--threads-as-recorded]
 //              [--single-thread] [--allow-writes] [--inherit-env] [--out results.json]
-//              [--from S] [--to S] [--limit-seconds N]
+//              [--from S] [--to S] [--limit-seconds N] [--no-ff] [--ff-reads]
 //              [--config NAME KEY=VAL ...]...
 //
 // The parent process only orchestrates: it spawns itself once per --config (with
@@ -56,6 +56,8 @@ struct Options {
   bool allowWrites = false;
   bool inheritEnv = false;
   double fromSec = 0;
+  bool noFastForward = false;  // --no-ff: window mode re-opens handles instead of replaying the prefix
+  bool ffReads = false;        // --ff-reads: the fast-forwarded prefix also executes reads (cache warming)
   double toSec = -1;     // < 0: to the end
   double limitSec = -1;  // < 0: none
   std::wstring vfsPath;      // --vfs: mapping manifest written by USVFS_MAPPING_DUMP
@@ -531,7 +533,8 @@ public:
       std::stable_sort(v.begin(), v.end(), [&](size_t a, size_t b) { return m_ix.blocks[a].firstTs < m_ix.blocks[b].firstTs; });
 
     applyStartDirectory();
-    preOpen();
+    if (m_fromTs > m_ix.minTs && !m_o.noFastForward) fastForward();
+    else preOpen();
 
     std::vector<std::unique_ptr<Cursor>> cursors;
     std::vector<uint32_t> tids;
@@ -608,6 +611,83 @@ private:
     logf("window starts at +%.1fs: re-opened %llu of %llu handles that were open at that point",
          (double)(m_fromTs - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, (unsigned long long)opened,
          (unsigned long long)total);
+  }
+
+  // --from S without --no-ff: replay the trace's prefix (everything before S) as one merged stream in timestamp
+  // order, executing only the state-building ops: opens, closes, file positions, cwd. Search handles still open
+  // at S are re-created (FindFirst + the recorded number of FindNext calls). Reads only with --ff-reads. Nothing
+  // here is timed or counted in the results.
+  void fastForward()
+  {
+    const uint64_t tStart = qpcNow();
+    std::map<uint32_t, std::vector<size_t>> perThread;
+    for (size_t i = 0; i < m_ix.blocks.size(); ++i)
+      if (m_ix.blocks[i].firstTs < m_fromTs) perThread[m_ix.blocks[i].tid].push_back(i);
+    std::vector<std::unique_ptr<Cursor>> cursors;
+    for (auto& [tid, v] : perThread) {
+      std::stable_sort(v.begin(), v.end(), [&](size_t a, size_t b) { return m_ix.blocks[a].firstTs < m_ix.blocks[b].firstTs; });
+      cursors.push_back(std::make_unique<Cursor>(m_tf, m_ix, v, 0, m_fromTs));
+    }
+    auto cmp = [&](size_t a, size_t b) { return cursors[a]->peek()->ts > cursors[b]->peek()->ts; };
+    std::priority_queue<size_t, std::vector<size_t>, decltype(cmp)> heap(cmp);
+    for (size_t i = 0; i < cursors.size(); ++i) if (cursors[i]->peek()) heap.push(i);
+
+    struct OpenFind { Record first; uint64_t nexts = 0; };
+    std::map<int, OpenFind> openFinds;
+    ThreadStats scratch;  // discarded
+    std::vector<uint8_t> buf(4096);
+    HANDLE event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    uint64_t nOpen = 0, nClose = 0, nPos = 0, nCwd = 0, nRead = 0, nSkipped = 0;
+    m_quiet = true;
+    while (!heap.empty()) {
+      const size_t i = heap.top();
+      heap.pop();
+      const Record& r = *cursors[i]->peek();
+      switch (r.op) {
+      case Op::Create:
+      case Op::Open:
+        if ((int32_t)r.status >= 0) { exec(r, buf, event, scratch, true); ++nOpen; } else ++nSkipped;
+        break;
+      case Op::Close: exec(r, buf, event, scratch, true); ++nClose; break;
+      case Op::SetInfo: exec(r, buf, event, scratch, true); ++nPos; break;
+      case Op::SetCwd: exec(r, buf, event, scratch, true); ++nCwd; break;
+      case Op::Read:
+        if (m_o.ffReads) { exec(r, buf, event, scratch, true); ++nRead; } else ++nSkipped;
+        break;
+      case Op::FindFirst: {
+        const int fid = r.h ? m_ix.lookupFind(r.h, r.ts + r.dur) : -1;
+        if (fid >= 0) openFinds[fid] = OpenFind{r, 0};
+        break;
+      }
+      case Op::FindNext: {
+        auto it = openFinds.find(m_ix.lookupFind(r.h, r.ts));
+        if (it != openFinds.end()) ++it->second.nexts;
+        break;
+      }
+      case Op::FindClose: openFinds.erase(m_ix.lookupFind(r.h, r.ts)); break;
+      default: ++nSkipped; break;
+      }
+      cursors[i]->advance();
+      if (cursors[i]->peek()) heap.push(i);
+    }
+    uint64_t nFinds = 0, nNexts = 0;
+    for (auto& [fid, of] : openFinds) {
+      exec(of.first, buf, event, scratch, true);
+      HANDLE fh = m_finds[fid].live.load();
+      if (!fh) continue;
+      ++nFinds;
+      WIN32_FIND_DATAW fd;
+      for (uint64_t k = 0; k < of.nexts; ++k, ++nNexts)
+        if (!::FindNextFileW(fh, &fd)) break;
+    }
+    m_quiet = false;
+    ::CloseHandle(event);
+    logf("fast-forward to +%.1fs done in %.1f ms: %llu opens, %llu closes, %llu positions, %llu cwd, %llu reads%s, "
+         "%llu/%zu search handles re-created (%llu FindNext), %llu other records skipped",
+         (double)(m_fromTs - m_ix.minTs) / (double)m_ix.hdr.qpcFreq, ticksToUs(qpcNow() - tStart) / 1000.0,
+         (unsigned long long)nOpen, (unsigned long long)nClose, (unsigned long long)nPos, (unsigned long long)nCwd,
+         (unsigned long long)nRead, m_o.ffReads ? "" : " (off)", (unsigned long long)nFinds, openFinds.size(),
+         (unsigned long long)nNexts, (unsigned long long)nSkipped);
   }
 
   void runThread(Cursor& cur, ThreadStats& ts, size_t slot)
@@ -688,6 +768,7 @@ private:
 
   void note(ThreadStats& ts, const Record& r, NTSTATUS got, const char* what)
   {
+    if (m_quiet) return;
     OpStat& s = ts.op[(int)r.op];
     if ((uint32_t)got != r.status) {
       ++s.diffs;
@@ -999,6 +1080,7 @@ private:
   std::unique_ptr<std::atomic<uint64_t>[]> m_progress;
   size_t m_nProgress = 0;
   uint64_t m_fromTs = 0, m_toTs = ~0ull, m_start = 0, m_planned = 0;
+  bool m_quiet = false;  // fast-forward prefix: no status-diff accounting
 };
 
 // child: one pass, results as simple "key value" lines for the parent
@@ -1016,7 +1098,7 @@ int runChild(const Options& o)
 
   TraceFile tf;
   if (!tf.open(o.tracePath)) return 2;
-  const bool windowed = o.fromSec > 0;
+  const bool windowed = o.fromSec > 0 && o.noFastForward;  // closes index is only for the --no-ff re-open
   Index ix;
   logf("indexing %.0f MB trace ...", (double)tf.size() / 1048576.0);
   if (!buildIndex(tf, windowed, ix)) return 2;
@@ -1404,6 +1486,8 @@ bool runConfig(const Options& o, const Config& c, size_t index, Result& res)
   if (o.verify) cmd += L" --verify";
   if (o.singleThread) cmd += L" --single-thread";
   if (o.allowWrites) cmd += L" --allow-writes";
+  if (o.noFastForward) cmd += L" --no-ff";
+  if (o.ffReads) cmd += L" --ff-reads";
 
   EnvScope envScope;
   applyEnv(envScope, c, o.inheritEnv);
@@ -1604,7 +1688,7 @@ void usage()
   std::fputs(
       "usage: replay.exe <trace> [--timing asap|original] [--verify] [--threads-as-recorded]\n"
       "                  [--single-thread] [--allow-writes] [--inherit-env] [--out results.json]\n"
-      "                  [--from S] [--to S] [--limit-seconds N]\n"
+      "                  [--from S] [--to S] [--limit-seconds N] [--no-ff] [--ff-reads]\n"
       "                  [--vfs MANIFEST [--instance NAME] [--usvfs-dll PATH]]\n"
       "                  [--config NAME KEY=VAL ...]...\n",
       stderr);
@@ -1687,6 +1771,8 @@ int wmain(int argc, wchar_t** argv)
     else if (a == L"--usvfs-dll") o.usvfsDll = next();
     else if (a == L"--log") o.logPath = next();
     else if (a == L"--child") o.childResult = next();
+    else if (a == L"--no-ff") o.noFastForward = true;
+    else if (a == L"--ff-reads") o.ffReads = true;
     else if (a == L"--from") o.fromSec = _wtof(next().c_str());
     else if (a == L"--to") o.toSec = _wtof(next().c_str());
     else if (a == L"--limit-seconds") o.limitSec = _wtof(next().c_str());
