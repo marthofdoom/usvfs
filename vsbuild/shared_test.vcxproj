@@ -267,6 +267,7 @@
     <ClCompile Include="..\test\shared_test\main.cpp" />
     <ClCompile Include="..\test\shared_test\readcache_logic_test.cpp" />
     <ClCompile Include="..\test\shared_test\metacache_logic_test.cpp" />
+    <ClCompile Include="..\test\shared_test\trace_format_test.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="shared.vcxproj">

@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - "async-read-prefetch*"
+      - harness
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -65,6 +66,13 @@ jobs:
           path: |
             ./lib
             ./bin
+
+      # harness: file-API trace replayer
+      - if: matrix.tests == '' && matrix.config == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay_${{ matrix.arch }}
+          path: ./bin/replay_${{ matrix.arch }}.exe
 
       - if: matrix.tests == 'Test' && matrix.config == 'Debug'
         uses: actions/upload-artifact@master

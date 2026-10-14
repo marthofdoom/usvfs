@@ -83,6 +83,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "usvfs_test", "usvfs_test.vc
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "usvfs_test_runner", "usvfs_test_runner.vcxproj", "{0452CB4D-A906-4717-94AC-7A450E479BE1}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "replay", "replay.vcxproj", "{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}"
+EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "injection", "injection", "{60262FE7-A84B-4B73-BE5D-0B5886A28BB8}"
 EndProject
 Global
@@ -349,6 +351,18 @@ Global
 		{0452CB4D-A906-4717-94AC-7A450E479BE1}.ReleaseTest|x64.Build.0 = ReleaseTest|x64
 		{0452CB4D-A906-4717-94AC-7A450E479BE1}.ReleaseTest|x86.ActiveCfg = ReleaseTest|Win32
 		{0452CB4D-A906-4717-94AC-7A450E479BE1}.ReleaseTest|x86.Build.0 = ReleaseTest|Win32
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.Debug|x64.ActiveCfg = Debug|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.Debug|x64.Build.0 = Debug|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.Debug|x86.ActiveCfg = Debug|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.DebugTest|x64.ActiveCfg = Debug|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.DebugTest|x64.Build.0 = Debug|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.DebugTest|x86.ActiveCfg = Debug|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.Release|x64.ActiveCfg = Release|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.Release|x64.Build.0 = Release|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.Release|x86.ActiveCfg = Release|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.ReleaseTest|x64.ActiveCfg = Release|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.ReleaseTest|x64.Build.0 = Release|x64
+		{757C85CB-0CF6-4BAF-B942-9AFAEECBC868}.ReleaseTest|x86.ActiveCfg = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

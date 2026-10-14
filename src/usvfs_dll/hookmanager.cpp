@@ -25,6 +25,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "usvfs.h"
 #include "readcache.h"
 #include "metacache.h"
+#include "trace.h"
 #include "../thooklib/utility.h"
 #include "../thooklib/ttrampolinepool.h"
 #include <shmlogger.h>
@@ -60,6 +61,7 @@ HookManager::HookManager(const usvfsParameters& params, HMODULE module)
                              version.major, version.minor, version.build, version.servicpack, version.platformid,
                              shared::string_cast<std::string>(winapi::ex::wide::getWindowsBuildLab(true)).c_str());
 
+  trace::init();  // harness trace (USVFS_TRACE); before any hook exists
   readcache::init();
   readcache::setForgetCallback(forgetWorkerHandle);
   metacache::init();
@@ -80,6 +82,7 @@ HookManager::~HookManager()
   // stops the read cache workers; not called from DllMain, so waiting is safe
   metacache::shutdown();
   readcache::shutdown();
+  trace::shutdown();
   removeHooks();
   m_Context.unregisterCurrentProcess();
 }

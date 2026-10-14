@@ -1,4 +1,5 @@
 #include "ntdll.h"
+#include "ntdll_impl.h"
 #include "sharedids.h"
 #include <loghelpers.h>
 #include "../hookcontext.h"
@@ -756,7 +757,7 @@ bool addVirtualSearchResult(PVOID &FileInformation,
   }
 }
 
-NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
+NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
     PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
     ULONG Length, FILE_INFORMATION_CLASS FileInformationClass,
@@ -917,7 +918,7 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
   return res;
 }
 
-NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFileEx(
+NTSTATUS WINAPI usvfs::impl_NtQueryDirectoryFileEx(
     HANDLE FileHandle,
     HANDLE Event,
     PIO_APC_ROUTINE ApcRoutine,
@@ -1200,7 +1201,7 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle,
   return res;
 }
 
-NTSTATUS WINAPI usvfs::hook_NtOpenFile(PHANDLE FileHandle,
+NTSTATUS WINAPI usvfs::impl_NtOpenFile(PHANDLE FileHandle,
                                          ACCESS_MASK DesiredAccess,
                                          POBJECT_ATTRIBUTES ObjectAttributes,
                                          PIO_STATUS_BLOCK IoStatusBlock,
@@ -1360,7 +1361,7 @@ NTSTATUS ntdll_mess_NtCreateFile(
   return res;
 }
 
-NTSTATUS WINAPI usvfs::hook_NtCreateFile(
+NTSTATUS WINAPI usvfs::impl_NtCreateFile(
   PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
   POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
   PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
@@ -1378,7 +1379,7 @@ NTSTATUS WINAPI usvfs::hook_NtCreateFile(
   return res;
 }
 
-NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
+NTSTATUS WINAPI usvfs::impl_NtClose(HANDLE Handle)
 {
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
@@ -1435,7 +1436,7 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
   return res;
 }
 
-NTSTATUS WINAPI usvfs::hook_NtQueryAttributesFile(
+NTSTATUS WINAPI usvfs::impl_NtQueryAttributesFile(
     POBJECT_ATTRIBUTES ObjectAttributes,
     PFILE_BASIC_INFORMATION FileInformation)
 {
@@ -1484,7 +1485,7 @@ NTSTATUS WINAPI usvfs::hook_NtQueryAttributesFile(
   return res;
 }
 
-NTSTATUS WINAPI usvfs::hook_NtQueryFullAttributesFile(
+NTSTATUS WINAPI usvfs::impl_NtQueryFullAttributesFile(
     POBJECT_ATTRIBUTES ObjectAttributes,
     PFILE_NETWORK_OPEN_INFORMATION FileInformation)
 {
@@ -1548,7 +1549,7 @@ void usvfs::forgetWorkerHandle(HANDLE handle)
   usvfs::metacache::onClose(handle);
 }
 
-NTSTATUS WINAPI usvfs::hook_NtReadFile(
+NTSTATUS WINAPI usvfs::impl_NtReadFile(
   HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
   PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
   PLARGE_INTEGER ByteOffset, PULONG Key)
@@ -1596,7 +1597,7 @@ NTSTATUS WINAPI usvfs::hook_NtReadFile(
                       Buffer, Length, ByteOffset, Key);
 }
 
-NTSTATUS WINAPI usvfs::hook_NtQueryInformationFile(
+NTSTATUS WINAPI usvfs::impl_NtQueryInformationFile(
   HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
   ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {
@@ -1638,7 +1639,7 @@ NTSTATUS WINAPI usvfs::hook_NtQueryInformationFile(
                                   Length, FileInformationClass);
 }
 
-NTSTATUS WINAPI usvfs::hook_NtSetInformationFile(
+NTSTATUS WINAPI usvfs::impl_NtSetInformationFile(
   HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
   ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
 {

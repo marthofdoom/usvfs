@@ -506,6 +506,13 @@
       <Project>{ba5b2cac-8b75-4c6b-83c7-ffb963e872b6}</Project>
     </ProjectReference>
   </ItemGroup>
+  <ItemGroup Label="harness trace">
+    <ClCompile Include="..\src\usvfs_dll\trace.cpp" />
+    <ClCompile Include="..\src\usvfs_dll\hooks\ntdll_traced.cpp" />
+    <ClInclude Include="..\src\usvfs_dll\trace.h" />
+    <ClInclude Include="..\src\usvfs_dll\trace_format.h" />
+    <ClInclude Include="..\src\usvfs_dll\hooks\ntdll_impl.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
