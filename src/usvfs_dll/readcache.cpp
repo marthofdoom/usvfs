@@ -2297,7 +2297,7 @@ void init()
   g->limits.maxFileBytes = config::number("USVFS_READCACHE_MAXFILE_MB", 64) << 20;
   g->admitReads = static_cast<uint32_t>(config::number("USVFS_READCACHE_ADMIT_READS", 8, 0, 1u << 20));
   g->splitEnabled = config::flag("USVFS_READCACHE_SPLIT", true);
-  g->raEnabled    = config::flag("USVFS_READCACHE_RA", true);
+  g->raEnabled    = config::flag("USVFS_READCACHE_RA", false);
   g->splitMinBytes = config::number("USVFS_READCACHE_SPLIT_MIN_KB", 256, 64) << 10;
   g->splitChunk    = config::number("USVFS_READCACHE_SPLIT_CHUNK_KB", 256, 16) << 10;
   g->raCapBytes    = config::number("USVFS_READCACHE_RA_MB", 64) << 20;

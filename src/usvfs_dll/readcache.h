@@ -32,7 +32,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 //   USVFS_READCACHE_ADMIT_READS=8  small reads of a file before it is cached
 //   USVFS_READCACHE_SPLIT=1        split big reads over worker threads (default on)
 //   USVFS_READCACHE_SPLIT_MIN_KB=256, USVFS_READCACHE_SPLIT_CHUNK_KB=256
-//   USVFS_READCACHE_RA=1           sequential readahead (default on)
+//   USVFS_READCACHE_RA=0           sequential readahead (default off)
 //   USVFS_READCACHE_RA_MB=64       memory cap of all readahead windows
 //   USVFS_READCACHE_ASYNC=1        fill in background workers (default on; 0 = fill on the caller)
 //   USVFS_READCACHE_THREADS=4      number of background workers
