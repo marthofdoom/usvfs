@@ -225,8 +225,9 @@ TEST(MetaCacheStore, NoCachePrefix)
 TEST(MetaCacheStore, LruEvictsLeastRecentlyUsedWithinCap)
 {
   const std::wstring p1 = L"\\P\\1", p2 = L"\\P\\2", p3 = L"\\P\\3";
-  // each entry costs path*2 + 160 bytes; room for two
-  Store s(2 * (p1.size() * 2 + 160) + 10);
+  // each entry costs Store::attrCost(leaf) plus the interned directory once; room for two
+  const size_t cap = 2 * Store::attrCost(1) + 2 * 2 + 96 + 10;
+  Store s(cap);
   s.putAttr(p1, existing());
   s.putAttr(p2, existing());
   Attr out;
@@ -236,7 +237,7 @@ TEST(MetaCacheStore, LruEvictsLeastRecentlyUsedWithinCap)
   EXPECT_TRUE(s.lookupAttr(p1, true, out));
   EXPECT_FALSE(s.lookupAttr(p2, true, out));
   EXPECT_TRUE(s.lookupAttr(p3, true, out));
-  EXPECT_LE(s.bytes(), 2 * (p1.size() * 2 + 160) + 10);
+  EXPECT_LE(s.bytes(), cap);
   EXPECT_GE(s.stats().evictions, 1u);
 }
 
@@ -327,11 +328,12 @@ TEST(MetaCacheListing, LiteralLookupByFoldedName)
   l.add(std::string(8, 'b'), L"bar.esm");
   l.add(std::string(8, 'c'), L"foo.esp");  // same name, different case
 
-  const std::vector<uint32_t>* hit = l.findLiteral(normalizeMask(L"FOO.esp"));
-  ASSERT_NE(nullptr, hit);
-  EXPECT_EQ(2u, hit->size());
-  EXPECT_EQ(nullptr, l.findLiteral(normalizeMask(L"nothing")));
-  ASSERT_NE(nullptr, l.findLiteral(normalizeMask(L"BAR.ESM")));
+  const std::vector<uint32_t> hit = l.findLiteral(normalizeMask(L"FOO.esp"));
+  ASSERT_EQ(2u, hit.size());
+  EXPECT_EQ(0u, hit[0]);
+  EXPECT_EQ(2u, hit[1]);
+  EXPECT_TRUE(l.findLiteral(normalizeMask(L"nothing")).empty());
+  EXPECT_FALSE(l.findLiteral(normalizeMask(L"BAR.ESM")).empty());
 }
 
 TEST(MetaCacheStore, UsedAboveReportsMemoryShare)

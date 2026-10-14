@@ -349,28 +349,49 @@ struct Listing
   std::vector<std::string> records;  // raw records, NextEntryOffset zeroed
   std::vector<size_t> rawLengths;
   std::vector<std::wstring> names;
-  std::unordered_map<std::wstring, std::vector<uint32_t>> byName;  // folded name -> indices
+  // hash of the folded name -> index (a multimap: collisions are verified against
+  // `names`); much smaller than a map keyed by the folded strings
+  std::unordered_multimap<uint64_t, uint32_t> byHash;
   size_t bytes = 0;
+
+  static uint64_t hashFolded(std::wstring_view name, bool fold)
+  {
+    uint64_t h = 1469598103934665603ull;
+    for (wchar_t c : name) {
+      h ^= static_cast<uint16_t>(fold ? foldChar(c) : c);
+      h *= 1099511628211ull;
+    }
+    return h;
+  }
 
   void add(std::string record, std::wstring name)
   {
     rawLengths.push_back(record.size());
-    bytes += record.size() + name.size() * sizeof(wchar_t) * 2 + 96;
-    std::wstring folded;
-    folded.reserve(name.size());
-    for (wchar_t c : name)
-      folded.push_back(foldChar(c));
-    byName[std::move(folded)].push_back(static_cast<uint32_t>(records.size()));
+    // payload plus the container overheads of one entry (headers, hash node)
+    bytes += record.size() + name.size() * sizeof(wchar_t) + 96;
+    byHash.emplace(hashFolded(name, true), static_cast<uint32_t>(records.size()));
     records.push_back(std::move(record));
     names.push_back(std::move(name));
   }
 
-  // indices of the entries whose name equals `foldedName` (already folded with
-  // foldChar, as normalizeMask does); null if none
-  const std::vector<uint32_t>* findLiteral(const std::wstring& foldedName) const
+  // indices (ascending) of the entries whose name equals `foldedName` (already
+  // folded with foldChar, as normalizeMask does); empty if none
+  std::vector<uint32_t> findLiteral(const std::wstring& foldedName) const
   {
-    auto it = byName.find(foldedName);
-    return it == byName.end() ? nullptr : &it->second;
+    std::vector<uint32_t> out;
+    auto range = byHash.equal_range(hashFolded(foldedName, false));
+    for (auto it = range.first; it != range.second; ++it) {
+      const std::wstring& n = names[it->second];
+      if (n.size() != foldedName.size())
+        continue;
+      bool same = true;
+      for (size_t i = 0; i < n.size() && same; ++i)
+        same = foldChar(n[i]) == foldedName[i];
+      if (same)
+        out.push_back(it->second);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
   }
 };
 
@@ -404,7 +425,7 @@ public:
   bool lookupAttr(const std::wstring& path, bool needFull, Attr& out)
   {
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_attrs.find(path);
+    auto it = findAttr(path);
     if (it == m_attrs.end() || (needFull && !it->second.attr.full &&
                                 it->second.attr.status >= 0)) {
       ++m_stats.attrMisses;
@@ -442,7 +463,7 @@ public:
   bool hasAttr(const std::wstring& path)
   {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_attrs.find(path) != m_attrs.end();
+    return findAttr(path) != m_attrs.end();
   }
 
   void putAttr(const std::wstring& path, const Attr& attr,
@@ -451,7 +472,7 @@ public:
     std::lock_guard<std::mutex> lock(m_mutex);
     if (isBlocked(path) || (generation != kAnyGeneration && generation != m_generation))
       return;
-    auto it = m_attrs.find(path);
+    auto it = findAttr(path);
     if (it != m_attrs.end()) {
       // keep a full entry rather than replacing it by a basic one
       if (it->second.attr.full && !attr.full && attr.status >= 0 &&
@@ -493,7 +514,8 @@ public:
     if (isBlocked(dir) || m_volatileDirs.count(dir) ||
         (generation != kAnyGeneration && generation != m_generation))
       return;
-    std::vector<ListSlot>& slots = m_dirs[dir];
+    auto dirIt = m_dirs.try_emplace(dir).first;
+    std::vector<ListSlot>& slots = dirIt->second;
     for (ListSlot& slot : slots) {
       if (slot.cls == cls && slot.mask == mask)
         return;  // somebody was faster
@@ -502,7 +524,15 @@ public:
     slot.cls     = cls;
     slot.mask    = mask;
     slot.listing = std::move(listing);
-    slot.lru     = addLru(Node{false, dir, cls, mask, slot.listing->bytes + dir.size() * 2 + 64});
+    {
+      Node n;
+      n.isAttr = false;
+      n.dkey   = &dirIt->first;
+      n.cls    = cls;
+      n.mask   = std::make_unique<std::wstring>(mask);
+      n.bytes  = slot.listing->bytes + dir.size() * 2 + 64;
+      slot.lru = addLru(std::move(n));
+    }
     m_bytes += slot.lru->bytes;
     if (derived)
       ++m_stats.listingDerived;
@@ -544,7 +574,7 @@ public:
       return;
     }
     for (auto it = m_attrs.begin(); it != m_attrs.end();) {
-      if (isUnderPrefix(it->first, path)) {
+      if (isUnderPrefix(attrPath(it->first), path)) {
         m_bytes -= std::min(m_bytes, it->second.lru->bytes);
         m_lru.erase(it->second.lru);
         it = m_attrs.erase(it);
@@ -641,16 +671,36 @@ public:
     return m_stats;
   }
 
+  // accounted cost of one attribute entry with a leaf name of `leafChars`
+  static size_t attrCost(size_t leafChars) { return leafChars * 2 + 240; }
+
 private:
   static constexpr size_t kTreeScanLimit = 200000;
   static constexpr size_t kMaxVolatile   = 200000;
 
+  // key of an attribute entry: interned directory + leaf name (directories share
+  // their long path prefixes, which dominated the per-entry cost)
+  struct AttrKey
+  {
+    uint32_t dir = 0;
+    std::wstring leaf;
+    bool operator==(const AttrKey& o) const { return dir == o.dir && leaf == o.leaf; }
+  };
+  struct AttrKeyHash
+  {
+    size_t operator()(const AttrKey& k) const
+    {
+      return std::hash<std::wstring>()(k.leaf) * 31 + k.dir;
+    }
+  };
+
   struct Node
   {
     bool isAttr = true;
-    std::wstring key;  // path (attr) or directory (listing)
+    const AttrKey* akey      = nullptr;  // attr: key inside m_attrs (node-stable)
+    const std::wstring* dkey = nullptr;  // listing: key inside m_dirs
     int cls = 0;
-    std::wstring mask;
+    std::unique_ptr<std::wstring> mask;  // listing only
     size_t bytes = 0;
   };
   using Lru = std::list<Node>;
@@ -688,16 +738,73 @@ private:
     return m_volatilePaths.count(path) != 0;
   }
 
-  void insertAttr(const std::wstring& path, const Attr& attr)
+  // ---- interned directories of attribute keys ----
+
+  static void splitPath(const std::wstring& path, std::wstring_view& dir, std::wstring_view& leaf)
   {
-    AttrSlot slot;
-    slot.attr = attr;
-    slot.lru  = addLru(Node{true, path, 0, std::wstring(), path.size() * 2 + 160});
-    m_bytes += slot.lru->bytes;
-    m_attrs.emplace(path, std::move(slot));
+    const size_t pos = path.rfind(L'\\');
+    if (pos == std::wstring::npos) {
+      dir  = std::wstring_view();
+      leaf = path;
+    } else {
+      dir  = std::wstring_view(path).substr(0, pos);
+      leaf = std::wstring_view(path).substr(pos + 1);
+    }
   }
 
-  void eraseAttr(std::unordered_map<std::wstring, AttrSlot>::iterator it)
+  std::wstring attrPath(const AttrKey& k) const
+  {
+    const std::wstring& d = *m_dirNames[k.dir];
+    std::wstring out;
+    out.reserve(d.size() + 1 + k.leaf.size());
+    out = d;
+    out.push_back(L'\\');
+    out += k.leaf;
+    return out;
+  }
+
+  std::unordered_map<AttrKey, AttrSlot, AttrKeyHash>::iterator findAttr(const std::wstring& path)
+  {
+    std::wstring_view dir, leaf;
+    splitPath(path, dir, leaf);
+    auto d = m_dirIds.find(std::wstring(dir));
+    if (d == m_dirIds.end())
+      return m_attrs.end();
+    AttrKey k;
+    k.dir  = d->second;
+    k.leaf = std::wstring(leaf);
+    return m_attrs.find(k);
+  }
+
+  void insertAttr(const std::wstring& path, const Attr& attr)
+  {
+    std::wstring_view dir, leaf;
+    splitPath(path, dir, leaf);
+    uint32_t id;
+    auto d = m_dirIds.find(std::wstring(dir));
+    if (d != m_dirIds.end()) {
+      id = d->second;
+    } else {
+      id = static_cast<uint32_t>(m_dirNames.size());
+      d  = m_dirIds.emplace(std::wstring(dir), id).first;
+      m_dirNames.push_back(&d->first);
+      m_bytes += dir.size() * 2 + 96;  // never evicted: counted once
+    }
+    AttrKey k;
+    k.dir  = id;
+    k.leaf = std::wstring(leaf);
+    AttrSlot slot;
+    slot.attr = attr;
+    auto it   = m_attrs.emplace(std::move(k), std::move(slot)).first;
+    Node n;
+    n.isAttr = true;
+    n.akey   = &it->first;
+    n.bytes  = attrCost(leaf.size());
+    it->second.lru = addLru(std::move(n));
+    m_bytes += it->second.lru->bytes;
+  }
+
+  void eraseAttr(std::unordered_map<AttrKey, AttrSlot, AttrKeyHash>::iterator it)
   {
     m_bytes -= std::min(m_bytes, it->second.lru->bytes);
     m_lru.erase(it->second.lru);
@@ -718,7 +825,7 @@ private:
 
   void markVolatile(const std::wstring& path)
   {
-    auto a = m_attrs.find(path);
+    auto a = findAttr(path);
     if (a != m_attrs.end())
       eraseAttr(a);
     eraseDir(path);
@@ -727,7 +834,7 @@ private:
     if (!parent.empty()) {
       eraseDir(parent);
       // a directory's own times/size change when an entry is added or removed
-      auto pa = m_attrs.find(parent);
+      auto pa = findAttr(parent);
       if (pa != m_attrs.end())
         eraseAttr(pa);
       m_volatileDirs.insert(parent);
@@ -749,19 +856,19 @@ private:
       Node& victim = m_lru.back();
       ++m_stats.evictions;
       if (victim.isAttr) {
-        auto a = m_attrs.find(victim.key);
+        auto a = m_attrs.find(*victim.akey);
         m_bytes -= std::min(m_bytes, victim.bytes);
         if (a != m_attrs.end())
           m_attrs.erase(a);
         m_lru.pop_back();
       } else {
-        auto d = m_dirs.find(victim.key);
+        auto d = m_dirs.find(*victim.dkey);
         m_bytes -= std::min(m_bytes, victim.bytes);
         if (d != m_dirs.end()) {
           auto& slots = d->second;
           slots.erase(std::remove_if(slots.begin(), slots.end(),
                                      [&](const ListSlot& s) {
-                                       return s.cls == victim.cls && s.mask == victim.mask;
+                                       return s.cls == victim.cls && s.mask == *victim.mask;
                                      }),
                       slots.end());
           if (slots.empty())
@@ -778,6 +885,8 @@ private:
     m_attrs.clear();
     m_dirs.clear();
     m_lru.clear();
+    m_dirIds.clear();
+    m_dirNames.clear();
     m_bytes = 0;
   }
 
@@ -785,7 +894,9 @@ private:
   uint64_t m_cap;
   uint64_t m_bytes = 0;
   Lru m_lru;  // front = most recently used
-  std::unordered_map<std::wstring, AttrSlot> m_attrs;
+  std::unordered_map<AttrKey, AttrSlot, AttrKeyHash> m_attrs;
+  std::unordered_map<std::wstring, uint32_t> m_dirIds;  // interned attr directories
+  std::vector<const std::wstring*> m_dirNames;           // id -> name (node-stable)
   std::unordered_map<std::wstring, std::vector<ListSlot>> m_dirs;
   std::unordered_set<std::wstring> m_volatilePaths;
   std::unordered_set<std::wstring> m_volatileDirs;

@@ -28,6 +28,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 
 #include <condition_variable>
 #include <cstring>
+#include <cwchar>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -350,10 +351,32 @@ struct FrontEntry
   FrontResult result;
 };
 
+// 128-bit hash of a front key: the entry stores 16 bytes instead of the path
+// string (a collision of two different live paths is ~2^-100 per pair)
+struct FrontKey
+{
+  uint64_t a = 0, b = 0;
+  bool operator==(const FrontKey& o) const { return a == o.a && b == o.b; }
+};
+struct FrontKeyHash
+{
+  size_t operator()(const FrontKey& k) const { return static_cast<size_t>(k.a); }
+};
+FrontKey makeFrontKey(const std::wstring& s)
+{
+  uint64_t a = 1469598103934665603ull, b = 0x9E3779B97F4A7C15ull;
+  for (wchar_t c : s) {
+    a = (a ^ static_cast<uint16_t>(c)) * 1099511628211ull;
+    b = (b + static_cast<uint16_t>(c) + 0x632BE59BD9B4E019ull) * 0xFF51AFD7ED558CCDull;
+    b ^= b >> 29;
+  }
+  return FrontKey{a, b ^ (static_cast<uint64_t>(s.size()) << 48)};
+}
+
 struct FrontState
 {
   std::shared_mutex mutex;
-  std::unordered_map<std::wstring, FrontEntry> entries;  // key + kind char
+  std::unordered_map<FrontKey, FrontEntry, FrontKeyHash> entries;  // hash of key + kind char
   std::atomic<uint64_t> hits{0};
   std::atomic<uint64_t> misses{0};
   // diagnostics: misses of a key seen before (bloom-ish, 2 hashes) vs first time
@@ -368,12 +391,77 @@ FrontState* gFront = nullptr;  // allocated in init() when enabled, never freed
 
 // ---- enumeration front cache ----
 
+// WIN32_FIND_DATAW records without the 592-byte fixed size: a small header and
+// the two names at their real length
+class PackedFinds
+{
+public:
+  size_t size() const { return m_offs.size(); }
+  bool empty() const { return m_offs.empty(); }
+  size_t capacityBytes() const { return m_blob.capacity() + m_offs.capacity() * sizeof(uint32_t); }
+
+  void push_back(const WIN32_FIND_DATAW& fd)
+  {
+    Head h;
+    h.attrs = fd.dwFileAttributes;
+    h.res0  = fd.dwReserved0;
+    h.res1  = fd.dwReserved1;
+    h.ct    = fd.ftCreationTime;
+    h.at    = fd.ftLastAccessTime;
+    h.wt    = fd.ftLastWriteTime;
+    h.sizeHigh = fd.nFileSizeHigh;
+    h.sizeLow  = fd.nFileSizeLow;
+    h.nl = static_cast<uint16_t>(wcsnlen(fd.cFileName, 260));
+    h.al = static_cast<uint16_t>(wcsnlen(fd.cAlternateFileName, 14));
+    m_offs.push_back(static_cast<uint32_t>(m_blob.size()));
+    m_blob.append(reinterpret_cast<const char*>(&h), sizeof(h));
+    m_blob.append(reinterpret_cast<const char*>(fd.cFileName), h.nl * sizeof(wchar_t));
+    m_blob.append(reinterpret_cast<const char*>(fd.cAlternateFileName), h.al * sizeof(wchar_t));
+  }
+
+  WIN32_FIND_DATAW operator[](size_t i) const
+  {
+    Head h;
+    std::memcpy(&h, m_blob.data() + m_offs[i], sizeof(h));
+    WIN32_FIND_DATAW fd;
+    std::memset(&fd, 0, sizeof(fd));
+    fd.dwFileAttributes = h.attrs;
+    fd.dwReserved0      = h.res0;
+    fd.dwReserved1      = h.res1;
+    fd.ftCreationTime   = h.ct;
+    fd.ftLastAccessTime = h.at;
+    fd.ftLastWriteTime  = h.wt;
+    fd.nFileSizeHigh    = h.sizeHigh;
+    fd.nFileSizeLow     = h.sizeLow;
+    const char* p = m_blob.data() + m_offs[i] + sizeof(h);
+    std::memcpy(fd.cFileName, p, h.nl * sizeof(wchar_t));
+    std::memcpy(fd.cAlternateFileName, p + h.nl * sizeof(wchar_t), h.al * sizeof(wchar_t));
+    return fd;
+  }
+
+  void shrink_to_fit()
+  {
+    m_blob.shrink_to_fit();
+    m_offs.shrink_to_fit();
+  }
+
+private:
+  struct Head
+  {
+    DWORD attrs, res0, res1, sizeHigh, sizeLow;
+    FILETIME ct, at, wt;
+    uint16_t nl, al;
+  };
+  std::string m_blob;
+  std::vector<uint32_t> m_offs;
+};
+
 struct EnumListing
 {
   bool failed = false;
   DWORD err   = 0;
-  std::vector<WIN32_FIND_DATAW> entries;
-  size_t bytes() const { return sizeof(*this) + entries.capacity() * sizeof(WIN32_FIND_DATAW) + 128; }
+  PackedFinds entries;
+  size_t bytes() const { return sizeof(*this) + entries.capacityBytes() + 128; }
 };
 
 struct EnumSearch
@@ -455,6 +543,9 @@ void logSummary(const char* prefix)
       classes += std::format(" {}={}", i, ld(g->dirClassCount[i]));
   }
 
+  logger->info("{}: store bytes/attr-entry={} (attr {} listings {} memory {}B)", prefix,
+               g->store.attrCount() ? g->store.bytes() / g->store.attrCount() : 0,
+               g->store.attrCount(), g->store.listingCount(), g->store.bytes());
   if (gFront) {
     logger->info("{}: attr front misses first-time={} repeat={}", prefix,
                  ld(gFront->missesFirst), ld(gFront->missesRepeat));
@@ -586,10 +677,8 @@ std::shared_ptr<const Listing> deriveListing(const std::wstring& dir, int cls,
   if (logic::isLiteralMask(mask)) {
     // a single file: by far the most common query. Not stored (there is one per
     // file); the name index makes it cheap to derive again.
-    if (const std::vector<uint32_t>* idx = all->findLiteral(mask)) {
-      for (uint32_t i : *idx)
-        derived->add(all->records[i], all->names[i]);
-    }
+    for (uint32_t i : all->findLiteral(mask))
+      derived->add(all->records[i], all->names[i]);
     g->store.noteDerived();
     return derived;
   }
@@ -1098,8 +1187,8 @@ void init()
   if (enabled && (fr ? readcache::logic::parseFlag(fr, true) : true))
   {
     gFront = new FrontState();
-    // ~400 bytes per entry, at most a quarter of the cap
-    gFront->maxEntries = static_cast<size_t>(std::clamp<uint64_t>((mb << 20) / 4 / 400, 1000, 400000));
+    // ~150 bytes per entry (hashed key), at most a quarter of the cap
+    gFront->maxEntries = static_cast<size_t>(std::clamp<uint64_t>((mb << 20) / 4 / 150, 1000, 1000000));
   }
 
   const char* pw = env("USVFS_METACACHE_PREWARM", buf, sizeof(buf));
@@ -1205,7 +1294,7 @@ bool frontLookup(bool ex, const wchar_t* name, FrontResult& out, FrontTicket& ti
   tick();
   {
     std::shared_lock<std::shared_mutex> lock(f->mutex);
-    auto it = f->entries.find(key);
+    auto it = f->entries.find(makeFrontKey(key));
     if (it != f->entries.end() && it->second.gen == gen) {
       out = it->second.result;
       f->hits.fetch_add(1, std::memory_order_relaxed);
@@ -1266,7 +1355,7 @@ void frontStore(const FrontTicket& ticket, bool ex, const FrontResult& result,
     return;  // something was invalidated meanwhile
   if (f->entries.size() >= f->maxEntries)
     f->entries.clear();
-  FrontEntry& e = f->entries[ticket.key];
+  FrontEntry& e = f->entries[makeFrontKey(ticket.key)];
   e.gen    = ticket.gen;
   e.result = result;
 }
@@ -1355,8 +1444,9 @@ bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, D
         e->hits.fetch_add(1, std::memory_order_relaxed);
         return true;
       }
-      if (!l->entries.empty() &&
-          readcache::guardedCopy(data, &l->entries[0], sizeof(WIN32_FIND_DATAW))) {
+      WIN32_FIND_DATAW first;
+      if (!l->entries.empty() && ((first = l->entries[0]), true) &&
+          readcache::guardedCopy(data, &first, sizeof(WIN32_FIND_DATAW))) {
         auto s    = std::make_shared<EnumSearch>();
         s->replay = l;
         s->next   = 1;
@@ -1381,7 +1471,8 @@ bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, D
           return true;
         }
         auto l = std::make_shared<EnumListing>();
-        for (const WIN32_FIND_DATAW& fd : all->entries) {
+        for (size_t ei = 0; ei < all->entries.size(); ++ei) {
+          const WIN32_FIND_DATAW fd = all->entries[ei];
           if (logic::maskMatches(maskView, fd.cFileName) ||
               (fd.cAlternateFileName[0] != 0 && logic::maskMatches(maskView, fd.cAlternateFileName)))
             l->entries.push_back(fd);
@@ -1393,7 +1484,8 @@ bool enumFirst(const wchar_t* name, int infoLevel, int searchOp, void* filter, D
           e->derived.fetch_add(1, std::memory_order_relaxed);
           return true;
         }
-        if (readcache::guardedCopy(data, &l->entries[0], sizeof(WIN32_FIND_DATAW))) {
+        const WIN32_FIND_DATAW first = l->entries[0];
+        if (readcache::guardedCopy(data, &first, sizeof(WIN32_FIND_DATAW))) {
           auto s    = std::make_shared<EnumSearch>();
           s->replay = l;
           s->next   = 1;
@@ -1458,7 +1550,8 @@ bool enumNext(HANDLE h, WIN32_FIND_DATAW* data, BOOL& result, DWORD& err)
     return false;
   EnumSearch& s = *it->second;
   if (s.next < s.replay->entries.size()) {
-    if (!readcache::guardedCopy(data, &s.replay->entries[s.next], sizeof(WIN32_FIND_DATAW))) {
+    const WIN32_FIND_DATAW cur = s.replay->entries[s.next];
+    if (!readcache::guardedCopy(data, &cur, sizeof(WIN32_FIND_DATAW))) {
       result = FALSE;
       err    = ERROR_INVALID_PARAMETER;
       return true;
