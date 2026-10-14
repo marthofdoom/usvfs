@@ -1,4 +1,7 @@
+#include "../metacache.h"
+#include "../readcache.h"
 #include "kernel32.h"
+#include "kernel32_impl.h"
 #include "sharedids.h"
 
 #include "../hookcallcontext.h"
@@ -379,9 +382,9 @@ BOOL WINAPI usvfs::hook_GetFileAttributesExA(LPCSTR lpFileName,
   return res;
 }
 
-BOOL WINAPI usvfs::hook_GetFileAttributesExW(LPCWSTR lpFileName,
-                                             GET_FILEEX_INFO_LEVELS fInfoLevelId,
-                                             LPVOID lpFileInformation)
+BOOL WINAPI usvfs::impl_GetFileAttributesExW(
+    LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId,
+    LPVOID lpFileInformation)
 {
   BOOL res = FALSE;
 
@@ -390,6 +393,24 @@ BOOL WINAPI usvfs::hook_GetFileAttributesExW(LPCWSTR lpFileName,
     res = GetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
     callContext.updateLastError();
     return res;
+  }
+
+  // front cache: the final answer for this virtual path, before any usvfs work
+  usvfs::metacache::FrontTicket front;
+  if (fInfoLevelId == GetFileExInfoStandard && lpFileInformation) {
+    usvfs::metacache::FrontResult cached;
+    if (usvfs::metacache::frontLookup(true, lpFileName, cached, front) &&
+        (!cached.ok ||
+         usvfs::readcache::guardedCopy(lpFileInformation, &cached.data, sizeof(cached.data)))) {
+      if (!cached.ok)
+        callContext.updateLastError(cached.err);
+      return cached.ok ? TRUE : FALSE;
+    }
+    usvfs::metacache::FrontResult neg;
+    if (!front.key.empty() && usvfs::metacache::frontNegative(front, neg)) {
+      callContext.updateLastError(neg.err);
+      return FALSE;
+    }
   }
 
   fs::path canonicalFile = RerouteW::canonizePath(RerouteW::absolutePath(lpFileName));
@@ -431,6 +452,16 @@ BOOL WINAPI usvfs::hook_GetFileAttributesExW(LPCWSTR lpFileName,
   }
   if (fixedError != originalError)
     callContext.updateLastError(fixedError);
+
+  if (!front.key.empty()) {
+    usvfs::metacache::FrontResult result;
+    result.ok  = res != FALSE;
+    result.err = fixedError;
+    if (!result.ok || usvfs::readcache::guardedCopy(&result.data, lpFileInformation,
+                                                     sizeof(result.data)))
+      usvfs::metacache::frontStore(front, true, result, reroute.fileName(),
+                                      canonicalFile.c_str());
+  }
 
   if (reroute.wasRerouted() || fixedError != originalError) {
     DWORD resAttrib;
@@ -477,7 +508,7 @@ DWORD WINAPI usvfs::hook_GetFileAttributesA(LPCSTR lpFileName)
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetFileAttributesW(LPCWSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetFileAttributesW(LPCWSTR lpFileName)
 {
   DWORD res = 0UL;
 
@@ -486,6 +517,22 @@ DWORD WINAPI usvfs::hook_GetFileAttributesW(LPCWSTR lpFileName)
     res = GetFileAttributesW(lpFileName);
     callContext.updateLastError();
     return res;
+  }
+
+  // front cache: the final answer for this virtual path, before any usvfs work
+  usvfs::metacache::FrontTicket front;
+  {
+    usvfs::metacache::FrontResult cached;
+    if (usvfs::metacache::frontLookup(false, lpFileName, cached, front)) {
+      if (!cached.ok)
+        callContext.updateLastError(cached.err);
+      return cached.ok ? cached.attr : INVALID_FILE_ATTRIBUTES;
+    }
+    usvfs::metacache::FrontResult neg;
+    if (!front.key.empty() && usvfs::metacache::frontNegative(front, neg)) {
+      callContext.updateLastError(neg.err);
+      return INVALID_FILE_ATTRIBUTES;
+    }
   }
 
   fs::path canonicalFile = RerouteW::canonizePath(RerouteW::absolutePath(lpFileName));
@@ -529,6 +576,15 @@ DWORD WINAPI usvfs::hook_GetFileAttributesW(LPCWSTR lpFileName)
   if (fixedError != originalError)
     callContext.updateLastError(fixedError);
 
+  if (!front.key.empty()) {
+    usvfs::metacache::FrontResult result;
+    result.ok   = res != INVALID_FILE_ATTRIBUTES;
+    result.err  = fixedError;
+    result.attr = res;
+    usvfs::metacache::frontStore(front, false, result, reroute.fileName(),
+                                    canonicalFile.c_str());
+  }
+
   if (reroute.wasRerouted() || fixedError != originalError) {
     LOG_CALL()
         .PARAM(lpFileName)
@@ -550,6 +606,8 @@ DWORD WINAPI usvfs::hook_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttr
   HOOK_START_GROUP(MutExHookGroup::FILE_ATTRIBUTES)
   // Why is the usual if (!callContext.active()... check missing?
 
+  usvfs::metacache::noteDosPath(lpFileName, false);
+
   RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, lpFileName);
   PRE_REALCALL
   res = ::SetFileAttributesW(reroute.fileName(), dwFileAttributes);
@@ -564,7 +622,7 @@ DWORD WINAPI usvfs::hook_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttr
   return res;
 }
 
-BOOL WINAPI usvfs::hook_DeleteFileW(LPCWSTR lpFileName)
+BOOL WINAPI usvfs::impl_DeleteFileW(LPCWSTR lpFileName)
 {
   BOOL res = FALSE;
 
@@ -573,6 +631,8 @@ BOOL WINAPI usvfs::hook_DeleteFileW(LPCWSTR lpFileName)
 
   const std::wstring path =
       RerouteW::canonizePath(RerouteW::absolutePath(lpFileName)).wstring();
+
+  usvfs::metacache::noteDosPath(path.c_str(), false);
 
   RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, path.c_str());
 
@@ -636,7 +696,8 @@ BOOL WINAPI usvfs::hook_MoveFileA(LPCSTR lpExistingFileName, LPCSTR lpNewFileNam
   return res;
 }
 
-BOOL WINAPI usvfs::hook_MoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName)
+BOOL WINAPI usvfs::impl_MoveFileW(LPCWSTR lpExistingFileName,
+                                    LPCWSTR lpNewFileName)
 {
   BOOL res = FALSE;
 
@@ -646,6 +707,10 @@ BOOL WINAPI usvfs::hook_MoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileN
     callContext.updateLastError();
     return res;
   }
+
+  // virtual paths: listings and attributes are keyed by them
+  usvfs::metacache::noteDosPath(lpExistingFileName, true);
+  usvfs::metacache::noteDosPath(lpNewFileName, true);
 
   RerouteW readReroute;
   CreateRerouter writeReroute;
@@ -771,8 +836,8 @@ BOOL WINAPI usvfs::hook_MoveFileExA(LPCSTR lpExistingFileName, LPCSTR lpNewFileN
   return res;
 }
 
-BOOL WINAPI usvfs::hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName,
-                                    DWORD dwFlags)
+BOOL WINAPI usvfs::impl_MoveFileExW(LPCWSTR lpExistingFileName,
+                                      LPCWSTR lpNewFileName, DWORD dwFlags)
 {
   BOOL res = FALSE;
 
@@ -782,6 +847,10 @@ BOOL WINAPI usvfs::hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFil
     callContext.updateLastError();
     return res;
   }
+
+  // virtual paths: listings and attributes are keyed by them
+  usvfs::metacache::noteDosPath(lpExistingFileName, true);
+  usvfs::metacache::noteDosPath(lpNewFileName, true);
 
   RerouteW readReroute;
   CreateRerouter writeReroute;
@@ -927,6 +996,10 @@ BOOL WINAPI usvfs::hook_MoveFileWithProgressW(LPCWSTR lpExistingFileName,
     return res;
   }
 
+  // virtual paths: listings and attributes are keyed by them
+  usvfs::metacache::noteDosPath(lpExistingFileName, true);
+  usvfs::metacache::noteDosPath(lpNewFileName, true);
+
   RerouteW readReroute;
   usvfs::CreateRerouter writeReroute;
   bool callOriginal = true;
@@ -1032,6 +1105,8 @@ BOOL WINAPI usvfs::hook_CopyFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFil
     return res;
   }
 
+  usvfs::metacache::noteDosPath(lpNewFileName, false);
+
   RerouteW readReroute;
   usvfs::CreateRerouter writeReroute;
   bool callOriginal = true;
@@ -1134,7 +1209,7 @@ BOOL WINAPI usvfs::hook_SetCurrentDirectoryA(LPCSTR lpPathName)
   return SetCurrentDirectoryW(ush::string_cast<std::wstring>(lpPathName).c_str());
 }
 
-BOOL WINAPI usvfs::hook_SetCurrentDirectoryW(LPCWSTR lpPathName)
+BOOL WINAPI usvfs::impl_SetCurrentDirectoryW(LPCWSTR lpPathName)
 {
   BOOL res = FALSE;
 
@@ -1200,6 +1275,8 @@ DLLEXPORT BOOL WINAPI usvfs::hook_CreateDirectoryW(
   BOOL res = FALSE;
   HOOK_START
 
+  usvfs::metacache::noteDosPath(lpPathName, false);
+
   RerouteW reroute = RerouteW::createOrNew(READ_CONTEXT(), callContext, lpPathName);
 
   PRE_REALCALL
@@ -1228,6 +1305,8 @@ DLLEXPORT BOOL WINAPI usvfs::hook_RemoveDirectoryW(LPCWSTR lpPathName)
 
   HOOK_START_GROUP(MutExHookGroup::DELETE_FILE)
   // Why is the usual if (!callContext.active()... check missing?
+
+  usvfs::metacache::noteDosPath(lpPathName, true);
 
   RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, lpPathName);
 
@@ -1444,9 +1523,7 @@ DWORD WINAPI usvfs::hook_GetModuleFileNameW(HMODULE hModule, LPWSTR lpFilename,
   return res;
 }
 
-HANDLE WINAPI usvfs::hook_FindFirstFileExW(
-    LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData,
-    FINDEX_SEARCH_OPS fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags)
+HANDLE WINAPI usvfs::impl_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData, FINDEX_SEARCH_OPS  fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags)
 {
   HANDLE res = INVALID_HANDLE_VALUE;
 
@@ -1468,6 +1545,21 @@ HANDLE WINAPI usvfs::hook_FindFirstFileExW(
             fs::path(lpFileName).string());
         return INVALID_HANDLE_VALUE;
       }
+    }
+  }
+
+  // enumeration front cache: a recorded listing of this virtual directory and mask
+  usvfs::metacache::EnumTicket enumTicket;
+  if (lpFindFileData) {
+    DWORD cachedErr = 0;
+    HANDLE cachedRes = INVALID_HANDLE_VALUE;
+    if (usvfs::metacache::enumFirst(lpFileName, static_cast<int>(fInfoLevelId),
+                                    static_cast<int>(fSearchOp), lpSearchFilter,
+                                    dwAdditionalFlags, lpFindFileData, cachedRes, cachedErr,
+                                    enumTicket)) {
+      if (cachedRes == INVALID_HANDLE_VALUE)
+        callContext.updateLastError(cachedErr);
+      return cachedRes;
     }
   }
 
@@ -1507,6 +1599,13 @@ HANDLE WINAPI usvfs::hook_FindFirstFileExW(
                                        fSearchOp, lpSearchFilter, dwAdditionalFlags);
       POST_REALCALL
     }
+  }
+
+  if (!enumTicket.key.empty()) {
+    const DWORD findErr = callContext.lastError();
+    usvfs::metacache::enumRecordFirst(
+        enumTicket, originalPath.c_str(), static_cast<int>(fInfoLevelId), dwAdditionalFlags,
+        res, findErr, static_cast<const WIN32_FIND_DATAW*>(lpFindFileData));
   }
 
   if (res != INVALID_HANDLE_VALUE) {
@@ -1549,6 +1648,8 @@ HRESULT WINAPI usvfs::hook_CopyFile2(PCWSTR pwszExistingFileName,
     return res;
   }
 
+  usvfs::metacache::noteDosPath(pwszNewFileName, false);
+
   RerouteW readReroute;
   CreateRerouter writeReroute;
   bool callOriginal = true;
@@ -1588,10 +1689,7 @@ HRESULT WINAPI usvfs::hook_CopyFile2(PCWSTR pwszExistingFileName,
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName,
-                                                  LPCSTR lpDefault,
-                                                  LPSTR lpReturnedString, DWORD nSize,
-                                                  LPCSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, LPCSTR lpDefault, LPSTR lpReturnedString, DWORD nSize, LPCSTR lpFileName)
 {
   DWORD res = 0;
 
@@ -1628,10 +1726,7 @@ DWORD WINAPI usvfs::hook_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKey
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName,
-                                                  LPCWSTR lpDefault,
-                                                  LPWSTR lpReturnedString, DWORD nSize,
-                                                  LPCWSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpDefault, LPWSTR lpReturnedString, DWORD nSize, LPCWSTR lpFileName)
 {
   DWORD res = 0;
 
@@ -1666,9 +1761,7 @@ DWORD WINAPI usvfs::hook_GetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpK
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetPrivateProfileSectionA(LPCSTR lpAppName,
-                                                   LPSTR lpReturnedString, DWORD nSize,
-                                                   LPCSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetPrivateProfileSectionA(LPCSTR lpAppName, LPSTR lpReturnedString, DWORD nSize, LPCSTR lpFileName)
 {
   DWORD res = 0;
 
@@ -1703,9 +1796,7 @@ DWORD WINAPI usvfs::hook_GetPrivateProfileSectionA(LPCSTR lpAppName,
   return res;
 }
 
-DWORD WINAPI usvfs::hook_GetPrivateProfileSectionW(LPCWSTR lpAppName,
-                                                   LPWSTR lpReturnedString, DWORD nSize,
-                                                   LPCWSTR lpFileName)
+DWORD WINAPI usvfs::impl_GetPrivateProfileSectionW(LPCWSTR lpAppName, LPWSTR lpReturnedString, DWORD nSize, LPCWSTR lpFileName)
 {
   DWORD res = 0;
 
@@ -1738,8 +1829,7 @@ DWORD WINAPI usvfs::hook_GetPrivateProfileSectionW(LPCWSTR lpAppName,
   return res;
 }
 
-BOOL WINAPI usvfs::hook_WritePrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName,
-                                                   LPCSTR lpString, LPCSTR lpFileName)
+BOOL WINAPI usvfs::impl_WritePrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, LPCSTR lpString, LPCSTR lpFileName)
 {
   BOOL res = false;
 
@@ -1783,8 +1873,7 @@ BOOL WINAPI usvfs::hook_WritePrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKe
   return res;
 }
 
-BOOL WINAPI usvfs::hook_WritePrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName,
-                                                   LPCWSTR lpString, LPCWSTR lpFileName)
+BOOL WINAPI usvfs::impl_WritePrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpString, LPCWSTR lpFileName)
 {
   BOOL res = false;
 
@@ -1857,4 +1946,32 @@ VOID WINAPI usvfs::hook_ExitProcess(UINT exitCode)
   //  POST_REALCALL
 
   HOOK_END
+}
+
+// FindNextFileW / FindClose: replayed searches (enumeration front cache) are
+// answered here, searches being recorded are watched; everything else is untouched
+BOOL WINAPI usvfs::impl_FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)
+{
+  if (!usvfs::metacache::enumFrontActive())
+    return ::FindNextFileW(hFindFile, lpFindFileData);
+  BOOL result = FALSE;
+  DWORD err   = 0;
+  if (usvfs::metacache::enumNext(hFindFile, lpFindFileData, result, err)) {
+    if (!result)
+      ::SetLastError(err);
+    return result;
+  }
+  result = ::FindNextFileW(hFindFile, lpFindFileData);
+  err    = ::GetLastError();
+  usvfs::metacache::enumAfterNext(hFindFile, result, err, lpFindFileData);
+  if (!result)
+    ::SetLastError(err);
+  return result;
+}
+
+BOOL WINAPI usvfs::impl_FindClose(HANDLE hFindFile)
+{
+  if (usvfs::metacache::enumFrontActive() && usvfs::metacache::enumClose(hFindFile))
+    return TRUE;
+  return ::FindClose(hFindFile);
 }
