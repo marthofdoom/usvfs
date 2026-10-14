@@ -217,7 +217,6 @@ struct HandleState
   std::atomic<int> mode{kHandleNone};
   uint64_t shadowPos = 0;  // guarded by m
   FileSnapshot snap;       // set during classification, immutable afterwards
-  FileSnapshot snap;       // set during classification, immutable afterwards
   std::shared_ptr<CacheEntry> entry;
 
   // layer 3 (big reads); splitOk/key are set during classification, the rest is
