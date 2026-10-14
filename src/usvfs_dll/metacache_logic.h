@@ -187,7 +187,7 @@ inline std::wstring frontEnumKey(std::wstring_view path, std::wstring_view cwd, 
   std::wstring key = dirKey;
   key.push_back(L'\x03');
   key.push_back(static_cast<wchar_t>(L'0' + infoLevel));
-  key.push_back(static_cast<wchar_t>(L'0' + flags));
+  key.push_back(static_cast<wchar_t>(L'0' + (flags & 4)));  // large fetch does not change the result
   key.push_back(L'\x03');
   for (wchar_t c : mask)
     key.push_back(foldChar(c));

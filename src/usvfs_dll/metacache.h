@@ -32,7 +32,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 //
 // Configuration (environment, read once in init()):
 //   USVFS_METACACHE=1|0                force on/off (default: on only in SkyrimSE.exe)
-//   USVFS_METACACHE_MB=1024            memory cap
+//   USVFS_METACACHE_MB=auto            memory cap (auto: RAM/64 clamped 256..1024) (auto: RAM/64 clamped 256..1024)
 //   USVFS_METACACHE_FRONT_ENUM=1|0     enumeration front cache (default: on with the
 //                                      metacache; memory: half of USVFS_METACACHE_MB)
 //   USVFS_METACACHE_FRONT=1|0          front cache for GetFileAttributesW/ExW keyed

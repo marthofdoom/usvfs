@@ -312,6 +312,8 @@ struct State
   std::condition_variable gateCv;
   std::atomic<uint64_t> prewarmStart{0};
   std::atomic<bool> prewarmDone{false};
+  bool frontPrewarm = false;  // USVFS_METACACHE_FRONT_PREWARM (game process only)
+  int frontPrewarmSec = 90;   // time budget of the front pre-warm
   std::atomic<bool> prewarmCapped{false};
 
   std::atomic<uint64_t> tick{0};
@@ -817,10 +819,97 @@ bool listChildren(const std::string& vpath, std::vector<Child>& out)
 void prewarmDirectory(const std::string& vpath, const std::string& link);
 void prewarmRealDirectory(const std::string& realDir);
 
+
+// Pre-warm of the front caches: runs the real (hooked) FindFirstFileExW "*"
+// enumeration of every virtual directory, which records and publishes the
+// listing, and GetFileAttributesExW of every virtual file, which stores the
+// attribute front entry. One low-priority job after the main pre-warm; stops at
+// the time budget, at 75% of either front cache, when the generation moves or
+// at shutdown. Never touches game threads' data except through the same
+// publish paths they use.
+void frontPrewarmJob()
+{
+  const uint64_t start = GetTickCount64();
+  const uint64_t gen0  = g->store.generation();
+  uint64_t dirs = 0, files = 0, lists = 0;
+  const char* stop = "done";
+  const HANDLE self = GetCurrentThread();
+  const int oldPrio = GetThreadPriority(self);
+  SetThreadPriority(self, THREAD_PRIORITY_BELOW_NORMAL);
+  try {
+    std::vector<std::string> todo{std::string()};
+    while (!todo.empty() && stop[0] == 'd') {
+      const std::string vpath = std::move(todo.back());
+      todo.pop_back();
+      std::vector<Child> kids;
+      if (!listChildren(vpath, kids))
+        continue;
+      std::wstring winDir;
+      if (!vpath.empty() && !kids.empty()) {
+        winDir = shared::string_cast<std::wstring>(vpath, shared::CodePage::UTF8);
+        std::replace(winDir.begin(), winDir.end(), L'/', L'\\');
+        for (int level = 0; level <= 1; ++level) {
+          WIN32_FIND_DATAW fd;
+          const std::wstring pat = winDir + L"\\*";
+          HANDLE h = ::FindFirstFileExW(pat.c_str(), static_cast<FINDEX_INFO_LEVELS>(level), &fd,
+                                        FindExSearchNameMatch, nullptr, 0);
+          if (h != INVALID_HANDLE_VALUE) {
+            while (::FindNextFileW(h, &fd) && !g->pool.stopping()) {
+            }
+            ::FindClose(h);
+            ++lists;
+          }
+        }
+        ++dirs;
+      }
+      for (const Child& c : kids) {
+        if (g->pool.stopping()) {
+          stop = "shutdown";
+          break;
+        }
+        if (g->store.generation() != gen0) {
+          stop = "generation moved";
+          break;
+        }
+        if (GetTickCount64() - start > static_cast<uint64_t>(g->frontPrewarmSec) * 1000) {
+          stop = "time budget";
+          break;
+        }
+        if ((gFront && gFront->entries.size() * 4 >= gFront->maxEntries * 3) ||
+            (gEnum && gEnum->bytes * 4 >= gEnum->maxBytes * 3)) {
+          stop = "cache budget";
+          break;
+        }
+        const std::string childPath = vpath.empty() ? c.name : vpath + "/" + c.name;
+        if (c.dir) {
+          todo.push_back(childPath);
+        } else if (c.file && gFront) {
+          std::wstring w = shared::string_cast<std::wstring>(childPath, shared::CodePage::UTF8);
+          std::replace(w.begin(), w.end(), L'/', L'\\');
+          WIN32_FILE_ATTRIBUTE_DATA data;
+          ::GetFileAttributesExW(w.c_str(), GetFileExInfoStandard, &data);
+          ++files;
+        }
+      }
+    }
+  } catch (...) {
+    stop = "exception";
+  }
+  SetThreadPriority(self, oldPrio);
+  if (auto logger = spdlog::get("usvfs")) {
+    logger->info("metacache: front pre-warm {} after {} ms: {} directories, {} listings, {} files, "
+                 "front entries={} enum listings={}",
+                 stop, GetTickCount64() - start, dirs, lists, files,
+                 gFront ? gFront->entries.size() : 0, gEnum ? gEnum->listings.size() : 0);
+  }
+}
+
 void finishPrewarmJob()
 {
   if (g->prewarmPending.fetch_sub(1) == 1 && !g->prewarmDone.exchange(true)) {
     const uint64_t ms = GetTickCount64() - g->prewarmStart.load();
+    if (g->frontPrewarm && (gFront || gEnum) && !g->pool.stopping())
+      g->pool.submit([] { frontPrewarmJob(); });
     if (auto logger = spdlog::get("usvfs")) {
       logger->info(
           "metacache: pre-warm finished in {} ms: {} directories, {} files, {} listings, "
@@ -996,8 +1085,11 @@ void init()
   const char* forced = env("USVFS_METACACHE", buf, sizeof(buf));
   const bool enabled =
       forced ? readcache::logic::parseFlag(forced, false) : isGameProcess();
-  const uint64_t mb =
-      readcache::logic::parseNumber(env("USVFS_METACACHE_MB", buf, sizeof(buf)), 1024);
+  MEMORYSTATUSEX memStatus{};
+  memStatus.dwLength = sizeof(memStatus);
+  const uint64_t ramBytes = GlobalMemoryStatusEx(&memStatus) ? memStatus.ullTotalPhys : (16ull << 30);
+  const uint64_t mb       = readcache::logic::parseNumber(
+      env("USVFS_METACACHE_MB", buf, sizeof(buf)), readcache::logic::scaledDefaultMb(ramBytes, 64));
   g = new State(mb << 20);
   g->lastLogTick.store(GetTickCount64());
   if (enabled)
@@ -1035,6 +1127,13 @@ void init()
     g->prewarmClasses = classes;
   }
 
+  if (enabled && g->prewarm && isGameProcess()) {
+    const char* fp = env("USVFS_METACACHE_FRONT_PREWARM", buf, sizeof(buf));
+    g->frontPrewarm = fp ? readcache::logic::parseFlag(fp, true) : true;
+    g->frontPrewarmSec = static_cast<int>(readcache::logic::parseNumber(
+        env("USVFS_METACACHE_FRONT_PREWARM_SEC", buf, sizeof(buf)), 90));
+  }
+
   const char* fe = env("USVFS_METACACHE_FRONT_ENUM", buf, sizeof(buf));
   if (enabled && (fe ? readcache::logic::parseFlag(fe, true) : true)) {
     gEnum           = new EnumState();
@@ -1043,7 +1142,7 @@ void init()
 
   if (auto logger = spdlog::get("usvfs")) {
     if (enabled) {
-      logger->info("metacache: enabled, cap {} MiB, front {}, enum front {}, pre-warm {}", mb,
+      logger->info("metacache: enabled, RAM {} MiB, cap {} MiB, front {}, enum front {}, pre-warm {}", ramBytes >> 20, mb,
                    gFront ? "on" : "off", gEnum ? "on" : "off",
                    g->prewarm ? std::format("on ({} threads)", g->prewarmThreads)
                               : std::string("off"));

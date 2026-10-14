@@ -2252,8 +2252,14 @@ void init()
   g = new State();
 
   const bool enabled = logic::parseFlag(env("USVFS_READCACHE", buf, sizeof(buf)), true);
+  MEMORYSTATUSEX ms{};
+  ms.dwLength = sizeof(ms);
+  const uint64_t ramBytes = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : (16ull << 30);
   g->limits.budgetBytes =
-      logic::parseNumber(env("USVFS_READCACHE_MB", buf, sizeof(buf)), 1024) << 20;
+      logic::parseNumber(env("USVFS_READCACHE_MB", buf, sizeof(buf)),
+                         logic::scaledDefaultMb(ramBytes, 32)) << 20;
+  if (auto lg = spdlog::get("usvfs"))
+    lg->info("readcache: RAM {} MiB, budget {} MiB", ramBytes >> 20, g->limits.budgetBytes >> 20);
   g->limits.maxFileBytes =
       logic::parseNumber(env("USVFS_READCACHE_MAXFILE_MB", buf, sizeof(buf)), 64) << 20;
   g->admitReads = static_cast<uint32_t>(std::min<uint64_t>(

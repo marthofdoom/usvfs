@@ -414,6 +414,13 @@ selectEvictions(const std::vector<EvictCandidate>& lruOldestFirst,
 // configuration parsing
 
 // returns `def` for null/empty/invalid input; otherwise the parsed number
+// default cache size in MiB: totalRamBytes / divisor MiB-wise, clamped to [256, 1024]
+inline uint64_t scaledDefaultMb(uint64_t totalRamBytes, uint64_t divisor)
+{
+  const uint64_t mb = (totalRamBytes >> 20) / (divisor ? divisor : 1);
+  return mb < 256 ? 256 : (mb > 1024 ? 1024 : mb);
+}
+
 inline uint64_t parseNumber(const char* s, uint64_t def)
 {
   if (!s || !*s)

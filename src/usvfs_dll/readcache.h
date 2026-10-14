@@ -27,7 +27,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 //
 // Configuration (environment variables, read once in init()):
 //   USVFS_READCACHE=0              disable (hooks are plain passthrough)
-//   USVFS_READCACHE_MB=1024        LRU budget in MiB
+//   USVFS_READCACHE_MB=auto       LRU budget in MiB (auto: RAM/32 clamped 256..1024) (auto: RAM/32 clamped 256..1024)
 //   USVFS_READCACHE_MAXFILE_MB=64  largest cached file in MiB
 //   USVFS_READCACHE_ADMIT_READS=8  small reads of a file before it is cached
 //   USVFS_READCACHE_SPLIT=1        split big reads over worker threads (default on)
